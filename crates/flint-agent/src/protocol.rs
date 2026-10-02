@@ -10,8 +10,8 @@ use std::path::PathBuf;
 use serde::Deserialize;
 use serde::Serialize;
 
-/// Everything a session needs to run.
-#[derive(Debug, Clone)]
+/// Everything a session needs to run. `Debug` redacts the API keys.
+#[derive(Clone)]
 pub struct AgentConfig {
     /// OpenAI-compatible base URL, e.g. `http://127.0.0.1:18433/v1`.
     pub base_url: String,
@@ -32,11 +32,34 @@ pub enum ApprovalMode {
     AskForChanges,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct JevConfig {
     pub api_key: String,
     pub base_url: String,
     pub model: String,
+}
+
+impl std::fmt::Debug for AgentConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AgentConfig")
+            .field("base_url", &self.base_url)
+            .field("model", &self.model)
+            .field("api_key", &"<redacted>")
+            .field("workspace", &self.workspace)
+            .field("approval", &self.approval)
+            .field("jev", &self.jev)
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for JevConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("JevConfig")
+            .field("api_key", &"<redacted>")
+            .field("base_url", &self.base_url)
+            .field("model", &self.model)
+            .finish()
+    }
 }
 
 /// Front end -> engine.
