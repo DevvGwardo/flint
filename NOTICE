@@ -1,0 +1,25 @@
+flint
+Copyright 2026 the flint contributors
+
+Licensed under the Apache License, Version 2.0 (see LICENSE).
+
+This product includes software and ideas from the following projects.
+
+openai/codex (Apache-2.0) - https://github.com/openai/codex
+  The agent's system prompt (crates/flint-agent/src/prompt.rs) is adapted
+  from the Codex agent prompt. Copyright OpenAI, licensed under the Apache
+  License, Version 2.0. The adapted text has been modified.
+
+GPUI and gpui-kit (Apache-2.0)
+  https://github.com/zed-industries/zed (GPUI), https://github.com/longbridge/gpui-kit
+  The user interface is built on GPUI, the GPU-accelerated UI framework from
+  the Zed editor, through the gpui-kit crate (which also bundles GPUI Component).
+
+Agent Client Protocol (Apache-2.0) - https://agentclientprotocol.com
+  crates/flint-acp speaks the Agent Client Protocol (through the
+  agent-client-protocol crate) to run Claude Code and Codex through the
+  claude-agent-acp and codex-acp adapters. Those adapters and the agents
+  themselves are separate programs with their own licenses; flint does not
+  bundle them.
+
+Third-party Rust crates are used under their own licenses; see Cargo.lock.
