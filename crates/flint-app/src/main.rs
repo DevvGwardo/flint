@@ -1,21 +1,23 @@
 //! flint: a native agent/coding workstation on GPUI.
 //!
 //! Usage: `flint [WORKSPACE] [--demo] [--demo-stop N] [--demo-instant]
-//!        [--demo-approval] [--prompt TEXT] [--palette] [--changes] [--select-change]`
+//!        [--demo-approval] [--demo-expand] [--prompt TEXT] [--size WxH] [--palette] [--changes] [--select-change]`
 
 mod app;
+mod app_actions;
 mod changes_panel;
 mod composer;
 mod demo;
 mod diff;
 mod engine;
+mod header;
+mod layout;
 mod palette;
 mod session;
 mod sidebar;
-mod status_bar;
 mod theme;
-mod title_bar;
 mod transcript;
+mod turns;
 mod ui;
 mod view_model;
 
@@ -34,8 +36,15 @@ fn parse_options() -> Options {
             "--demo-instant" => options.demo_instant = true,
             "--demo-stop" => options.demo_stop = args.next().and_then(|n| n.parse().ok()),
             "--demo-approval" => options.demo_approval = true,
+            "--demo-expand" => options.demo_expand = true,
             "--prompt" => options.prompt = args.next(),
             "--palette" => options.open_palette = true,
+            "--size" => {
+                options.window_size = args.next().and_then(|s| {
+                    let (w, h) = s.split_once('x')?;
+                    Some((w.parse().ok()?, h.parse().ok()?))
+                });
+            }
             "--changes" => options.open_changes = true,
             "--select-change" => options.select_change = true,
             path if !path.starts_with("--") => options.workspace = Some(path.into()),
@@ -56,7 +65,6 @@ fn bind_keys(cx: &mut App) {
         KeyBinding::new("cmd-shift-a", ToggleApproval, None),
         KeyBinding::new("cmd-o", OpenWorkspace, None),
         KeyBinding::new("cmd-.", Interrupt, None),
-        KeyBinding::new("escape", Interrupt, Some("FlintApp")),
         KeyBinding::new("cmd-l", FocusComposer, None),
         KeyBinding::new("cmd-q", Quit, None),
     ]);
@@ -72,10 +80,19 @@ fn main() {
             bind_keys(cx);
             cx.on_action(|_: &app::Quit, cx| cx.quit());
 
-            let bounds = Bounds::centered(None, size(px(1440.), px(900.)), cx);
+            let (w, h) = options.window_size.unwrap_or((1440., 900.));
+            let bounds = Bounds::centered(None, size(px(w), px(h)), cx);
             let window_options = WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 window_min_size: Some(size(px(900.), px(560.))),
+                // Vibrancy behind the floating sidebar.
+                window_background: WindowBackgroundAppearance::Blurred,
+                titlebar: Some(TitlebarOptions {
+                    title: None,
+                    appears_transparent: true,
+                    // Inside the floating sidebar's top row.
+                    traffic_light_position: Some(point(px(20.), px(21.))),
+                }),
                 ..TitleBar::window_options()
             };
             gpui_kit::open_window(window_options, cx, move |window, cx| {

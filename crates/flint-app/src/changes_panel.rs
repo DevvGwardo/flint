@@ -18,9 +18,9 @@ pub fn render(app: &FlintApp, cx: &mut Context<FlintApp>) -> impl IntoElement {
         .fold((0, 0), |(a, r), f| (a + f.added, r + f.removed));
 
     let header = div()
-        .h(px(36.))
+        .h(px(crate::header::HEADER_HEIGHT))
         .flex_shrink_0()
-        .px(px(14.))
+        .px(px(18.))
         .flex()
         .items_center()
         .justify_between()
@@ -31,7 +31,7 @@ pub fn render(app: &FlintApp, cx: &mut Context<FlintApp>) -> impl IntoElement {
                 .flex()
                 .items_center()
                 .gap(px(8.))
-                .child(ui::icon(IconName::FileDiff, 13., p.text_muted))
+                .child(ui::icon(IconName::FileDiff, 15., p.text_muted))
                 .child(
                     div()
                         .text_size(px(size::BASE))
@@ -57,13 +57,13 @@ pub fn render(app: &FlintApp, cx: &mut Context<FlintApp>) -> impl IntoElement {
         let (dir, name) = split_path(&file.path);
         div()
             .id(("change", ix))
-            .mx(px(6.))
-            .px(px(8.))
-            .h(px(30.))
-            .rounded(px(6.))
+            .mx(px(8.))
+            .px(px(12.))
+            .h(px(38.))
+            .rounded(px(9.))
             .flex()
             .items_center()
-            .gap(px(8.))
+            .gap(px(10.))
             .cursor_pointer()
             .when(selected, |row| row.bg(p.raised))
             .when(!selected, |row| row.hover(|style| style.bg(p.surface)))
@@ -124,8 +124,8 @@ pub fn render(app: &FlintApp, cx: &mut Context<FlintApp>) -> impl IntoElement {
                 .border_color(p.border)
                 .child(
                     div()
-                        .h(px(30.))
-                        .px(px(14.))
+                        .h(px(40.))
+                        .px(px(18.))
                         .flex()
                         .items_center()
                         .bg(p.surface)
@@ -171,7 +171,7 @@ pub fn render(app: &FlintApp, cx: &mut Context<FlintApp>) -> impl IntoElement {
             panel
                 .child(
                     div()
-                        .py(px(6.))
+                        .py(px(10.))
                         .flex()
                         .flex_col()
                         .gap(px(1.))

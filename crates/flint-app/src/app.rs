@@ -1,5 +1,6 @@
-//! The root view: owns sessions, the composer and panel state, routes actions,
-//! and pumps engine (or demo) events into the active session.
+//! The root view's state and behavior: sessions (each with its own engine,
+//! running independently), the composer, panels, and event pumping. Layout
+//! lives in `layout.rs`.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -12,15 +13,13 @@ use flint_agent::Op;
 use flint_agent::TurnEndReason;
 use gpui_kit::component::command::CommandState;
 use gpui_kit::component::input::InputEvent;
+use gpui_kit::component::input::InputState;
 use gpui_kit::component::input::TextareaState;
-use gpui_kit::component::*;
-use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use crate::demo;
 use crate::engine;
 use crate::session::Session;
-use crate::theme::palette;
 
 actions!(
     flint,
@@ -33,6 +32,7 @@ actions!(
         OpenWorkspace,
         Interrupt,
         FocusComposer,
+        RevealWorkspace,
         Quit,
     ]
 );
@@ -48,28 +48,57 @@ pub struct Options {
     pub demo_instant: bool,
     /// Demo: ask for approval before the final test run.
     pub demo_approval: bool,
+    /// Demo: expand the finished turn's work block.
+    pub demo_expand: bool,
     /// Submit this message on startup (scripting and screenshots).
     pub prompt: Option<String>,
     pub open_palette: bool,
     pub open_changes: bool,
+    /// Initial window size, e.g. `1100x800`.
+    pub window_size: Option<(f32, f32)>,
     pub select_change: bool,
+}
+
+/// Which sessions the sidebar lists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionFilter {
+    All,
+    Running,
+    Unread,
+}
+
+/// Reasoning effort shown on the model chip. The engine protocol has no
+/// effort setting yet, so this is display-only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Effort {
+    Low,
+    Medium,
+    High,
 }
 
 pub struct FlintApp {
     pub sessions: Vec<Session>,
     pub active: usize,
+    /// Workspace new sessions start in.
     pub workspace: PathBuf,
-    pub branch: Option<String>,
     pub model: String,
+    pub effort: Effort,
     pub approval: ApprovalMode,
     pub sidebar_open: bool,
+    /// Whether the sidebar is on screen this frame (it auto-collapses when narrow).
+    pub sidebar_visible: bool,
     pub changes_open: bool,
     pub selected_change: Option<usize>,
     pub palette: Option<Entity<CommandState>>,
     pub composer: Entity<TextareaState>,
+    pub search: Entity<InputState>,
+    pub filter: SessionFilter,
+    pub notice_dismissed: bool,
     pub origin: Instant,
-    focus: FocusHandle,
-    options: Options,
+    pub(crate) focus: FocusHandle,
+    /// Window drag from the header, armed on mouse down.
+    pub(crate) drag_armed: bool,
+    pub(crate) options: Options,
     _subscriptions: Vec<Subscription>,
     _ticker: Task<()>,
 }
@@ -83,27 +112,31 @@ impl FlintApp {
             .unwrap_or_default();
         let composer = cx.new(|cx| {
             TextareaState::new(window, cx)
-                .auto_grow(1, 10)
+                .auto_grow(1, 8)
                 .submit_on_enter(true)
-                .placeholder("Ask flint to build, fix, or explain something…")
+                .placeholder("Ask anything, @ to mention, / for actions")
         });
-        let subscriptions = vec![cx.subscribe_in(
-            &composer,
-            window,
-            |this, _, event: &InputEvent, window, cx| {
-                if let InputEvent::PressEnter { shift: false, .. } = event {
-                    this.submit(window, cx);
-                }
-            },
-        )];
-        // Redraw once a second while a turn runs so the elapsed time ticks.
+        let search = cx.new(|cx| InputState::new(window, cx).placeholder("Search sessions"));
+        let subscriptions = vec![
+            cx.subscribe_in(
+                &composer,
+                window,
+                |this, _, event: &InputEvent, window, cx| {
+                    if let InputEvent::PressEnter { shift: false, .. } = event {
+                        this.submit(window, cx);
+                    }
+                },
+            ),
+            cx.subscribe(&search, |_, _, _: &InputEvent, cx| cx.notify()),
+        ];
+        // Animation clock: fast while anything runs (status glyphs, timers).
         let ticker = cx.spawn(async move |this, cx| {
             loop {
                 cx.background_executor()
-                    .timer(Duration::from_millis(500))
+                    .timer(Duration::from_millis(120))
                     .await;
                 let alive = this.update(cx, |app, cx| {
-                    if app.session().view.running {
+                    if app.sessions.iter().any(|s| s.view.running) {
                         cx.notify();
                     }
                 });
@@ -113,19 +146,24 @@ impl FlintApp {
             }
         });
         let mut app = Self {
-            branch: engine::git_branch(&workspace),
+            sessions: vec![Session::new(workspace.clone())],
             workspace,
-            sessions: vec![Session::new()],
             active: 0,
             model: engine::model_name(),
+            effort: Effort::Medium,
             approval: ApprovalMode::Auto,
             sidebar_open: true,
+            sidebar_visible: true,
             changes_open: options.open_changes,
             selected_change: None,
             palette: None,
             composer,
+            search,
+            filter: SessionFilter::All,
+            notice_dismissed: false,
             origin: Instant::now(),
             focus: cx.focus_handle(),
+            drag_armed: false,
             options: options.clone(),
             _subscriptions: subscriptions,
             _ticker: ticker,
@@ -153,21 +191,36 @@ impl FlintApp {
         self.origin.elapsed()
     }
 
+    pub fn branch(&self) -> Option<String> {
+        engine::git_branch(&self.session().workspace)
+    }
+
     fn start_demo(&mut self, cx: &mut Context<Self>) {
-        let ix = self.active;
-        let start = self.now();
-        let session = &mut self.sessions[ix];
-        session.demo = true;
-        let change = session.view.push_user(demo::PROMPT.to_string());
-        session.apply(change);
+        let change = self.sessions[0].view.push_user(demo::PROMPT.to_string());
+        self.sessions[0].apply(change);
         let mut beats = demo::script(self.options.demo_approval);
         if let Some(stop) = self.options.demo_stop {
             beats.truncate(stop);
         }
-        let instant = self.options.demo_instant;
-        let select_change = self.options.select_change;
-        session.pump = Some(cx.spawn(async move |this, cx| {
-            // Scripted time, so instant playback still shows real durations.
+        self.play(0, beats, self.options.demo_instant, cx);
+        // Other sessions working in the background, to show concurrency.
+        for extra in demo::extra_sessions(&self.workspace) {
+            let mut session = Session::new(extra.workspace);
+            let change = session.view.push_user(extra.prompt.to_string());
+            session.apply(change);
+            self.sessions.push(session);
+            let ix = self.sessions.len() - 1;
+            self.play(ix, extra.beats, extra.instant, cx);
+        }
+    }
+
+    /// Plays scripted events into a session with scripted time, so instant
+    /// playback still shows real durations.
+    fn play(&mut self, ix: usize, beats: Vec<demo::Beat>, instant: bool, cx: &mut Context<Self>) {
+        let start = self.now();
+        let select_change = self.options.select_change && ix == self.active;
+        let expand = self.options.demo_expand;
+        self.sessions[ix].pump = Some(cx.spawn(async move |this, cx| {
             let mut clock = start;
             for beat in beats {
                 clock += beat.delay;
@@ -181,13 +234,19 @@ impl FlintApp {
                     return;
                 }
             }
-            if select_change {
-                this.update(cx, |app, cx| {
-                    app.selected_change = Some(0);
-                    cx.notify();
-                })
-                .ok();
-            }
+            this.update(cx, |app, cx| {
+                if app.active == ix {
+                    if select_change {
+                        app.changes_open = true;
+                        app.selected_change = Some(0);
+                    }
+                    if expand {
+                        app.toggle_work(1, cx);
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
         }));
     }
 
@@ -203,11 +262,17 @@ impl FlintApp {
         now: Duration,
         cx: &mut Context<Self>,
     ) {
+        let active = self.active;
         let Some(session) = self.sessions.get_mut(ix) else {
             return;
         };
+        let finished = matches!(event, AgentEvent::TurnFinished { .. });
         let change = session.view.fold(event, now);
         session.apply(change);
+        session.touched = Instant::now();
+        if finished && ix != active {
+            session.unread = true;
+        }
         cx.notify();
     }
 
@@ -216,22 +281,22 @@ impl FlintApp {
         if text.is_empty() {
             return;
         }
-        if self.session().view.running && self.session().ops.is_none() {
+        let ix = self.active;
+        if self.sessions[ix].view.running && self.sessions[ix].ops.is_none() {
             return;
         }
         self.composer
             .update(cx, |state, cx| state.set_value("", window, cx));
-        let ix = self.active;
         let change = self.sessions[ix].view.push_user(text.clone());
         self.sessions[ix].apply(change);
-        if let Err(err) = self.ensure_engine(ix, cx) {
-            let now = self.now();
-            let change = self.sessions[ix]
-                .view
-                .fold(AgentEvent::Error(format!("{err:#}")), now);
-            self.sessions[ix].apply(change);
-        } else if let Some(ops) = &self.sessions[ix].ops {
-            ops.try_send(Op::UserMessage(text)).ok();
+        self.sessions[ix].touched = Instant::now();
+        match self.ensure_engine(ix, cx) {
+            Ok(()) => {
+                if let Some(ops) = &self.sessions[ix].ops {
+                    ops.try_send(Op::UserMessage(text)).ok();
+                }
+            }
+            Err(err) => self.apply_event(ix, AgentEvent::Error(format!("{err:#}")), cx),
         }
         cx.notify();
     }
@@ -241,7 +306,7 @@ impl FlintApp {
         if self.sessions[ix].ops.is_some() {
             return Ok(());
         }
-        let config = engine::config_for(&self.workspace, self.approval)?;
+        let config = engine::config_for(&self.sessions[ix].workspace, self.approval)?;
         let handle = flint_agent::spawn_session(config);
         let events = handle.events.clone();
         let session = &mut self.sessions[ix];
@@ -299,6 +364,26 @@ impl FlintApp {
         cx.notify();
     }
 
+    /// Answers the oldest unanswered approval in the active session.
+    pub fn answer_pending(&mut self, decision: ApprovalDecision, cx: &mut Context<Self>) {
+        let pending = self
+            .session()
+            .view
+            .items
+            .iter()
+            .find_map(|item| match item {
+                crate::view_model::Item::Approval {
+                    call_id,
+                    decision: None,
+                    ..
+                } => Some(call_id.clone()),
+                _ => None,
+            });
+        if let Some(call_id) = pending {
+            self.answer_approval(call_id, decision, cx);
+        }
+    }
+
     pub fn toggle_item(&mut self, ix: usize, cx: &mut Context<Self>) {
         let session = &mut self.sessions[self.active];
         let change = session.view.toggle_expanded(ix);
@@ -307,10 +392,38 @@ impl FlintApp {
         cx.notify();
     }
 
-    pub fn select_session(&mut self, ix: usize, cx: &mut Context<Self>) {
+    pub fn toggle_work(&mut self, ix: usize, cx: &mut Context<Self>) {
+        let session = &mut self.sessions[self.active];
+        let change = session.view.toggle_work(ix);
+        session.list.pause_following_tail();
+        session.apply(change);
+        cx.notify();
+    }
+
+    pub fn feedback(&mut self, ix: usize, positive: bool, cx: &mut Context<Self>) {
+        let session = &mut self.sessions[self.active];
+        let change = session.view.set_feedback(ix, positive);
+        session.apply(change);
+        cx.notify();
+    }
+
+    /// Opens the changes panel on the first file a turn changed.
+    pub fn review(&mut self, path: Option<String>, cx: &mut Context<Self>) {
+        let changes = &self.session().view.changes;
+        self.selected_change = path
+            .and_then(|path| changes.iter().position(|f| f.path == path))
+            .or(if changes.is_empty() { None } else { Some(0) });
+        self.changes_open = true;
+        cx.notify();
+    }
+
+    pub fn select_session(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
         if ix < self.sessions.len() {
             self.active = ix;
+            self.sessions[ix].unread = false;
             self.selected_change = None;
+            self.composer
+                .update(cx, |state, cx| state.focus(window, cx));
             cx.notify();
         }
     }
@@ -325,45 +438,22 @@ impl FlintApp {
         cx.notify();
     }
 
-    fn new_session(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        // Reuse an untouched session instead of stacking empty ones.
-        if let Some(ix) = self.sessions.iter().position(|s| s.view.items.is_empty()) {
-            self.active = ix;
-        } else {
-            self.sessions.push(Session::new());
-            self.active = self.sessions.len() - 1;
+    pub(crate) fn new_session(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // Reuse an untouched session in this workspace instead of stacking empty ones.
+        let reusable = self.sessions.iter().position(|s| {
+            s.view.items.is_empty() && s.ops.is_none() && s.workspace == self.workspace
+        });
+        match reusable {
+            Some(ix) => self.active = ix,
+            None => {
+                self.sessions.push(Session::new(self.workspace.clone()));
+                self.active = self.sessions.len() - 1;
+            }
         }
         self.selected_change = None;
         self.composer
             .update(cx, |state, cx| state.focus(window, cx));
         cx.notify();
-    }
-
-    fn open_workspace(&mut self, cx: &mut Context<Self>) {
-        let paths = cx.prompt_for_paths(PathPromptOptions {
-            files: false,
-            directories: true,
-            multiple: false,
-            prompt: Some("Open workspace".into()),
-        });
-        cx.spawn(async move |this, cx| {
-            let Ok(Ok(Some(paths))) = paths.await else {
-                return;
-            };
-            let Some(path) = paths.into_iter().next() else {
-                return;
-            };
-            this.update(cx, |app, cx| {
-                app.branch = engine::git_branch(&path);
-                app.workspace = path;
-                // Engines are bound to a workspace; new messages start fresh ones.
-                app.sessions.push(Session::new());
-                app.active = app.sessions.len() - 1;
-                cx.notify();
-            })
-            .ok();
-        })
-        .detach();
     }
 
     pub fn open_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -386,68 +476,5 @@ impl FlintApp {
             ApprovalMode::AskForChanges => ApprovalMode::Auto,
         };
         cx.notify();
-    }
-}
-
-impl Render for FlintApp {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let p = palette();
-        let body = h_resizable("flint-body")
-            .child(resizable_panel().child(crate::transcript::render_main(self, window, cx)))
-            .child(
-                resizable_panel()
-                    .size(px(400.))
-                    .size_range(px(300.)..px(760.))
-                    .visible(self.changes_open)
-                    .child(crate::changes_panel::render(self, cx)),
-            );
-        div()
-            .id("flint")
-            .key_context("FlintApp")
-            .track_focus(&self.focus)
-            .on_action(cx.listener(|this, _: &NewSession, window, cx| this.new_session(window, cx)))
-            .on_action(cx.listener(|this, _: &TogglePalette, window, cx| {
-                if this.palette.is_some() {
-                    this.close_palette(window, cx);
-                } else {
-                    this.open_palette(window, cx);
-                }
-            }))
-            .on_action(cx.listener(|this, _: &ToggleChanges, _, cx| {
-                this.changes_open = !this.changes_open;
-                cx.notify();
-            }))
-            .on_action(cx.listener(|this, _: &ToggleSidebar, _, cx| {
-                this.sidebar_open = !this.sidebar_open;
-                cx.notify();
-            }))
-            .on_action(cx.listener(|this, _: &ToggleApproval, _, cx| this.toggle_approval(cx)))
-            .on_action(cx.listener(|this, _: &OpenWorkspace, _, cx| this.open_workspace(cx)))
-            .on_action(cx.listener(|this, _: &Interrupt, _, cx| this.interrupt(cx)))
-            .on_action(cx.listener(|this, _: &FocusComposer, window, cx| {
-                this.composer
-                    .update(cx, |state, cx| state.focus(window, cx));
-            }))
-            .size_full()
-            .flex()
-            .flex_col()
-            .bg(p.bg)
-            .text_color(p.text)
-            .text_size(px(crate::theme::size::BASE))
-            .child(crate::title_bar::render(self, cx))
-            .child(
-                div()
-                    .flex_1()
-                    .min_h_0()
-                    .flex()
-                    .when(self.sidebar_open, |row| {
-                        row.child(crate::sidebar::render(self, cx))
-                    })
-                    .child(div().flex_1().min_w_0().h_full().child(body)),
-            )
-            .child(crate::status_bar::render(self, cx))
-            .when_some(self.palette.clone(), |root, state| {
-                root.child(crate::palette::render(&state, cx))
-            })
     }
 }

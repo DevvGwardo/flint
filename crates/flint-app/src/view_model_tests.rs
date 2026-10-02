@@ -115,7 +115,7 @@ fn tool_output_streams_then_finishes_and_failed_commands_open() {
                 diff: None,
                 duration_ms: 1200,
             }),
-            expanded: true,
+            expanded: false,
         }))
     );
 }

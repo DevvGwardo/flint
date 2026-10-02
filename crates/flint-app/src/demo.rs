@@ -340,3 +340,101 @@ fn chunks(text: &str, words: usize) -> Vec<String> {
     }
     out
 }
+
+/// A background session for the demo.
+pub struct Extra {
+    pub workspace: std::path::PathBuf,
+    pub prompt: &'static str,
+    pub beats: Vec<Beat>,
+    pub instant: bool,
+}
+
+/// Two more sessions: one still running in a sibling workspace, one finished
+/// (unread) in the main workspace.
+pub fn extra_sessions(workspace: &std::path::Path) -> Vec<Extra> {
+    let sibling = workspace
+        .parent()
+        .map(|parent| parent.join("spark"))
+        .unwrap_or_else(|| workspace.join("spark"));
+
+    let mut running = Script::default();
+    running.at(300, AgentEvent::TurnStarted { turn_id: 1 });
+    running.step(1);
+    running.stream_reasoning("Find the router first, then add the route and a test.");
+    running.tool(
+        "b1",
+        "read_file",
+        ToolKind::Read,
+        json!({"path": "server/index.ts"}),
+        "server/index.ts",
+    );
+    running.finish("b1", "import express from 'express';", None, true, None, 9);
+    running.step(2);
+    running.tool(
+        "b2",
+        "run_command",
+        ToolKind::Command,
+        json!({"command": "npm run build -- --watch"}),
+        "npm run build -- --watch",
+    );
+    for n in 0..400 {
+        running.at(
+            900,
+            AgentEvent::ToolOutputDelta {
+                call_id: "b2".into(),
+                chunk: format!(
+                    "[watch] rebuilt in {}ms ({} modules)\n",
+                    180 + n % 40,
+                    212 + n
+                ),
+            },
+        );
+    }
+
+    let mut done = Script::default();
+    done.at(0, AgentEvent::TurnStarted { turn_id: 1 });
+    done.step(1);
+    done.tool(
+        "d1",
+        "grep",
+        ToolKind::Search,
+        json!({"pattern": "SessionStore"}),
+        "\"SessionStore\" in src",
+    );
+    done.finish(
+        "d1",
+        "src/store.ts:4: export class SessionStore {",
+        None,
+        true,
+        None,
+        30,
+    );
+    done.step(2);
+    done.stream_text(
+        "Sessions live in `SessionStore` (`src/store.ts`), an append-only JSONL log per \
+         session that is replayed on startup.",
+    );
+    done.usage(3_120, 1_024, 140, 60);
+    done.at(
+        0,
+        AgentEvent::TurnFinished {
+            turn_id: 1,
+            reason: TurnEndReason::Completed,
+        },
+    );
+
+    vec![
+        Extra {
+            workspace: sibling,
+            prompt: "Add a /health endpoint to the API server",
+            beats: running.beats,
+            instant: false,
+        },
+        Extra {
+            workspace: workspace.to_path_buf(),
+            prompt: "Explain how session storage works",
+            beats: done.beats,
+            instant: true,
+        },
+    ]
+}

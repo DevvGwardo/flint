@@ -15,6 +15,9 @@ use flint_agent::ToolKind;
 use flint_agent::TurnEndReason;
 use flint_agent::Usage;
 
+pub use crate::turns::Role;
+pub use crate::turns::TurnInfo;
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Item {
     User(String),
@@ -97,7 +100,7 @@ pub struct Change {
 }
 
 impl Change {
-    fn updated(ix: usize) -> Self {
+    pub(crate) fn updated(ix: usize) -> Self {
         Self {
             appended: 0..0,
             updated: vec![ix],
@@ -120,6 +123,11 @@ pub struct SessionView {
     pub session_usage: Usage,
     pub changes: Vec<ChangedFile>,
     pub pending_approvals: usize,
+    /// Every turn so far; see `turns.rs`.
+    pub turns: Vec<TurnInfo>,
+    /// The turn each item belongs to, parallel to `items`.
+    pub turn_of: Vec<Option<usize>>,
+    pub current_turn: Option<usize>,
 }
 
 impl SessionView {
@@ -139,6 +147,7 @@ impl SessionView {
                 self.step = 0;
                 self.turn_started = Some(now);
                 self.usage = Usage::default();
+                self.begin_turn();
                 Change::default()
             }
             AgentEvent::StepStarted { step, .. } => {
@@ -192,11 +201,10 @@ impl SessionView {
                 };
                 if let Some(diff) = &diff {
                     self.record_change(diff);
+                    self.note_turn_file(diff);
                 }
                 if let Item::Tool(call) = &mut self.items[ix] {
                     call.output = output;
-                    // Failed commands open so the error is visible.
-                    call.expanded = !success && call.kind == ToolKind::Command;
                     call.result = Some(ToolResult {
                         exit_code,
                         success,
@@ -220,6 +228,7 @@ impl SessionView {
                 })
             }
             AgentEvent::HarnessNudge { reason, message } => {
+                self.note_turn_nudge();
                 let mut change = self.close_streams(now);
                 change.appended = self.push(Item::Nudge { reason, message }).appended;
                 change
@@ -247,6 +256,8 @@ impl SessionView {
                         usage: self.usage,
                     })
                     .appended;
+                // The turn's work collapses, so every row in it changes height.
+                change.updated.extend(self.end_turn(duration));
                 change
             }
             AgentEvent::Error(message) => self.push(Item::Error(message)),
@@ -289,6 +300,7 @@ impl SessionView {
     fn push(&mut self, item: Item) -> Change {
         let ix = self.items.len();
         self.items.push(item);
+        self.turn_of.push(self.current_turn);
         Change {
             appended: ix..ix + 1,
             updated: Vec::new(),

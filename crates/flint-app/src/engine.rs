@@ -2,7 +2,6 @@
 //! current git branch for the title bar.
 
 use std::path::Path;
-use std::path::PathBuf;
 
 use flint_agent::AgentConfig;
 use flint_agent::ApprovalMode;
@@ -32,16 +31,5 @@ pub fn git_branch(workspace: &Path) -> Option<String> {
     match head.strip_prefix("ref: refs/heads/") {
         Some(branch) => Some(branch.to_string()),
         None => Some(head.chars().take(7).collect()),
-    }
-}
-
-/// `~/Projects/foo` style display path.
-pub fn display_path(path: &Path) -> String {
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_default();
-    match path.strip_prefix(&home) {
-        Ok(rest) if !home.as_os_str().is_empty() => format!("~/{}", rest.display()),
-        _ => path.display().to_string(),
     }
 }

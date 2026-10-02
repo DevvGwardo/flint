@@ -11,6 +11,12 @@ use gpui_kit::*;
 
 /// App-specific colors the component theme has no slot for.
 pub struct Palette {
+    /// Tint over the blurred window backdrop (around the floating sidebar).
+    pub window_tint: Hsla,
+    /// The floating sidebar's translucent fill.
+    pub sidebar_fill: Hsla,
+    /// The user's message bubble.
+    pub bubble: Hsla,
     /// Window background (transcript canvas).
     pub bg: Hsla,
     /// Chrome: title bar, sidebar, status bar.
@@ -26,11 +32,11 @@ pub struct Palette {
     pub text_subtle: Hsla,
     pub accent: Hsla,
     pub accent_soft: Hsla,
+    /// Text on the accent fill.
+    pub on_accent: Hsla,
     pub success: Hsla,
     pub danger: Hsla,
-    pub danger_soft: Hsla,
     pub warning: Hsla,
-    pub warning_soft: Hsla,
     pub info: Hsla,
     pub diff_add_bg: Hsla,
     pub diff_del_bg: Hsla,
@@ -50,7 +56,10 @@ fn hexa(value: u32, alpha: f32) -> Hsla {
 }
 
 pub static PALETTE: LazyLock<Palette> = LazyLock::new(|| Palette {
-    bg: hex(0x0c0c0e),
+    window_tint: hexa(0x0b0b0d, 0.78),
+    sidebar_fill: hexa(0xffffff, 0.035),
+    bubble: hex(0x1c1c21),
+    bg: hex(0x0e0e10),
     chrome: hex(0x0f0f12),
     surface: hex(0x141418),
     raised: hex(0x1b1b20),
@@ -61,11 +70,10 @@ pub static PALETTE: LazyLock<Palette> = LazyLock::new(|| Palette {
     text_subtle: hex(0x63636d),
     accent: hex(0xff8a3d),
     accent_soft: hexa(0xff8a3d, 0.14),
+    on_accent: hex(0x1a0d04),
     success: hex(0x4cc38a),
     danger: hex(0xf2555a),
-    danger_soft: hexa(0xf2555a, 0.13),
     warning: hex(0xe5b454),
-    warning_soft: hexa(0xe5b454, 0.12),
     info: hex(0x6aa6ff),
     diff_add_bg: hexa(0x4cc38a, 0.10),
     diff_del_bg: hexa(0xf2555a, 0.10),
@@ -82,10 +90,12 @@ pub const MONO_FONT: &str = "JetBrains Mono";
 
 /// Text sizes used across the app (px).
 pub mod size {
-    pub const XS: f32 = 11.;
-    pub const SM: f32 = 12.;
-    pub const BASE: f32 = 13.;
-    pub const MD: f32 = 14.;
+    pub const XS: f32 = 12.5;
+    /// Mono text: code, paths, commands.
+    pub const SM: f32 = 13.5;
+    pub const BASE: f32 = 15.;
+    pub const MD: f32 = 15.;
+    pub const PROSE: f32 = 16.;
 }
 
 /// Installs the dark theme and overrides its colors with the palette.
@@ -95,9 +105,9 @@ pub fn install(cx: &mut App) {
     Theme::update(cx, |theme| {
         theme.font_size = px(size::BASE);
         theme.mono_font_family = MONO_FONT.into();
-        theme.mono_font_size = px(12.);
-        theme.radius = px(6.);
-        theme.radius_lg = px(10.);
+        theme.mono_font_size = px(13.5);
+        theme.radius = px(8.);
+        theme.radius_lg = px(14.);
         theme.shadow = true;
 
         let c = &mut theme.colors;

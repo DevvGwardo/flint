@@ -7,7 +7,6 @@ use gpui_kit::component::Icon;
 use gpui_kit::*;
 
 use crate::theme::MONO_FONT;
-use crate::theme::palette;
 use crate::theme::size;
 
 pub fn icon(name: IconName, size_px: f32, color: Hsla) -> Icon {
@@ -31,23 +30,6 @@ pub fn mono(text: impl Into<SharedString>, size_px: f32, color: Hsla) -> Div {
         .child(text.into())
 }
 
-/// A keycap hint like `⌘K`.
-pub fn key_hint(keys: &str) -> Div {
-    let p = palette();
-    div()
-        .px(px(5.))
-        .h(px(18.))
-        .flex()
-        .items_center()
-        .rounded(px(4.))
-        .border_1()
-        .border_color(p.border_strong)
-        .bg(p.surface)
-        .text_size(px(size::XS))
-        .text_color(p.text_muted)
-        .child(keys.to_string())
-}
-
 /// A small pill: colored text on a soft tint.
 pub fn pill(text: impl Into<SharedString>, fg: Hsla, bg: Hsla) -> Div {
     div()
@@ -61,11 +43,6 @@ pub fn pill(text: impl Into<SharedString>, fg: Hsla, bg: Hsla) -> Div {
         .font_weight(FontWeight::MEDIUM)
         .text_color(fg)
         .child(text.into())
-}
-
-/// A 1px vertical divider for chrome rows.
-pub fn vdivider() -> Div {
-    div().w(px(1.)).h(px(14.)).bg(palette().border_strong)
 }
 
 /// `24.9k`, `1.2M`, `512`.
