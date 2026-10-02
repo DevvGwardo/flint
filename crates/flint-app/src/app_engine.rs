@@ -210,6 +210,7 @@ impl FlintApp {
             &session.workspace,
             &self.settings,
             self.key_path.as_deref(),
+            &self.key_sources,
             self.approval,
         )?;
         config.session_dir = session.dir.clone();

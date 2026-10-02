@@ -18,6 +18,7 @@ use gpui_kit::*;
 
 use crate::engine;
 use crate::session::Session;
+use crate::settings::KeySources;
 use crate::settings::Settings;
 
 actions!(
@@ -81,6 +82,9 @@ pub struct Options {
     pub home: Option<PathBuf>,
     /// API key file; overrides the `api_key_file` setting.
     pub key_path: Option<PathBuf>,
+    /// Environment and legacy key file the key lookup may use; `None` means
+    /// the process environment and `~/.fx/surplus.key`.
+    pub key_sources: Option<KeySources>,
 }
 
 impl Options {
@@ -107,6 +111,7 @@ pub struct FlintApp {
     pub home: PathBuf,
     /// API key file override from the command line, ahead of the settings.
     pub key_path: Option<PathBuf>,
+    pub key_sources: KeySources,
     pub settings: Settings,
     pub model: String,
     pub effort: Option<ReasoningEffort>,
@@ -163,7 +168,8 @@ impl FlintApp {
             .clone()
             .unwrap_or_else(crate::settings::flint_home);
         let key_path = options.key_path.clone();
-        let settings = Settings::load(&home);
+        let key_sources = options.key_sources.clone().unwrap_or_default();
+        let settings = Settings::load(&home, &key_sources);
         let composer = cx.new(|cx| {
             TextareaState::new(window, cx)
                 .auto_grow(1, 8)
@@ -188,6 +194,7 @@ impl FlintApp {
             workspace: workspace.clone(),
             home,
             key_path,
+            key_sources,
             active: 0,
             model: settings.model.clone(),
             effort: settings.reasoning_effort(),

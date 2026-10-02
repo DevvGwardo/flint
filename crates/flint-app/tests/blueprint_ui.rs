@@ -13,6 +13,7 @@ use flint_agent::ToolKind;
 use flint_agent::TurnEndReason;
 use flint_app::app::FlintApp;
 use flint_app::app::Options;
+use flint_app::settings::KeySources;
 use flint_app::view_model::Item;
 use gpui_kit::test::TestWindowExt;
 use gpui_kit::{
@@ -79,6 +80,8 @@ fn test_options() -> Options {
         workspace: Some(temp_dir("ws")),
         home: Some(home),
         key_path: Some(key),
+        // No environment keys and no ~/.fx fallback: independent of this machine.
+        key_sources: Some(KeySources::none()),
         ..Options::default()
     }
 }
@@ -958,7 +961,6 @@ fn copy_shows_copied_and_fills_the_clipboard(cx: &mut TestAppContext) {
 
 #[gpui_kit::test]
 fn a_missing_key_shows_a_card_that_opens_settings(cx: &mut TestAppContext) {
-    // Assumes FLINT_API_KEY / OPENAI_API_KEY are unset, as on CI.
     let ui = open_with(
         cx,
         Options {

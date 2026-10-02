@@ -7,6 +7,7 @@ use anyhow::bail;
 use flint_agent::AgentConfig;
 use flint_agent::ApprovalMode;
 
+use crate::settings::KeySources;
 use crate::settings::Settings;
 
 /// Prefix of the error shown when no API key is configured (the UI offers
@@ -20,9 +21,10 @@ pub fn config_for(
     workspace: &Path,
     settings: &Settings,
     key_file: Option<&Path>,
+    sources: &KeySources,
     approval: ApprovalMode,
 ) -> anyhow::Result<AgentConfig> {
-    let Some(found) = settings.resolve_key(key_file) else {
+    let Some(found) = settings.resolve_key(key_file, sources) else {
         bail!(
             "{NO_KEY}. Set FLINT_API_KEY (or OPENAI_API_KEY) in the environment, or choose a \
              key file in Settings, then retry."

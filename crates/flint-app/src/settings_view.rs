@@ -142,7 +142,10 @@ fn row(label: &str, hint: Option<&str>, control: impl IntoElement) -> Div {
 pub fn render(app: &FlintApp, cx: &mut Context<FlintApp>) -> Option<impl IntoElement> {
     let p = palette();
     let form = app.settings_form.as_ref()?;
-    let (key_icon, key_text, key_color) = match app.settings.key_status(app.key_path.as_deref()) {
+    let (key_icon, key_text, key_color) = match app
+        .settings
+        .key_status(app.key_path.as_deref(), &app.key_sources)
+    {
         KeyStatus::Found(source) => (
             IconName::CircleCheck,
             format!("Found in {source}"),

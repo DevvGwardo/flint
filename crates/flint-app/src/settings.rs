@@ -9,7 +9,6 @@ use flint_agent::ApprovalMode;
 use flint_agent::ReasoningEffort;
 use flint_agent::config::DEFAULT_BASE_URL;
 use flint_agent::config::DEFAULT_MODEL;
-use flint_agent::config::api_key_from_env;
 use serde::Deserialize;
 use serde::Serialize;
 
@@ -67,9 +66,9 @@ impl Settings {
     }
 
     /// Reads the settings file; a missing or unreadable file gives defaults.
-    pub fn load(home: &Path) -> Self {
+    pub fn load(home: &Path, sources: &KeySources) -> Self {
         let Ok(text) = std::fs::read_to_string(Self::path(home)) else {
-            return Self::legacy_defaults().unwrap_or_default();
+            return Self::legacy_defaults(sources).unwrap_or_default();
         };
         toml::from_str(&text).unwrap_or_default()
     }
@@ -77,8 +76,8 @@ impl Settings {
     /// Backward compatibility for early installs that predate the provider
     /// settings: with no config file but a key at `~/.fx/surplus.key`, keep
     /// talking to the local shim those installs were written against.
-    fn legacy_defaults() -> Option<Self> {
-        legacy_key_path().is_file().then(|| Self {
+    fn legacy_defaults(sources: &KeySources) -> Option<Self> {
+        sources.legacy_key_file.as_ref()?.is_file().then(|| Self {
             model: LEGACY_MODEL.to_string(),
             base_url: LEGACY_BASE_URL.to_string(),
             ..Self::default()
@@ -129,8 +128,40 @@ impl Settings {
 const LEGACY_BASE_URL: &str = "http://127.0.0.1:18433/v1";
 const LEGACY_MODEL: &str = "deepseek-v4.1-flash";
 
-fn legacy_key_path() -> PathBuf {
-    home().join(".fx").join("surplus.key")
+/// Where API keys may come from besides the settings: environment variables
+/// and the key file of early installs. The app takes this as a parameter so
+/// tests can run without the developer's environment or home directory.
+#[derive(Debug, Clone)]
+pub struct KeySources {
+    /// Looks up an environment variable (`None` when unset or empty).
+    pub env: fn(&str) -> Option<String>,
+    /// Key file of early installs, used only with their endpoint.
+    pub legacy_key_file: Option<PathBuf>,
+}
+
+impl KeySources {
+    /// No environment and no legacy key file.
+    pub fn none() -> Self {
+        Self {
+            env: |_| None,
+            legacy_key_file: None,
+        }
+    }
+}
+
+impl Default for KeySources {
+    /// The process environment and `~/.fx/surplus.key`.
+    fn default() -> Self {
+        Self {
+            env: |name| {
+                std::env::var(name)
+                    .ok()
+                    .map(|v| v.trim().to_string())
+                    .filter(|v| !v.is_empty())
+            },
+            legacy_key_file: Some(home().join(".fx").join("surplus.key")),
+        }
+    }
 }
 
 /// Where the API key comes from, for display (never the key itself).
@@ -167,7 +198,11 @@ impl Settings {
     /// `FLINT_API_KEY`, `OPENAI_API_KEY`. Keys from early installs
     /// (`~/.fx/surplus.key`) are used only for the endpoint they were issued
     /// for, so they are never sent to another provider.
-    pub fn resolve_key(&self, key_file: Option<&Path>) -> Option<ResolvedKey> {
+    pub fn resolve_key(
+        &self,
+        key_file: Option<&Path>,
+        sources: &KeySources,
+    ) -> Option<ResolvedKey> {
         let from_file = |path: PathBuf| {
             read_key_file(&path).map(|key| ResolvedKey {
                 key,
@@ -184,36 +219,32 @@ impl Settings {
         }
         let named = self.api_key_env.trim();
         if !named.is_empty()
-            && let Some(key) = std::env::var(named)
-                .ok()
-                .map(|key| key.trim().to_string())
-                .filter(|key| !key.is_empty())
+            && let Some(key) = (sources.env)(named)
         {
             return Some(ResolvedKey {
                 key,
                 source: format!("${named}"),
             });
         }
-        if let Some(key) = api_key_from_env() {
-            let source = if std::env::var("FLINT_API_KEY").is_ok_and(|v| !v.trim().is_empty()) {
-                "$FLINT_API_KEY"
-            } else {
-                "$OPENAI_API_KEY"
-            };
-            return Some(ResolvedKey {
-                key,
-                source: source.to_string(),
-            });
+        for name in ["FLINT_API_KEY", "OPENAI_API_KEY"] {
+            if let Some(key) = (sources.env)(name) {
+                return Some(ResolvedKey {
+                    key,
+                    source: format!("${name}"),
+                });
+            }
         }
-        if self.base_url == LEGACY_BASE_URL {
-            return from_file(legacy_key_path());
+        if self.base_url == LEGACY_BASE_URL
+            && let Some(path) = &sources.legacy_key_file
+        {
+            return from_file(path.clone());
         }
         None
     }
 
     /// What Settings shows for the key: where it was found, or what to set.
-    pub fn key_status(&self, key_file: Option<&Path>) -> KeyStatus {
-        match self.resolve_key(key_file) {
+    pub fn key_status(&self, key_file: Option<&Path>, sources: &KeySources) -> KeyStatus {
+        match self.resolve_key(key_file, sources) {
             Some(found) => KeyStatus::Found(found.source),
             None if !self.api_key_file.is_empty() => {
                 KeyStatus::Missing(display_path(&expand_home(&self.api_key_file)))
