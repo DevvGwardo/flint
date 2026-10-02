@@ -26,4 +26,5 @@ serde = { workspace = true, features = ["derive"] }
 
 [dev-dependencies]
 pretty_assertions = "1"
+tempfile = "3.27.0"
 gpui-kit = { version = "0.7.0", features = ["test-support"] }

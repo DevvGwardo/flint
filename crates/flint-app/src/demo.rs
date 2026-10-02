@@ -354,8 +354,8 @@ pub struct Extra {
 pub fn extra_sessions(workspace: &std::path::Path) -> Vec<Extra> {
     let sibling = workspace
         .parent()
-        .map(|parent| parent.join("spark"))
-        .unwrap_or_else(|| workspace.join("spark"));
+        .map(|parent| parent.join("api"))
+        .unwrap_or_else(|| workspace.join("api"));
 
     let mut running = Script::default();
     running.at(300, AgentEvent::TurnStarted { turn_id: 1 });

@@ -29,7 +29,13 @@ const LIVE_TAIL_LINES: usize = 4;
 /// Cap on rendered output lines, even expanded.
 const MAX_OUTPUT_LINES: usize = 400;
 
-pub fn render(ix: usize, item: &Item, now: Duration, cx: &mut Context<FlintApp>) -> AnyElement {
+pub fn render(
+    ix: usize,
+    item: &Item,
+    now: Duration,
+    base_url: &str,
+    cx: &mut Context<FlintApp>,
+) -> AnyElement {
     match item {
         Item::User(text) => user(text).into_any_element(),
         Item::Assistant { text, streaming } => bullet(
@@ -87,7 +93,7 @@ pub fn render(ix: usize, item: &Item, now: Duration, cx: &mut Context<FlintApp>)
             let _ = call_id;
             super::approval::record(*kind, summary, *decision).into_any_element()
         }
-        Item::Error(message) => super::errors::render(ix, message, cx),
+        Item::Error(message) => super::errors::render(ix, message, base_url, cx),
         Item::TurnSummary { .. } => div().into_any_element(),
     }
 }

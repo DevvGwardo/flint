@@ -236,7 +236,7 @@ pub fn summary(
                 "up",
                 IconName::ThumbsUp,
                 turn.feedback == Some(true),
-                "Good response",
+                "Good response (kept on this device only)",
             )
             .on_click(cx.listener(move |this, _, _, cx| this.feedback(ix, true, cx))),
         )
@@ -245,7 +245,7 @@ pub fn summary(
                 "down",
                 IconName::ThumbsDown,
                 turn.feedback == Some(false),
-                "Bad response",
+                "Bad response (kept on this device only)",
             )
             .on_click(cx.listener(move |this, _, _, cx| this.feedback(ix, false, cx))),
         )

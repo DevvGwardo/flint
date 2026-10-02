@@ -1,5 +1,6 @@
-//! Live end-to-end test against the local Surplus shim (deepseek-v4.1-flash).
-//! Runs only with FLINT_LIVE=1.
+//! Live end-to-end test against a real OpenAI-compatible endpoint. Runs only
+//! with FLINT_LIVE=1; reads FLINT_API_KEY, FLINT_LIVE_BASE_URL and
+//! FLINT_LIVE_MODEL (the last two default to the library defaults).
 
 use std::time::Duration;
 
@@ -11,11 +12,17 @@ use flint_agent::TurnEndReason;
 #[test]
 fn live_creates_and_tests_add_py() {
     if std::env::var("FLINT_LIVE").as_deref() != Ok("1") {
-        eprintln!("skipped: set FLINT_LIVE=1 to run against the Surplus shim");
+        eprintln!("skipped: set FLINT_LIVE=1 to run against a live endpoint");
         return;
     }
     let dir = tempfile::tempdir().expect("tempdir");
-    let config = AgentConfig::surplus_default(dir.path().to_path_buf()).expect("surplus config");
+    let mut config = AgentConfig::from_env(dir.path().to_path_buf()).expect("live config");
+    if let Ok(base_url) = std::env::var("FLINT_LIVE_BASE_URL") {
+        config.base_url = base_url;
+    }
+    if let Ok(model) = std::env::var("FLINT_LIVE_MODEL") {
+        config.model = model;
+    }
     let handle = flint_agent::spawn_session(config);
     handle
         .ops

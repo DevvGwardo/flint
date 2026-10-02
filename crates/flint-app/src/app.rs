@@ -79,7 +79,7 @@ pub struct Options {
     pub select_change: bool,
     /// Settings and saved sessions live here (default `$FLINT_HOME` or `~/.flint`).
     pub home: Option<PathBuf>,
-    /// API key file (default `~/.fx/surplus.key`).
+    /// API key file; overrides the `api_key_file` setting.
     pub key_path: Option<PathBuf>,
 }
 
@@ -105,7 +105,8 @@ pub struct FlintApp {
     pub workspace: PathBuf,
     /// Where settings and saved sessions live.
     pub home: PathBuf,
-    pub key_path: PathBuf,
+    /// API key file override from the command line, ahead of the settings.
+    pub key_path: Option<PathBuf>,
     pub settings: Settings,
     pub model: String,
     pub effort: Option<ReasoningEffort>,
@@ -161,10 +162,7 @@ impl FlintApp {
             .home
             .clone()
             .unwrap_or_else(crate::settings::flint_home);
-        let key_path = options
-            .key_path
-            .clone()
-            .unwrap_or_else(crate::settings::default_key_path);
+        let key_path = options.key_path.clone();
         let settings = Settings::load(&home);
         let composer = cx.new(|cx| {
             TextareaState::new(window, cx)

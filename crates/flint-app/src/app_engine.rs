@@ -209,7 +209,7 @@ impl FlintApp {
         let mut config = engine::config_for(
             &session.workspace,
             &self.settings,
-            &self.key_path,
+            self.key_path.as_deref(),
             self.approval,
         )?;
         config.session_dir = session.dir.clone();

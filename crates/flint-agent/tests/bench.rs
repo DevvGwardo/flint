@@ -24,11 +24,12 @@ fn enabled() -> bool {
 }
 
 fn config(url: String, workspace: &Path) -> AgentConfig {
-    let mut config = AgentConfig::surplus_default(workspace.to_path_buf()).unwrap_or_else(|_| {
-        panic!("needs ~/.fx/surplus.key for defaults (the key is not used here)")
-    });
-    config.base_url = url;
-    config.api_key = "bench".to_string();
+    let mut config = AgentConfig::new(
+        workspace.to_path_buf(),
+        url,
+        "bench".to_string(),
+        "bench".to_string(),
+    );
     config.approval = ApprovalMode::Auto;
     config.jev = None;
     config

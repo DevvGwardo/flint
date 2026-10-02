@@ -99,14 +99,21 @@ impl FlintApp {
                     .flex_col()
                     .child(header)
                     .when(info.expanded, |col| {
-                        col.child(div().pt(px(16.)).child(rows::render(ix, item, now, cx)))
+                        col.child(div().pt(px(16.)).child(rows::render(
+                            ix,
+                            item,
+                            now,
+                            &self.settings.base_url,
+                            cx,
+                        )))
                     })
                     .into_any_element();
                 (24., body)
             }
-            Role::Plain | Role::Live | Role::Work => {
-                (row_spacing(item), rows::render(ix, item, now, cx))
-            }
+            Role::Plain | Role::Live | Role::Work => (
+                row_spacing(item),
+                rows::render(ix, item, now, &self.settings.base_url, cx),
+            ),
             Role::Hidden => unreachable!("handled above"),
         };
         let last = ix + 1 == view.items.len();

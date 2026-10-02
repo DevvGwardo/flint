@@ -1,4 +1,4 @@
-//! The flash harness: guardrails that make a cheap model finish tasks.
+//! The harness: guardrails that make a cheap model finish tasks.
 //!
 //! - Between steps, [`Harness::before_step`] returns a stuck nudge when the
 //!   turn is looping (confirmed one repeat early by the JEV judge if present).

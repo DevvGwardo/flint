@@ -13,7 +13,7 @@ use serde::Serialize;
 /// Everything a session needs to run. `Debug` redacts the API keys.
 #[derive(Clone)]
 pub struct AgentConfig {
-    /// OpenAI-compatible base URL, e.g. `http://127.0.0.1:18433/v1`.
+    /// OpenAI-compatible base URL, e.g. `https://api.openai.com/v1`.
     pub base_url: String,
     pub model: String,
     pub api_key: String,

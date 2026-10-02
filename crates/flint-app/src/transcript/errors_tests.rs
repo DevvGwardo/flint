@@ -4,7 +4,7 @@ use super::classify;
 #[test]
 fn classifies_failures() {
     assert_eq!(
-        classify("No API key found at ~/.fx/surplus.key. Add…"),
+        classify("No API key found. Set FLINT_API_KEY…"),
         ErrorKind::NoKey
     );
     assert_eq!(

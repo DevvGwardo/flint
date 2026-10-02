@@ -6,45 +6,36 @@ use std::path::Path;
 use anyhow::bail;
 use flint_agent::AgentConfig;
 use flint_agent::ApprovalMode;
-use flint_agent::DEFAULT_CONTEXT_BUDGET_TOKENS;
-use flint_agent::config::jev_from_env;
 
-use crate::settings;
 use crate::settings::Settings;
 
-/// Prefix of the error shown when no key file exists (the UI offers Settings).
+/// Prefix of the error shown when no API key is configured (the UI offers
+/// Settings).
 pub const NO_KEY: &str = "No API key found";
 
 /// Settings decide the model and endpoint; `FLINT_MODEL` / `FLINT_BASE_URL`
-/// override them for one run. The key is read from the key file and never
-/// logged or shown.
+/// override them for one run. The key comes from [`Settings::resolve_key`] and
+/// is never logged or shown.
 pub fn config_for(
     workspace: &Path,
     settings: &Settings,
-    key_path: &Path,
+    key_file: Option<&Path>,
     approval: ApprovalMode,
 ) -> anyhow::Result<AgentConfig> {
-    let api_key = std::fs::read_to_string(key_path)
-        .unwrap_or_default()
-        .trim()
-        .to_string();
-    if api_key.is_empty() {
+    let Some(found) = settings.resolve_key(key_file) else {
         bail!(
-            "{NO_KEY} at {}. Add your Surplus key there, then retry.",
-            settings::display_path(key_path)
+            "{NO_KEY}. Set FLINT_API_KEY (or OPENAI_API_KEY) in the environment, or choose a \
+             key file in Settings, then retry."
         );
-    }
-    Ok(AgentConfig {
-        base_url: std::env::var("FLINT_BASE_URL").unwrap_or_else(|_| settings.base_url.clone()),
-        model: std::env::var("FLINT_MODEL").unwrap_or_else(|_| settings.model.clone()),
-        api_key,
-        workspace: workspace.to_path_buf(),
-        approval,
-        jev: jev_from_env(),
-        session_dir: None,
-        context_budget_tokens: DEFAULT_CONTEXT_BUDGET_TOKENS,
-        reasoning_effort: None,
-    })
+    };
+    let mut config = AgentConfig::new(
+        workspace.to_path_buf(),
+        std::env::var("FLINT_BASE_URL").unwrap_or_else(|_| settings.base_url.clone()),
+        std::env::var("FLINT_MODEL").unwrap_or_else(|_| settings.model.clone()),
+        found.key,
+    );
+    config.approval = approval;
+    Ok(config)
 }
 
 /// Current branch name from `.git/HEAD`, or a short commit for a detached head.

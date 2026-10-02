@@ -1,5 +1,4 @@
-//! Per-turn guardrails for the agent loop (ported from flash's
-//! `flash_guard.rs` via Spark's `turn-guard.ts`). Deliberately simple rules:
+//! Per-turn guardrails for the agent loop. Deliberately simple rules:
 //!
 //! - Stuck: the same tool call (normalized args) three times, or the same
 //!   command failing twice in a row with identical output -> a nudge to step
@@ -41,7 +40,7 @@ pub fn stuck_nudge(call: &str) -> String {
 }
 
 // Caps that keep every JEV state small no matter how large the arguments or
-// outputs are (same values as flash).
+// outputs are (small fixed values).
 const JEV_TRAILING_TOOL_CALLS: usize = 8;
 const JEV_MAX_ARGS_CHARS: usize = 240;
 const JEV_MAX_OUTPUT_CHARS: usize = 200;

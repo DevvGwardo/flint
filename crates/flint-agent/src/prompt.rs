@@ -1,7 +1,7 @@
-//! The system prompt, condensed from flash's tuned prompt
-//! (flash-codex `flash/prompts/flash.md`). In flash's ablation the tuned
-//! prompt beat the stock one by 7 points and ran faster; the scope and
-//! standards rules fix the failure classes found in its research 09.
+//! The system prompt, adapted from the openai/codex agent prompt (Apache-2.0;
+//! see `NOTICE`) and tuned for cheap models. In the author's ablation the
+//! tuned prompt beat the stock one by 7 points and ran faster; the scope and
+//! standards rules target the failure classes seen in those runs.
 
 use std::path::Path;
 

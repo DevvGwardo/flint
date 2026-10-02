@@ -73,7 +73,7 @@ fn temp_dir(name: &str) -> std::path::PathBuf {
 /// and key file.
 fn test_options() -> Options {
     let home = temp_dir("home");
-    let key = home.join("surplus.key");
+    let key = home.join("api.key");
     std::fs::write(&key, "test-key").unwrap();
     Options {
         workspace: Some(temp_dir("ws")),
@@ -958,10 +958,11 @@ fn copy_shows_copied_and_fills_the_clipboard(cx: &mut TestAppContext) {
 
 #[gpui_kit::test]
 fn a_missing_key_shows_a_card_that_opens_settings(cx: &mut TestAppContext) {
+    // Assumes FLINT_API_KEY / OPENAI_API_KEY are unset, as on CI.
     let ui = open_with(
         cx,
         Options {
-            key_path: Some(temp_dir("nokey").join("surplus.key")),
+            key_path: Some(temp_dir("nokey").join("api.key")),
             ..test_options()
         },
     );
@@ -991,7 +992,7 @@ fn an_unreachable_endpoint_shows_a_card_with_retry(cx: &mut TestAppContext) {
     let home = options.home.clone().unwrap();
     std::fs::write(
         home.join("config.toml"),
-        "model = \"deepseek-v4.1-flash\"\nbase_url = \"http://127.0.0.1:9/v1\"\n",
+        "model = \"test-model\"\nbase_url = \"http://127.0.0.1:9/v1\"\n",
     )
     .unwrap();
     let ui = open_with(cx, options);

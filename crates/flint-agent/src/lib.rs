@@ -1,5 +1,5 @@
 //! flint's agent engine: a Chat Completions agent loop with local tools and
-//! the flash harness (loop detection, verify-before-done, zero-edit watchdog,
+//! the harness (loop detection, verify-before-done, zero-edit watchdog,
 //! tool-call repair, optional JEV judge). No UI code lives here.
 
 #[cfg(test)]

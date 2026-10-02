@@ -14,7 +14,7 @@ fn main() -> anyhow::Result<()> {
     let (Some(dir), Some(prompt)) = (args.next(), args.next()) else {
         anyhow::bail!("usage: headless <dir> <prompt>");
     };
-    let config = AgentConfig::surplus_default(PathBuf::from(dir))?;
+    let config = AgentConfig::from_env(PathBuf::from(dir))?;
     eprintln!(
         "model {} at {}  jev={}",
         config.model,

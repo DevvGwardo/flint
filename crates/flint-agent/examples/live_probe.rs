@@ -1,6 +1,7 @@
-//! Live measurements against the local Surplus shim (deepseek-v4.1-flash):
-//! time to first token, reasoning_effort, and provider cache hits across a
-//! context compaction.
+//! Live measurements against an OpenAI-compatible endpoint (needs
+//! `FLINT_API_KEY`; `FLINT_BASE_URL` and `FLINT_MODEL` are optional): time to
+//! first token, reasoning_effort, and provider cache hits across a context
+//! compaction.
 //!
 //! cargo run -p flint-agent --release --example live_probe -- [ttft|effort|cache]...
 
@@ -124,7 +125,7 @@ async fn cache() {
             .collect();
         std::fs::write(dir.path().join(format!("data{i}.txt")), body).expect("write");
     }
-    let mut config = AgentConfig::surplus_default(PathBuf::from(dir.path())).expect("config");
+    let mut config = AgentConfig::from_env(PathBuf::from(dir.path())).expect("config");
     config.context_budget_tokens = 14_000;
     let handle = flint_agent::spawn_session(config);
     let mut rows = Vec::new();
@@ -173,7 +174,7 @@ async fn cache() {
 
 #[tokio::main]
 async fn main() {
-    let config = AgentConfig::surplus_default(std::env::temp_dir()).expect("config");
+    let config = AgentConfig::from_env(std::env::temp_dir()).expect("config");
     let provider = Provider::new(&config.base_url, &config.model, &config.api_key);
     let modes: Vec<String> = std::env::args().skip(1).collect();
     let all = modes.is_empty();

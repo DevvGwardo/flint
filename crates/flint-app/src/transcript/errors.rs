@@ -44,7 +44,7 @@ pub fn classify(message: &str) -> ErrorKind {
     }
 }
 
-pub fn render(ix: usize, message: &str, cx: &mut Context<FlintApp>) -> AnyElement {
+pub fn render(ix: usize, message: &str, base_url: &str, cx: &mut Context<FlintApp>) -> AnyElement {
     let p = palette();
     let kind = classify(message);
     if kind == ErrorKind::EffortUnsupported {
@@ -61,10 +61,7 @@ pub fn render(ix: usize, message: &str, cx: &mut Context<FlintApp>) -> AnyElemen
         ErrorKind::NoKey => ("No API key found", message.to_string()),
         ErrorKind::Unreachable => (
             "Can't reach the model endpoint",
-            format!(
-                "The connection was refused. Start the local Surplus shim, or point flint at another \
-                 endpoint in Settings.\n{message}"
-            ),
+            format!("Couldn't reach {base_url}. Check the endpoint in Settings.\n{message}"),
         ),
         _ => ("The model returned an error", message.to_string()),
     };

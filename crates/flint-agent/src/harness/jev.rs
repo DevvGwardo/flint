@@ -1,8 +1,8 @@
 //! Optional Typesafe System One ("JEV") judgment client.
 //!
 //! JEV answers calibrated yes/no ("noul") questions about a small JSON state.
-//! The harness spends one to turn a cheap heuristic into a verdict. In flash's
-//! benchmark ablation, disabling it cost 14 points (89% -> 75%).
+//! The harness spends one to turn a cheap heuristic into a verdict. In the
+//! author's benchmark ablation, disabling it cost 14 points (89% -> 75%).
 //!
 //! Wire shape:
 //!   POST {base}/v1/systemone   Authorization: Bearer <key>
@@ -35,7 +35,7 @@ pub const STUCK_QUESTION: NoulQuestion = NoulQuestion {
     no: "not stuck — calls differ, or each one reacts to what the previous one returned",
 };
 
-/// Covers deliverables beyond the edited files (flash research 09, rank 7).
+/// Covers deliverables beyond the edited files.
 pub const VERIFY_QUESTION: NoulQuestion = NoulQuestion {
     instructions: "Is the work in this turn actually verified — were the edited files, created \
                    manifests, and required deliverables checked by a command or validation script \

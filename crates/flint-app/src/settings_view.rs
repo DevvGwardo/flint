@@ -22,6 +22,7 @@ use crate::ui;
 pub struct SettingsForm {
     pub model: Entity<InputState>,
     pub base_url: Entity<InputState>,
+    pub api_key_file: Entity<InputState>,
     pub approval: ApprovalMode,
     pub effort: Option<ReasoningEffort>,
     pub error: Option<String>,
@@ -33,9 +34,16 @@ impl FlintApp {
         let base_url = self.settings.base_url.clone();
         let model = cx.new(|cx| InputState::new(window, cx).default_value(model));
         let base_url = cx.new(|cx| InputState::new(window, cx).default_value(base_url));
+        let key_file = self.settings.api_key_file.clone();
+        let api_key_file = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("Optional, e.g. ~/.config/flint/key")
+                .default_value(key_file)
+        });
         self.settings_form = Some(SettingsForm {
             model,
             base_url,
+            api_key_file,
             approval: self.approval,
             effort: self.effort,
             error: None,
@@ -58,6 +66,7 @@ impl FlintApp {
         let mut next = self.settings.clone();
         next.model = form.model.read(cx).value().trim().to_string();
         next.base_url = form.base_url.read(cx).value().trim().to_string();
+        next.api_key_file = form.api_key_file.read(cx).value().trim().to_string();
         if next.model.is_empty() || !next.base_url.starts_with("http") {
             form.error = Some("Enter a model name and an http(s) base URL.".into());
             cx.notify();
@@ -133,11 +142,15 @@ fn row(label: &str, hint: Option<&str>, control: impl IntoElement) -> Div {
 pub fn render(app: &FlintApp, cx: &mut Context<FlintApp>) -> Option<impl IntoElement> {
     let p = palette();
     let form = app.settings_form.as_ref()?;
-    let (key_icon, key_text, key_color) = match settings::key_status(&app.key_path) {
-        KeyStatus::Found(path) => (IconName::CircleCheck, format!("Found at {path}"), p.success),
-        KeyStatus::Missing(path) => (
+    let (key_icon, key_text, key_color) = match app.settings.key_status(app.key_path.as_deref()) {
+        KeyStatus::Found(source) => (
+            IconName::CircleCheck,
+            format!("Found in {source}"),
+            p.success,
+        ),
+        KeyStatus::Missing(source) => (
             IconName::CircleAlert,
-            format!("Missing — put your Surplus key in {path}"),
+            format!("Not found — set {source}, or choose a key file below"),
             p.danger,
         ),
     };
@@ -232,12 +245,19 @@ pub fn render(app: &FlintApp, cx: &mut Context<FlintApp>) -> Option<impl IntoEle
             "API key",
             Some("Never shown or logged"),
             div()
-                .pt(px(7.))
                 .flex()
-                .items_center()
+                .flex_col()
                 .gap(px(8.))
-                .child(ui::icon(key_icon, 15., key_color))
-                .child(ui::label(key_text, size::BASE - 1., key_color)),
+                .child(
+                    div()
+                        .pt(px(7.))
+                        .flex()
+                        .items_center()
+                        .gap(px(8.))
+                        .child(ui::icon(key_icon, 15., key_color))
+                        .child(ui::label(key_text, size::BASE - 1., key_color)),
+                )
+                .child(Input::new(&form.api_key_file)),
         ))
         .child(row(
             "JEV judge",
