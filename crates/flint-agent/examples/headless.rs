@@ -62,6 +62,12 @@ fn main() -> anyhow::Result<()> {
             ),
             AgentEvent::TurnFinished { reason, .. } => format!("── finished: {reason:?}"),
             AgentEvent::Error(message) => format!("! {message}"),
+            AgentEvent::ContextCompacted {
+                before_tokens,
+                after_tokens,
+            } => {
+                format!("⇣ context compacted {before_tokens} -> {after_tokens} tokens")
+            }
         };
         if in_text {
             writeln!(out)?;

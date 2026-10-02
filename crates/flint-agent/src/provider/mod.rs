@@ -1,12 +1,17 @@
-//! Chat Completions client: request building, streaming, and retries.
+//! Chat Completions client: streaming, retries, and the `reasoning_effort`
+//! fallback. Request bodies are built in [`wire`].
 
 pub mod stream;
+pub mod wire;
 
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
+use std::time::Instant;
 
+use bytes::Bytes;
 use futures_util::StreamExt;
 use serde_json::Value;
-use serde_json::json;
 use tokio_util::sync::CancellationToken;
 
 pub use stream::Completion;
@@ -14,65 +19,16 @@ use stream::CompletionBuilder;
 pub use stream::RawToolCall;
 use stream::SseParser;
 pub use stream::StreamDelta;
+pub use stream::Timing;
+pub use wire::ChatRequest;
+pub use wire::Message;
 
 const MAX_RETRIES: u32 = 3;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 /// Longest silence allowed mid-stream before the request is abandoned.
 const IDLE_TIMEOUT: Duration = Duration::from_secs(180);
-
-/// One message of the conversation.
-#[derive(Debug, Clone, PartialEq)]
-pub enum Message {
-    System(String),
-    User(String),
-    Assistant {
-        content: String,
-        /// Kept for DeepSeek thinking mode, which expects it back on
-        /// tool-call turns within the same user turn.
-        reasoning: String,
-        tool_calls: Vec<RawToolCall>,
-    },
-    Tool {
-        call_id: String,
-        content: String,
-    },
-}
-
-impl Message {
-    /// Wire form. `with_reasoning` sends `reasoning_content` back.
-    pub fn to_wire(&self, with_reasoning: bool) -> Value {
-        match self {
-            Message::System(text) => json!({"role": "system", "content": text}),
-            Message::User(text) => json!({"role": "user", "content": text}),
-            Message::Assistant {
-                content,
-                reasoning,
-                tool_calls,
-            } => {
-                let mut message = json!({"role": "assistant", "content": content});
-                if !tool_calls.is_empty() {
-                    message["tool_calls"] = tool_calls
-                        .iter()
-                        .map(|call| {
-                            json!({
-                                "id": call.id,
-                                "type": "function",
-                                "function": {"name": call.name, "arguments": call.arguments},
-                            })
-                        })
-                        .collect();
-                }
-                if with_reasoning && !reasoning.is_empty() {
-                    message["reasoning_content"] = Value::String(reasoning.clone());
-                }
-                message
-            }
-            Message::Tool { call_id, content } => {
-                json!({"role": "tool", "tool_call_id": call_id, "content": content})
-            }
-        }
-    }
-}
+/// Keep pooled connections warm between steps (steps are seconds apart).
+const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Why a model call failed.
 #[derive(Debug, Clone, PartialEq)]
@@ -82,57 +38,84 @@ pub enum ProviderError {
     Failed(String),
 }
 
-/// An OpenAI-compatible Chat Completions endpoint.
-#[derive(Debug, Clone)]
+/// An OpenAI-compatible Chat Completions endpoint. One client (and its
+/// keep-alive connection pool) is reused for every call in a session.
+#[derive(Debug)]
 pub struct Provider {
     http: reqwest::Client,
-    base_url: String,
+    url: String,
     model: String,
     api_key: String,
+    /// Set once the endpoint rejected `reasoning_effort`; it is not sent again.
+    effort_rejected: AtomicBool,
 }
 
 impl Provider {
     pub fn new(base_url: &str, model: &str, api_key: &str) -> Self {
         let http = reqwest::Client::builder()
             .connect_timeout(CONNECT_TIMEOUT)
+            .pool_idle_timeout(POOL_IDLE_TIMEOUT)
+            .tcp_nodelay(true)
             .build()
             .unwrap_or_default();
         Self {
             http,
-            base_url: base_url.trim_end_matches('/').to_string(),
+            url: format!("{}/chat/completions", base_url.trim_end_matches('/')),
             model: model.to_string(),
             api_key: api_key.to_string(),
+            effort_rejected: AtomicBool::new(false),
         }
     }
 
+    /// False once the endpoint rejected `reasoning_effort` in this session.
+    pub fn effort_supported(&self) -> bool {
+        !self.effort_rejected.load(Ordering::Relaxed)
+    }
+
     /// Streams one completion. `on_delta` sees text/reasoning as it arrives.
+    ///
     /// Retries rate limits, server errors and dropped connections, but only
-    /// before any delta was shown.
+    /// before any delta was shown. A 400/422 for a request carrying
+    /// `reasoning_effort` is retried once without it; if that works, the
+    /// parameter is dropped for the session (see [`Provider::effort_supported`]).
     pub async fn complete(
         &self,
-        messages: &[Value],
-        tools: &[Value],
+        request: &ChatRequest<'_>,
         on_delta: &mut (dyn FnMut(StreamDelta) + Send),
         cancel: &CancellationToken,
     ) -> Result<Completion, ProviderError> {
-        let mut body = json!({
-            "model": self.model,
-            "messages": messages,
-            "stream": true,
-            "stream_options": {"include_usage": true},
-        });
-        if !tools.is_empty() {
-            body["tools"] = Value::Array(tools.to_vec());
-            body["tool_choice"] = json!("auto");
-        }
+        let mut effort = request.effort.filter(|_| self.effort_supported());
+        let mut body = Bytes::from(ChatRequest { effort, ..*request }.body(&self.model));
         let mut attempt = 0;
         loop {
             let mut shown = false;
-            let result = self.attempt(&body, on_delta, &mut shown, cancel).await;
-            match result {
+            match self
+                .attempt(body.clone(), on_delta, &mut shown, cancel)
+                .await
+            {
                 Ok(completion) => return Ok(completion),
                 Err(Attempt::Cancelled) => return Err(ProviderError::Cancelled),
-                Err(Attempt::Fatal(message)) => return Err(ProviderError::Failed(message)),
+                Err(Attempt::Rejected(message)) if effort.is_some() => {
+                    effort = None;
+                    body = Bytes::from(ChatRequest { effort, ..*request }.body(&self.model));
+                    let mut retried_shown = false;
+                    return match self
+                        .attempt(body, on_delta, &mut retried_shown, cancel)
+                        .await
+                    {
+                        Ok(completion) => {
+                            self.effort_rejected.store(true, Ordering::Relaxed);
+                            Ok(completion)
+                        }
+                        Err(Attempt::Cancelled) => Err(ProviderError::Cancelled),
+                        Err(Attempt::Rejected(_) | Attempt::Retryable(_) | Attempt::Fatal(_)) => {
+                            Err(ProviderError::Failed(message))
+                        }
+                    };
+                }
+                Err(Attempt::Rejected(message) | Attempt::Fatal(message)) => {
+                    return Err(ProviderError::Failed(message));
+                }
                 Err(Attempt::Retryable(message)) => {
                     attempt += 1;
                     if shown || attempt > MAX_RETRIES {
@@ -150,16 +133,18 @@ impl Provider {
 
     async fn attempt(
         &self,
-        body: &Value,
+        body: Bytes,
         on_delta: &mut (dyn FnMut(StreamDelta) + Send),
         shown: &mut bool,
         cancel: &CancellationToken,
     ) -> Result<Completion, Attempt> {
+        let started = Instant::now();
         let request = self
             .http
-            .post(format!("{}/chat/completions", self.base_url))
+            .post(&self.url)
             .bearer_auth(&self.api_key)
-            .json(body)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(body)
             .send();
         let response = tokio::select! {
             response = request => response.map_err(|err| Attempt::Retryable(format!("request failed: {err}")))?,
@@ -170,13 +155,16 @@ impl Provider {
             let text = response.text().await.unwrap_or_default();
             let snippet: String = text.chars().take(500).collect();
             let message = format!("provider returned {status}: {snippet}");
-            let retryable = status.as_u16() == 429 || status.is_server_error();
-            return Err(if retryable {
-                Attempt::Retryable(message)
-            } else {
-                Attempt::Fatal(message)
+            return Err(match status.as_u16() {
+                429 | 500..=599 => Attempt::Retryable(message),
+                400 | 422 => Attempt::Rejected(message),
+                _ => Attempt::Fatal(message),
             });
         }
+        let mut timing = Timing {
+            headers: Some(started.elapsed()),
+            ..Timing::default()
+        };
         let mut bytes = response.bytes_stream();
         let mut parser = SseParser::default();
         let mut builder = CompletionBuilder::default();
@@ -194,14 +182,21 @@ impl Provider {
                 }
                 Ok(Some(Ok(chunk))) => chunk,
             };
+            timing.first_byte.get_or_insert_with(|| started.elapsed());
             for payload in parser.push(&chunk) {
                 done |= handle_payload(&payload, &mut builder, on_delta, shown)?;
+                if *shown {
+                    timing.first_delta.get_or_insert_with(|| started.elapsed());
+                }
             }
         }
         if let Some(payload) = parser.finish() {
             handle_payload(&payload, &mut builder, on_delta, shown)?;
         }
-        Ok(builder.finish())
+        timing.total = started.elapsed();
+        let mut completion = builder.finish();
+        completion.timing = timing;
+        Ok(completion)
     }
 }
 
@@ -234,6 +229,8 @@ fn handle_payload(
 
 enum Attempt {
     Cancelled,
+    /// 400/422: the request itself was refused (maybe an unsupported field).
+    Rejected(String),
     Retryable(String),
     Fatal(String),
 }

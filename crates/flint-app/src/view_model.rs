@@ -36,6 +36,12 @@ pub enum Item {
     Nudge {
         reason: NudgeReason,
         message: String,
+        expanded: bool,
+    },
+    /// The engine trimmed old history to fit the context budget.
+    Compacted {
+        before_tokens: u64,
+        after_tokens: u64,
     },
     Repair {
         tool: String,
@@ -87,6 +93,9 @@ pub struct ChangedFile {
     pub created: bool,
     /// Every diff applied to this file, oldest first.
     pub diffs: Vec<String>,
+    /// One diff from the file's original content to its current content,
+    /// when the original could be reconstructed.
+    pub combined: Option<String>,
 }
 
 /// Which transcript rows a fold touched, so a virtual list can splice and
@@ -230,7 +239,13 @@ impl SessionView {
             AgentEvent::HarnessNudge { reason, message } => {
                 self.note_turn_nudge();
                 let mut change = self.close_streams(now);
-                change.appended = self.push(Item::Nudge { reason, message }).appended;
+                change.appended = self
+                    .push(Item::Nudge {
+                        reason,
+                        message,
+                        expanded: false,
+                    })
+                    .appended;
                 change
             }
             AgentEvent::ToolRepaired { tool, detail } => self.push(Item::Repair { tool, detail }),
@@ -261,6 +276,13 @@ impl SessionView {
                 change
             }
             AgentEvent::Error(message) => self.push(Item::Error(message)),
+            AgentEvent::ContextCompacted {
+                before_tokens,
+                after_tokens,
+            } => self.push(Item::Compacted {
+                before_tokens,
+                after_tokens,
+            }),
         }
     }
 
@@ -284,6 +306,7 @@ impl SessionView {
         match self.items.get_mut(ix) {
             Some(Item::Thinking { expanded, .. }) => *expanded = !*expanded,
             Some(Item::Tool(call)) => call.expanded = !call.expanded,
+            Some(Item::Nudge { expanded, .. }) => *expanded = !*expanded,
             _ => return Change::default(),
         }
         Change::updated(ix)
@@ -388,6 +411,7 @@ impl SessionView {
                 removed: diff.removed,
                 created: diff.created,
                 diffs: vec![diff.unified.clone()],
+                combined: None,
             });
         }
     }

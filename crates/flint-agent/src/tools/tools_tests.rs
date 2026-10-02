@@ -195,3 +195,23 @@ fn summaries_and_kinds() {
         Some("b.rs".to_string())
     );
 }
+
+#[test]
+fn capture_stays_bounded_and_keeps_both_ends() {
+    let mut capture = command::Capture::default();
+    capture.push(b"START\n");
+    for _ in 0..10_000 {
+        capture.push(&[b'x'; 1000]);
+    }
+    capture.push(b"\nerror: the real failure is here");
+    let text = capture.model_text(8_000);
+    assert!(text.starts_with("START\n"));
+    assert!(text.ends_with("error: the real failure is here"));
+    assert!(text.contains("bytes omitted"));
+    assert!(text.chars().count() < 8_100);
+
+    let mut small = command::Capture::default();
+    small.push(b"hello ");
+    small.push(b"world\n");
+    assert_eq!(small.model_text(8_000), "hello world");
+}

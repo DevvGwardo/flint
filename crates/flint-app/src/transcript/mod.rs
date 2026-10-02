@@ -7,6 +7,7 @@
 
 mod approval;
 mod empty;
+mod errors;
 mod rows;
 mod turn;
 
@@ -17,6 +18,9 @@ use crate::app::FlintApp;
 use crate::theme::palette;
 use crate::view_model::Item;
 use crate::view_model::Role;
+
+pub use approval::pinned as pinned_approval;
+pub use turn::file_icon;
 
 /// Readable line length for the transcript.
 pub const COLUMN_WIDTH: f32 = 760.;
@@ -36,13 +40,18 @@ pub fn render_main(
         .flex_col()
         .bg(palette().bg)
         .child(
-            div().flex_1().min_h_0().child(
-                list(
-                    session.list.clone(),
-                    cx.processor(|this, ix, window, cx| this.render_item(ix, window, cx)),
+            div()
+                .id("transcript")
+                .flex_1()
+                .min_h_0()
+                .child(
+                    list(
+                        session.list.clone(),
+                        cx.processor(|this, ix, window, cx| this.render_item(ix, window, cx)),
+                    )
+                    .size_full(),
                 )
-                .size_full(),
-            ),
+                .test_support(),
         )
         .child(
             div()
@@ -76,7 +85,10 @@ impl FlintApp {
         let (top, body): (f32, AnyElement) = match role {
             Role::Answer => (22., turn::answer(ix, item)),
             Role::Summary => match view.turn_at(ix) {
-                Some(info) => (24., turn::summary(ix, item, info, view, cx)),
+                Some(info) => {
+                    let copied = self.copied.is_some_and(|(row, _)| row == ix);
+                    (24., turn::summary(ix, item, info, view, copied, cx))
+                }
                 None => (0., div().into_any_element()),
             },
             Role::WorkHeader => {
@@ -118,7 +130,7 @@ fn row_spacing(item: &Item) -> f32 {
         Item::Assistant { .. } => 20.,
         Item::Thinking { .. } => 18.,
         Item::Tool(_) | Item::Repair { .. } => 10.,
-        Item::Nudge { .. } => 12.,
+        Item::Nudge { .. } | Item::Compacted { .. } => 12.,
         Item::Approval { .. } | Item::Error(_) => 18.,
         Item::TurnSummary { .. } => 24.,
     }

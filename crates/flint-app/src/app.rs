@@ -1,25 +1,24 @@
-//! The root view's state and behavior: sessions (each with its own engine,
-//! running independently), the composer, panels, and event pumping. Layout
-//! lives in `layout.rs`.
+//! The root view's state and core behavior: sessions (each with its own
+//! engine, running independently and addressed by a stable uid), the composer,
+//! panels, and event pumping. Input menus live in `app_input.rs`, saved
+//! sessions in `app_store.rs`, workspace/sidebar/settings actions in
+//! `app_actions.rs`, and layout in `layout.rs`.
 
 use std::path::PathBuf;
 use std::time::Duration;
 use std::time::Instant;
 
-use flint_agent::AgentEvent;
-use flint_agent::ApprovalDecision;
 use flint_agent::ApprovalMode;
-use flint_agent::Op;
-use flint_agent::TurnEndReason;
+use flint_agent::ReasoningEffort;
 use gpui_kit::component::command::CommandState;
 use gpui_kit::component::input::InputEvent;
 use gpui_kit::component::input::InputState;
 use gpui_kit::component::input::TextareaState;
 use gpui_kit::*;
 
-use crate::demo;
 use crate::engine;
 use crate::session::Session;
+use crate::settings::Settings;
 
 actions!(
     flint,
@@ -30,9 +29,17 @@ actions!(
         ToggleSidebar,
         ToggleApproval,
         OpenWorkspace,
+        OpenSettings,
         Interrupt,
         FocusComposer,
         RevealWorkspace,
+        OpenTerminal,
+        RenameSession,
+        MenuUp,
+        MenuDown,
+        MenuAccept,
+        MenuDismiss,
+        DeleteSession,
         Quit,
     ]
 );
@@ -56,7 +63,29 @@ pub struct Options {
     pub open_changes: bool,
     /// Initial window size, e.g. `1100x800`.
     pub window_size: Option<(f32, f32)>,
+    /// Automation: quit a few seconds after the first turn finishes.
+    pub exit_after_turn: bool,
+    /// Automation: replay this many synthetic turns (perf harness).
+    pub demo_long: Option<usize>,
+    /// Automation: stream deltas at this rate per second, then quit.
+    pub stream_test: Option<u32>,
+    /// Automation: scroll a long transcript, then quit.
+    pub scroll_test: bool,
+    pub open_settings: bool,
+    pub open_mention: bool,
+    pub open_slash: bool,
     pub select_change: bool,
+    /// Settings and saved sessions live here (default `$FLINT_HOME` or `~/.flint`).
+    pub home: Option<PathBuf>,
+    /// API key file (default `~/.fx/surplus.key`).
+    pub key_path: Option<PathBuf>,
+}
+
+impl Options {
+    /// Automation and demo runs neither load nor save sessions.
+    pub(crate) fn ephemeral(&self) -> bool {
+        self.demo || self.demo_long.is_some() || self.stream_test.is_some() || self.scroll_test
+    }
 }
 
 /// Which sessions the sidebar lists.
@@ -67,22 +96,19 @@ pub enum SessionFilter {
     Unread,
 }
 
-/// Reasoning effort shown on the model chip. The engine protocol has no
-/// effort setting yet, so this is display-only.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Effort {
-    Low,
-    Medium,
-    High,
-}
-
 pub struct FlintApp {
     pub sessions: Vec<Session>,
     pub active: usize,
     /// Workspace new sessions start in.
     pub workspace: PathBuf,
+    /// Where settings and saved sessions live.
+    pub home: PathBuf,
+    pub key_path: PathBuf,
+    pub settings: Settings,
     pub model: String,
-    pub effort: Effort,
+    pub effort: Option<ReasoningEffort>,
+    /// False once the endpoint said it ignores `reasoning_effort`.
+    pub effort_supported: bool,
     pub approval: ApprovalMode,
     pub sidebar_open: bool,
     /// Whether the sidebar is on screen this frame (it auto-collapses when narrow).
@@ -93,14 +119,28 @@ pub struct FlintApp {
     pub composer: Entity<TextareaState>,
     pub search: Entity<InputState>,
     pub filter: SessionFilter,
-    pub notice_dismissed: bool,
+    pub mention: Option<crate::app_input::MentionMenu>,
+    pub slash: Option<crate::app_input::SlashMenu>,
+    /// Files attached with `@` for the next message.
+    pub attachments: Vec<String>,
+    pub settings_form: Option<crate::settings_view::SettingsForm>,
+    pub help_open: bool,
+    /// Summary row whose answer was just copied, and when.
+    pub copied: Option<(usize, Instant)>,
+    /// Sidebar row with its context menu open.
+    pub session_menu: Option<usize>,
+    /// Session being renamed, with its title input.
+    pub renaming: Option<(usize, Entity<InputState>)>,
     pub origin: Instant,
     pub(crate) focus: FocusHandle,
     /// Window drag from the header, armed on mouse down.
     pub(crate) drag_armed: bool,
     pub(crate) options: Options,
-    _subscriptions: Vec<Subscription>,
-    _ticker: Task<()>,
+    pub(crate) next_uid: u64,
+    pub(crate) file_index: std::collections::HashMap<PathBuf, Vec<String>>,
+    pub(crate) subscriptions: Vec<Subscription>,
+    /// Animation clock; runs only while a session is working.
+    pub(crate) ticker: Option<Task<()>>,
 }
 
 impl FlintApp {
@@ -110,6 +150,15 @@ impl FlintApp {
             .clone()
             .or_else(|| std::env::current_dir().ok())
             .unwrap_or_default();
+        let home = options
+            .home
+            .clone()
+            .unwrap_or_else(crate::settings::flint_home);
+        let key_path = options
+            .key_path
+            .clone()
+            .unwrap_or_else(crate::settings::default_key_path);
+        let settings = Settings::load(&home);
         let composer = cx.new(|cx| {
             TextareaState::new(window, cx)
                 .auto_grow(1, 8)
@@ -121,37 +170,25 @@ impl FlintApp {
             cx.subscribe_in(
                 &composer,
                 window,
-                |this, _, event: &InputEvent, window, cx| {
-                    if let InputEvent::PressEnter { shift: false, .. } = event {
-                        this.submit(window, cx);
-                    }
+                |this, _, event: &InputEvent, window, cx| match event {
+                    InputEvent::PressEnter { shift: false, .. } => this.submit(window, cx),
+                    InputEvent::Change => this.composer_changed(window, cx),
+                    _ => {}
                 },
             ),
             cx.subscribe(&search, |_, _, _: &InputEvent, cx| cx.notify()),
         ];
-        // Animation clock: fast while anything runs (status glyphs, timers).
-        let ticker = cx.spawn(async move |this, cx| {
-            loop {
-                cx.background_executor()
-                    .timer(Duration::from_millis(120))
-                    .await;
-                let alive = this.update(cx, |app, cx| {
-                    if app.sessions.iter().any(|s| s.view.running) {
-                        cx.notify();
-                    }
-                });
-                if alive.is_err() {
-                    break;
-                }
-            }
-        });
         let mut app = Self {
-            sessions: vec![Session::new(workspace.clone())],
-            workspace,
+            sessions: Vec::new(),
+            workspace: workspace.clone(),
+            home,
+            key_path,
             active: 0,
-            model: engine::model_name(),
-            effort: Effort::Medium,
-            approval: ApprovalMode::Auto,
+            model: settings.model.clone(),
+            effort: settings.reasoning_effort(),
+            effort_supported: true,
+            approval: settings.approval_mode(),
+            settings,
             sidebar_open: true,
             sidebar_visible: true,
             changes_open: options.open_changes,
@@ -160,31 +197,77 @@ impl FlintApp {
             composer,
             search,
             filter: SessionFilter::All,
-            notice_dismissed: false,
+            mention: None,
+            slash: None,
+            attachments: Vec::new(),
+            settings_form: None,
+            help_open: false,
+            copied: None,
+            session_menu: None,
+            renaming: None,
             origin: Instant::now(),
             focus: cx.focus_handle(),
             drag_armed: false,
             options: options.clone(),
-            _subscriptions: subscriptions,
-            _ticker: ticker,
+            next_uid: 0,
+            file_index: Default::default(),
+            subscriptions,
+            ticker: None,
         };
+        if !options.ephemeral() {
+            app.restore_sessions(cx);
+        }
+        let fresh = app.new_session_value(workspace);
+        app.sessions.insert(0, fresh);
+        app.active = 0;
         if options.demo {
             app.start_demo(cx);
-        } else if let Some(prompt) = options.prompt.clone() {
+        }
+        if let Some(turns) = options.demo_long.or(options.scroll_test.then_some(200)) {
+            app.load_long_session(turns, cx);
+        }
+        if let Some(rate) = options.stream_test {
+            app.start_stream_test(rate, cx);
+        }
+        if options.scroll_test {
+            app.start_scroll_test(cx);
+        }
+        if let Some(prompt) = options.prompt.clone().filter(|_| !options.demo) {
             app.composer
                 .update(cx, |state, cx| state.set_value(prompt, window, cx));
             app.submit(window, cx);
         }
+        crate::automation::schedule_dump(cx);
         if options.open_palette {
             app.open_palette(window, cx);
         } else {
             app.composer.update(cx, |state, cx| state.focus(window, cx));
         }
+        if options.open_settings {
+            app.open_settings(window, cx);
+        }
+        if options.open_mention {
+            app.open_mention_picker(window, cx);
+        }
+        if options.open_slash {
+            app.composer
+                .update(cx, |state, cx| state.set_value("/", window, cx));
+            app.composer_changed(window, cx);
+        }
         app
+    }
+
+    pub(crate) fn new_session_value(&mut self, workspace: PathBuf) -> Session {
+        self.next_uid += 1;
+        Session::new(self.next_uid, workspace)
     }
 
     pub fn session(&self) -> &Session {
         &self.sessions[self.active]
+    }
+
+    pub fn session_index(&self, uid: u64) -> Option<usize> {
+        self.sessions.iter().position(|s| s.uid == uid)
     }
 
     pub fn now(&self) -> Duration {
@@ -193,195 +276,6 @@ impl FlintApp {
 
     pub fn branch(&self) -> Option<String> {
         engine::git_branch(&self.session().workspace)
-    }
-
-    fn start_demo(&mut self, cx: &mut Context<Self>) {
-        let change = self.sessions[0].view.push_user(demo::PROMPT.to_string());
-        self.sessions[0].apply(change);
-        let mut beats = demo::script(self.options.demo_approval);
-        if let Some(stop) = self.options.demo_stop {
-            beats.truncate(stop);
-        }
-        self.play(0, beats, self.options.demo_instant, cx);
-        // Other sessions working in the background, to show concurrency.
-        for extra in demo::extra_sessions(&self.workspace) {
-            let mut session = Session::new(extra.workspace);
-            let change = session.view.push_user(extra.prompt.to_string());
-            session.apply(change);
-            self.sessions.push(session);
-            let ix = self.sessions.len() - 1;
-            self.play(ix, extra.beats, extra.instant, cx);
-        }
-    }
-
-    /// Plays scripted events into a session with scripted time, so instant
-    /// playback still shows real durations.
-    fn play(&mut self, ix: usize, beats: Vec<demo::Beat>, instant: bool, cx: &mut Context<Self>) {
-        let start = self.now();
-        let select_change = self.options.select_change && ix == self.active;
-        let expand = self.options.demo_expand;
-        self.sessions[ix].pump = Some(cx.spawn(async move |this, cx| {
-            let mut clock = start;
-            for beat in beats {
-                clock += beat.delay;
-                if !instant {
-                    cx.background_executor().timer(beat.delay).await;
-                }
-                if this
-                    .update(cx, |app, cx| app.apply_event_at(ix, beat.event, clock, cx))
-                    .is_err()
-                {
-                    return;
-                }
-            }
-            this.update(cx, |app, cx| {
-                if app.active == ix {
-                    if select_change {
-                        app.changes_open = true;
-                        app.selected_change = Some(0);
-                    }
-                    if expand {
-                        app.toggle_work(1, cx);
-                    }
-                }
-                cx.notify();
-            })
-            .ok();
-        }));
-    }
-
-    pub fn apply_event(&mut self, ix: usize, event: AgentEvent, cx: &mut Context<Self>) {
-        let now = self.now();
-        self.apply_event_at(ix, event, now, cx);
-    }
-
-    fn apply_event_at(
-        &mut self,
-        ix: usize,
-        event: AgentEvent,
-        now: Duration,
-        cx: &mut Context<Self>,
-    ) {
-        let active = self.active;
-        let Some(session) = self.sessions.get_mut(ix) else {
-            return;
-        };
-        let finished = matches!(event, AgentEvent::TurnFinished { .. });
-        let change = session.view.fold(event, now);
-        session.apply(change);
-        session.touched = Instant::now();
-        if finished && ix != active {
-            session.unread = true;
-        }
-        cx.notify();
-    }
-
-    pub fn submit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let text = self.composer.read(cx).value().trim().to_string();
-        if text.is_empty() {
-            return;
-        }
-        let ix = self.active;
-        if self.sessions[ix].view.running && self.sessions[ix].ops.is_none() {
-            return;
-        }
-        self.composer
-            .update(cx, |state, cx| state.set_value("", window, cx));
-        let change = self.sessions[ix].view.push_user(text.clone());
-        self.sessions[ix].apply(change);
-        self.sessions[ix].touched = Instant::now();
-        match self.ensure_engine(ix, cx) {
-            Ok(()) => {
-                if let Some(ops) = &self.sessions[ix].ops {
-                    ops.try_send(Op::UserMessage(text)).ok();
-                }
-            }
-            Err(err) => self.apply_event(ix, AgentEvent::Error(format!("{err:#}")), cx),
-        }
-        cx.notify();
-    }
-
-    /// Starts the engine for a session on its first message.
-    fn ensure_engine(&mut self, ix: usize, cx: &mut Context<Self>) -> anyhow::Result<()> {
-        if self.sessions[ix].ops.is_some() {
-            return Ok(());
-        }
-        let config = engine::config_for(&self.sessions[ix].workspace, self.approval)?;
-        let handle = flint_agent::spawn_session(config);
-        let events = handle.events.clone();
-        let session = &mut self.sessions[ix];
-        session.ops = Some(handle.ops);
-        session.pump = Some(cx.spawn(async move |this, cx| {
-            while let Ok(event) = events.recv().await {
-                if this
-                    .update(cx, |app, cx| app.apply_event(ix, event, cx))
-                    .is_err()
-                {
-                    break;
-                }
-            }
-        }));
-        Ok(())
-    }
-
-    pub fn interrupt(&mut self, cx: &mut Context<Self>) {
-        let ix = self.active;
-        if !self.sessions[ix].view.running {
-            return;
-        }
-        if let Some(ops) = &self.sessions[ix].ops {
-            ops.try_send(Op::Interrupt).ok();
-            return;
-        }
-        // Demo: stop playback and close the turn.
-        self.sessions[ix].pump = None;
-        let turn_id = self.sessions[ix].view.turn_id;
-        self.apply_event(
-            ix,
-            AgentEvent::TurnFinished {
-                turn_id,
-                reason: TurnEndReason::Interrupted,
-            },
-            cx,
-        );
-    }
-
-    pub fn answer_approval(
-        &mut self,
-        call_id: String,
-        decision: ApprovalDecision,
-        cx: &mut Context<Self>,
-    ) {
-        let session = &mut self.sessions[self.active];
-        let change = session.view.resolve_approval(&call_id, decision);
-        session.apply(change);
-        if let Some(ops) = &session.ops {
-            ops.try_send(Op::Approval { call_id, decision }).ok();
-        }
-        if decision == ApprovalDecision::ApproveAlways {
-            self.approval = ApprovalMode::Auto;
-        }
-        cx.notify();
-    }
-
-    /// Answers the oldest unanswered approval in the active session.
-    pub fn answer_pending(&mut self, decision: ApprovalDecision, cx: &mut Context<Self>) {
-        let pending = self
-            .session()
-            .view
-            .items
-            .iter()
-            .find_map(|item| match item {
-                crate::view_model::Item::Approval {
-                    call_id,
-                    decision: None,
-                    ..
-                } => Some(call_id.clone()),
-                _ => None,
-            });
-        if let Some(call_id) = pending {
-            self.answer_approval(call_id, decision, cx);
-        }
     }
 
     pub fn toggle_item(&mut self, ix: usize, cx: &mut Context<Self>) {
@@ -407,7 +301,28 @@ impl FlintApp {
         cx.notify();
     }
 
-    /// Opens the changes panel on the first file a turn changed.
+    /// Copies a finished turn's answer and shows "Copied" for a moment.
+    pub fn copy_answer(&mut self, ix: usize, text: String, cx: &mut Context<Self>) {
+        cx.write_to_clipboard(ClipboardItem::new_string(text));
+        self.copied = Some((ix, Instant::now()));
+        self.sessions[self.active].list.remeasure_items(ix..ix + 1);
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(1600))
+                .await;
+            this.update(cx, |app, cx| {
+                if app.copied.is_some_and(|(row, _)| row == ix) {
+                    app.copied = None;
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Opens the changes panel on a file (or the first changed file).
     pub fn review(&mut self, path: Option<String>, cx: &mut Context<Self>) {
         let changes = &self.session().view.changes;
         self.selected_change = path
@@ -422,6 +337,7 @@ impl FlintApp {
             self.active = ix;
             self.sessions[ix].unread = false;
             self.selected_change = None;
+            self.session_menu = None;
             self.composer
                 .update(cx, |state, cx| state.focus(window, cx));
             cx.notify();
@@ -429,11 +345,7 @@ impl FlintApp {
     }
 
     pub fn select_change(&mut self, ix: usize, cx: &mut Context<Self>) {
-        self.selected_change = if self.selected_change == Some(ix) {
-            None
-        } else {
-            Some(ix)
-        };
+        self.selected_change = Some(ix);
         self.changes_open = true;
         cx.notify();
     }
@@ -446,10 +358,27 @@ impl FlintApp {
         match reusable {
             Some(ix) => self.active = ix,
             None => {
-                self.sessions.push(Session::new(self.workspace.clone()));
+                let session = self.new_session_value(self.workspace.clone());
+                self.sessions.push(session);
                 self.active = self.sessions.len() - 1;
             }
         }
+        self.selected_change = None;
+        self.composer
+            .update(cx, |state, cx| state.focus(window, cx));
+        cx.notify();
+    }
+
+    /// `/clear`: a fresh session in place of the active one (the old one stays
+    /// saved and listed).
+    pub(crate) fn clear_session(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.session().view.items.is_empty() {
+            return;
+        }
+        let workspace = self.session().workspace.clone();
+        let session = self.new_session_value(workspace);
+        self.sessions.push(session);
+        self.active = self.sessions.len() - 1;
         self.selected_change = None;
         self.composer
             .update(cx, |state, cx| state.focus(window, cx));

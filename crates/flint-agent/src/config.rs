@@ -7,6 +7,7 @@ use anyhow::Result;
 
 use crate::protocol::AgentConfig;
 use crate::protocol::ApprovalMode;
+use crate::protocol::DEFAULT_CONTEXT_BUDGET_TOKENS;
 use crate::protocol::JevConfig;
 
 /// Local Surplus Intelligence shim (Chat Completions).
@@ -37,6 +38,9 @@ impl AgentConfig {
             workspace,
             approval: ApprovalMode::Auto,
             jev: jev_from_env(),
+            session_dir: None,
+            context_budget_tokens: DEFAULT_CONTEXT_BUDGET_TOKENS,
+            reasoning_effort: None,
         })
     }
 }

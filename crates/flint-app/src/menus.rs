@@ -1,0 +1,177 @@
+//! Popovers that sit just above the composer: the `@` file picker, the `/`
+//! command menu, and the help card.
+
+use gpui_kit::assets::IconName;
+use gpui_kit::prelude::FluentBuilder as _;
+use gpui_kit::*;
+
+use crate::app::FlintApp;
+use crate::slash;
+use crate::theme::MONO_FONT;
+use crate::theme::palette;
+use crate::theme::size;
+use crate::transcript::file_icon;
+use crate::ui;
+
+fn panel() -> Div {
+    let p = palette();
+    div()
+        .w_full()
+        .rounded(px(14.))
+        .border_1()
+        .border_color(p.border_strong)
+        .bg(p.surface)
+        .shadow_lg()
+        .py(px(8.))
+        .flex()
+        .flex_col()
+}
+
+fn header(title: &str, hint: &str) -> Div {
+    let p = palette();
+    div()
+        .px(px(16.))
+        .pb(px(6.))
+        .flex()
+        .justify_between()
+        .child(ui::label(title.to_string(), size::XS, p.text_subtle))
+        .child(ui::label(hint.to_string(), size::XS, p.text_subtle))
+}
+
+fn item_row(id: impl Into<ElementId>, selected: bool) -> Stateful<Div> {
+    let p = palette();
+    div()
+        .id(id)
+        .mx(px(6.))
+        .px(px(10.))
+        .h(px(36.))
+        .rounded(px(8.))
+        .flex()
+        .items_center()
+        .gap(px(10.))
+        .cursor_pointer()
+        .when(selected, |row| row.bg(p.raised))
+        .when(!selected, |row| row.hover(|s| s.bg(hsla(0., 0., 1., 0.04))))
+}
+
+pub fn render(app: &FlintApp, cx: &mut Context<FlintApp>) -> Option<AnyElement> {
+    let p = palette();
+    if let Some(menu) = &app.mention {
+        let rows = menu.results.iter().enumerate().map(|(n, path)| {
+            let (dir, name) = path.rsplit_once('/').unwrap_or(("", path));
+            let pick = path.clone();
+            item_row(("mention-item", n), n == menu.selected)
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.pick_mention(pick.clone(), window, cx)
+                }))
+                .child(ui::icon(file_icon(path), 15., p.text_muted))
+                .child(ui::mono(name.to_string(), size::SM, p.text))
+                .child(
+                    div()
+                        .min_w_0()
+                        .truncate()
+                        .font_family(MONO_FONT)
+                        .text_size(px(size::XS))
+                        .text_color(p.text_subtle)
+                        .child(dir.to_string()),
+                )
+                .test_support()
+        });
+        let empty = menu.results.is_empty();
+        let title = if menu.query.is_empty() {
+            "Attach a file".to_string()
+        } else {
+            format!("Files matching “{}”", menu.query)
+        };
+        return Some(
+            panel()
+                .id("mention-menu")
+                .child(header(&title, "↑↓ choose · ⏎ attach · esc close"))
+                .children(rows)
+                .when(empty, |panel| {
+                    panel.child(div().px(px(16.)).py(px(8.)).child(ui::label(
+                        "No files match. Keep typing or press esc.",
+                        size::BASE - 1.,
+                        p.text_muted,
+                    )))
+                })
+                .test_support()
+                .into_any_element(),
+        );
+    }
+    if let Some(menu) = &app.slash {
+        let text = app.composer.read(cx).value().to_string();
+        let commands = slash::active_query(&text)
+            .map(slash::matches)
+            .unwrap_or_default();
+        let rows = commands
+            .into_iter()
+            .enumerate()
+            .map(|(n, (command, name, about))| {
+                item_row(("slash-item", n), n == menu.selected)
+                    .on_click(
+                        cx.listener(move |this, _, window, cx| this.run_slash(command, window, cx)),
+                    )
+                    .child(ui::mono(name, size::SM, p.text).w(px(96.)))
+                    .child(ui::label(about, size::BASE - 1., p.text_muted))
+                    .test_support()
+            });
+        return Some(
+            panel()
+                .id("slash-menu")
+                .child(header("Commands", "↑↓ choose · ⏎ run · esc close"))
+                .children(rows)
+                .test_support()
+                .into_any_element(),
+        );
+    }
+    if app.help_open {
+        let line = |keys: &str, what: &str| {
+            div()
+                .px(px(16.))
+                .h(px(28.))
+                .flex()
+                .items_center()
+                .gap(px(14.))
+                .child(ui::mono(keys.to_string(), size::SM, p.text).w(px(110.)))
+                .child(ui::label(what.to_string(), size::BASE - 1., p.text_muted))
+        };
+        return Some(
+            panel()
+                .id("help-card")
+                .child(
+                    div()
+                        .px(px(16.))
+                        .pb(px(6.))
+                        .flex()
+                        .justify_between()
+                        .child(ui::label("Shortcuts", size::XS, p.text_subtle))
+                        .child(
+                            div()
+                                .id("close-help")
+                                .cursor_pointer()
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.help_open = false;
+                                    cx.notify();
+                                }))
+                                .child(ui::icon(IconName::X, 13., p.text_subtle)),
+                        ),
+                )
+                .child(line("⏎ / ⇧⏎", "Send / new line"))
+                .child(line("@", "Attach a workspace file"))
+                .child(line(
+                    "/",
+                    "Commands: new, clear, model, effort, approval, review",
+                ))
+                .child(line("⇧⇥", "Switch auto-run / ask before changes"))
+                .child(line(
+                    "Y · A · N",
+                    "Approve · always · deny (empty composer)",
+                ))
+                .child(line("⌘K · ⌘J · ⌘N", "Commands · changes · new agent"))
+                .child(line("esc · ⌘.", "Stop the running turn"))
+                .into_any_element(),
+        );
+    }
+    None
+}

@@ -22,6 +22,37 @@ pub struct AgentConfig {
     pub approval: ApprovalMode,
     /// Optional JEV judge; `None` keeps the harness on its heuristics.
     pub jev: Option<JevConfig>,
+    /// Where the conversation is saved (`history.json`) and restored from.
+    /// `None` keeps the session in memory only.
+    pub session_dir: Option<PathBuf>,
+    /// Token budget for the model context. History is compacted when the
+    /// estimate passes 80% of it.
+    pub context_budget_tokens: u64,
+    /// Sent as `reasoning_effort`; `None` leaves the provider default.
+    pub reasoning_effort: Option<ReasoningEffort>,
+}
+
+/// Default for [`AgentConfig::context_budget_tokens`].
+pub const DEFAULT_CONTEXT_BUDGET_TOKENS: u64 = 100_000;
+
+/// How hard a reasoning model should think.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ReasoningEffort {
+    Low,
+    Medium,
+    High,
+}
+
+impl ReasoningEffort {
+    /// The wire value.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ReasoningEffort::Low => "low",
+            ReasoningEffort::Medium => "medium",
+            ReasoningEffort::High => "high",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -48,6 +79,9 @@ impl std::fmt::Debug for AgentConfig {
             .field("workspace", &self.workspace)
             .field("approval", &self.approval)
             .field("jev", &self.jev)
+            .field("session_dir", &self.session_dir)
+            .field("context_budget_tokens", &self.context_budget_tokens)
+            .field("reasoning_effort", &self.reasoning_effort)
             .finish()
     }
 }
@@ -74,6 +108,8 @@ pub enum Op {
         call_id: String,
         decision: ApprovalDecision,
     },
+    /// Change the reasoning effort for later model calls (`None` = provider default).
+    SetReasoningEffort(Option<ReasoningEffort>),
     Shutdown,
 }
 
@@ -141,6 +177,12 @@ pub enum AgentEvent {
     },
     /// Cumulative token usage for the turn so far.
     Usage(Usage),
+    /// Old history was trimmed to stay within the context budget. Token
+    /// counts are estimates of the request size before and after.
+    ContextCompacted {
+        before_tokens: u64,
+        after_tokens: u64,
+    },
     TurnFinished {
         turn_id: u64,
         reason: TurnEndReason,

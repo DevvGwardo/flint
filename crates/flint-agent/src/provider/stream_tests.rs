@@ -64,6 +64,7 @@ fn assembles_text_reasoning_tool_calls_and_usage() {
                 output_tokens: 20,
                 reasoning_tokens: 7
             }),
+            timing: Timing::default(),
         }
     );
 }

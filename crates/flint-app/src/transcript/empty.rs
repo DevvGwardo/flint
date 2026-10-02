@@ -45,9 +45,9 @@ pub fn render(app: &FlintApp, cx: &mut Context<FlintApp>) -> impl IntoElement {
             .child(ui::label(text, size::BASE - 1., p.text_muted))
     });
 
-    let jev_off = std::env::var("TYPESAFE_API_KEY").map_or(true, |key| key.trim().is_empty());
-    let notice = (jev_off && !app.notice_dismissed).then(|| {
+    let notice = (!app.settings.tip_dismissed).then(|| {
         div()
+            .id("welcome-tip")
             .absolute()
             .top(px(16.))
             .right(px(20.))
@@ -60,24 +60,37 @@ pub fn render(app: &FlintApp, cx: &mut Context<FlintApp>) -> impl IntoElement {
             .shadow_lg()
             .flex()
             .gap(px(10.))
-            .child(ui::icon(IconName::ShieldCheck, 17., p.accent))
+            .child(ui::icon(IconName::Lightbulb, 17., p.accent))
             .child(
                 div()
                     .flex_1()
                     .min_w_0()
                     .flex()
                     .flex_col()
-                    .gap(px(4.))
-                    .child(ui::label("Guard runs on heuristics", size::BASE, p.text))
+                    .gap(px(6.))
+                    .child(ui::label("flint checks its own work", size::BASE, p.text))
                     .child(ui::label(
-                        "Set TYPESAFE_API_KEY to let the JEV judge decide stuck, verify and no-edit checks.",
+                        "Before it finishes, it re-runs your tests and stops itself from looping. \
+                         Model, endpoint and safety options live in Settings.",
                         size::SM,
                         p.text_subtle,
-                    )),
+                    ))
+                    .child(
+                        div()
+                            .id("tip-settings")
+                            .cursor_pointer()
+                            .text_size(px(size::SM))
+                            .text_color(p.accent)
+                            .hover(|s| s.underline())
+                            .on_click(
+                                cx.listener(|this, _, window, cx| this.open_settings(window, cx)),
+                            )
+                            .child("Open settings"),
+                    ),
             )
             .child(
                 div()
-                    .id("dismiss-notice")
+                    .id("dismiss-tip")
                     .size(px(28.))
                     .flex_shrink_0()
                     .rounded(px(5.))
@@ -86,12 +99,11 @@ pub fn render(app: &FlintApp, cx: &mut Context<FlintApp>) -> impl IntoElement {
                     .justify_center()
                     .cursor_pointer()
                     .hover(|style| style.bg(p.raised))
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.notice_dismissed = true;
-                        cx.notify();
-                    }))
-                    .child(ui::icon(IconName::X, 14., p.text_subtle)),
+                    .on_click(cx.listener(|this, _, _, cx| this.dismiss_tip(cx)))
+                    .child(ui::icon(IconName::X, 14., p.text_subtle))
+                    .test_support(),
             )
+            .test_support()
     });
 
     div()

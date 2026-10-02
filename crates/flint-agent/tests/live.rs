@@ -54,6 +54,12 @@ fn live_creates_and_tests_add_py() {
             AgentEvent::ToolRepaired { tool, detail } => eprintln!("repaired {tool}: {detail}"),
             AgentEvent::Usage(usage) => eprintln!("usage {usage:?}"),
             AgentEvent::Error(message) => eprintln!("error {message}"),
+            AgentEvent::ContextCompacted {
+                before_tokens,
+                after_tokens,
+            } => {
+                eprintln!("compacted {before_tokens} -> {after_tokens}");
+            }
             AgentEvent::TurnFinished { reason, .. } => {
                 eprintln!("finished {reason:?}");
                 finished = Some(reason.clone());

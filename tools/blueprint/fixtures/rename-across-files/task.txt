@@ -1,0 +1,1 @@
+Rename the function area_of_rect to rectangle_area everywhere: its definition and every caller in this project. Keep the behaviour exactly the same.

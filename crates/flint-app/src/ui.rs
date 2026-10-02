@@ -85,3 +85,26 @@ pub fn ago(elapsed: Duration) -> String {
         _ => format!("{}d", secs / 86_400),
     }
 }
+
+/// The animation clock's period while something runs (see `FlintApp`'s
+/// ticker). Glyphs below advance per tick, so nothing animates per frame and
+/// an idle window never repaints.
+pub const TICK_MS: u64 = 100;
+
+fn phase(now: Duration, steps: u32) -> f32 {
+    let tick = (now.as_millis() / TICK_MS as u128) as u32;
+    (tick % steps) as f32 / steps as f32
+}
+
+/// A loading ring rotated by the animation clock.
+pub fn spinner(now: Duration, size_px: f32, color: Hsla) -> Icon {
+    let turn = phase(now, 12) * std::f32::consts::TAU;
+    icon(IconName::LoaderCircle, size_px, color).rotate(radians(turn))
+}
+
+/// The "working" mark for the status line: a slowly turning asterisk drawn
+/// from the bundled SVG icons (no font glyph fallback).
+pub fn work_glyph(now: Duration, size_px: f32, color: Hsla) -> Icon {
+    let turn = phase(now, 16) * std::f32::consts::TAU / 2.;
+    icon(IconName::Asterisk, size_px, color).rotate(radians(turn))
+}

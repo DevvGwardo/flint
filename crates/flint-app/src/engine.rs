@@ -1,27 +1,50 @@
-//! Real-mode wiring: builds the engine config for a workspace and reads the
-//! current git branch for the title bar.
+//! Real-mode wiring: builds the engine config for a workspace from the user's
+//! settings, and reads the current git branch for the header.
 
 use std::path::Path;
 
+use anyhow::bail;
 use flint_agent::AgentConfig;
 use flint_agent::ApprovalMode;
-use flint_agent::config::SURPLUS_MODEL;
+use flint_agent::DEFAULT_CONTEXT_BUDGET_TOKENS;
+use flint_agent::config::jev_from_env;
 
-/// The model the app will use, for display before a session starts.
-pub fn model_name() -> String {
-    std::env::var("FLINT_MODEL").unwrap_or_else(|_| SURPLUS_MODEL.to_string())
-}
+use crate::settings;
+use crate::settings::Settings;
 
-/// The engine's Surplus defaults (key from `~/.fx/surplus.key`), with the
-/// app's approval mode and optional FLINT_BASE_URL / FLINT_MODEL overrides.
-pub fn config_for(workspace: &Path, approval: ApprovalMode) -> anyhow::Result<AgentConfig> {
-    let mut config = AgentConfig::surplus_default(workspace.to_path_buf())?;
-    config.approval = approval;
-    config.model = model_name();
-    if let Ok(base_url) = std::env::var("FLINT_BASE_URL") {
-        config.base_url = base_url;
+/// Prefix of the error shown when no key file exists (the UI offers Settings).
+pub const NO_KEY: &str = "No API key found";
+
+/// Settings decide the model and endpoint; `FLINT_MODEL` / `FLINT_BASE_URL`
+/// override them for one run. The key is read from the key file and never
+/// logged or shown.
+pub fn config_for(
+    workspace: &Path,
+    settings: &Settings,
+    key_path: &Path,
+    approval: ApprovalMode,
+) -> anyhow::Result<AgentConfig> {
+    let api_key = std::fs::read_to_string(key_path)
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    if api_key.is_empty() {
+        bail!(
+            "{NO_KEY} at {}. Add your Surplus key there, then retry.",
+            settings::display_path(key_path)
+        );
     }
-    Ok(config)
+    Ok(AgentConfig {
+        base_url: std::env::var("FLINT_BASE_URL").unwrap_or_else(|_| settings.base_url.clone()),
+        model: std::env::var("FLINT_MODEL").unwrap_or_else(|_| settings.model.clone()),
+        api_key,
+        workspace: workspace.to_path_buf(),
+        approval,
+        jev: jev_from_env(),
+        session_dir: None,
+        context_budget_tokens: DEFAULT_CONTEXT_BUDGET_TOKENS,
+        reasoning_effort: None,
+    })
 }
 
 /// Current branch name from `.git/HEAD`, or a short commit for a detached head.

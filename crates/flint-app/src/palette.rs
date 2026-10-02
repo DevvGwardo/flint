@@ -8,11 +8,15 @@ use gpui_kit::component::command::CommandItem;
 use gpui_kit::component::command::CommandState;
 use gpui_kit::*;
 
+use crate::app::DeleteSession;
 use crate::app::FlintApp;
 use crate::app::FocusComposer;
 use crate::app::Interrupt;
 use crate::app::NewSession;
+use crate::app::OpenSettings;
+use crate::app::OpenTerminal;
 use crate::app::OpenWorkspace;
+use crate::app::RenameSession;
 use crate::app::ToggleApproval;
 use crate::app::ToggleChanges;
 use crate::app::ToggleSidebar;
@@ -46,6 +50,16 @@ pub fn render(state: &Entity<CommandState>, cx: &mut Context<FlintApp>) -> impl 
                     Box::new(Interrupt),
                 ))
                 .item(item(
+                    "Rename session…",
+                    IconName::Pencil,
+                    Box::new(RenameSession),
+                ))
+                .item(item(
+                    "Delete session",
+                    IconName::Trash,
+                    Box::new(DeleteSession),
+                ))
+                .item(item(
                     "Focus composer",
                     IconName::TextCursorInput,
                     Box::new(FocusComposer),
@@ -73,7 +87,13 @@ pub fn render(state: &Entity<CommandState>, cx: &mut Context<FlintApp>) -> impl 
                     "Toggle approval mode",
                     IconName::ShieldCheck,
                     Box::new(ToggleApproval),
-                )),
+                ))
+                .item(item(
+                    "Open in Terminal",
+                    IconName::SquareTerminal,
+                    Box::new(OpenTerminal),
+                ))
+                .item(item("Settings", IconName::Settings, Box::new(OpenSettings))),
         )
         .on_confirm(move |_, window, cx| {
             on_confirm

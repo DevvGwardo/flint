@@ -68,6 +68,7 @@ pub fn worked_line(ix: usize, turn: &TurnInfo, cx: &mut Context<FlintApp>) -> im
                 )),
         )
         .child(div().flex_1().h(px(1.)).bg(p.border))
+        .test_support()
 }
 
 pub fn answer(ix: usize, item: &Item) -> AnyElement {
@@ -88,6 +89,7 @@ pub fn summary(
     item: &Item,
     turn: &TurnInfo,
     view: &SessionView,
+    copied: bool,
     cx: &mut Context<FlintApp>,
 ) -> AnyElement {
     let p = palette();
@@ -161,12 +163,17 @@ pub fn summary(
                     .child(div().flex_1())
                     .child(ui::label("⌘J", size::SM, p.text_subtle))
                     .child(
-                        Button::new(("review", ix))
-                            .outline()
-                            .label("Review")
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.review(first.clone(), cx);
-                            })),
+                        div()
+                            .id(("review-button", ix))
+                            .child(
+                                Button::new(("review", ix))
+                                    .outline()
+                                    .label("Review")
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.review(first.clone(), cx);
+                                    })),
+                            )
+                            .test_support(),
                     ),
             )
             .child(div().py(px(6.)).children(rows))
@@ -198,11 +205,31 @@ pub fn summary(
         .items_center()
         .gap(px(2.))
         .child(
-            action("copy", IconName::Copy, false, "Copy answer").on_click(move |_, _, cx| {
-                if let Some(text) = &answer_text {
-                    cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
-                }
-            }),
+            div()
+                .id(("copy-button", ix))
+                .flex()
+                .items_center()
+                .child(
+                    action(
+                        "copy",
+                        if copied {
+                            IconName::Check
+                        } else {
+                            IconName::Copy
+                        },
+                        copied,
+                        "Copy answer",
+                    )
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if let Some(text) = &answer_text {
+                            this.copy_answer(ix, text.clone(), cx);
+                        }
+                    })),
+                )
+                .when(copied, |row| {
+                    row.child(ui::label("Copied", size::SM, p.accent))
+                })
+                .test_support(),
         )
         .child(
             action(

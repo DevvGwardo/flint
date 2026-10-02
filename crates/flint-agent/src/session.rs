@@ -12,11 +12,14 @@ use serde_json::Map;
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
+use crate::context::ContextTracker;
 use crate::harness::Harness;
 use crate::harness::args::RepairedArgs;
 use crate::harness::args::closest_tool_name;
 use crate::harness::args::repair_tool_args;
 use crate::harness::jev::JevClient;
+use crate::persist;
+use crate::persist::Saver;
 use crate::prompt::system_prompt;
 use crate::protocol::AgentConfig;
 use crate::protocol::AgentEvent;
@@ -24,9 +27,11 @@ use crate::protocol::ApprovalDecision;
 use crate::protocol::ApprovalMode;
 use crate::protocol::NudgeReason;
 use crate::protocol::Op;
+use crate::protocol::ReasoningEffort;
 use crate::protocol::ToolKind;
 use crate::protocol::TurnEndReason;
 use crate::protocol::Usage;
+use crate::provider::ChatRequest;
 use crate::provider::Message;
 use crate::provider::Provider;
 use crate::provider::ProviderError;
@@ -40,12 +45,14 @@ pub const MAX_STEPS_PER_TURN: u32 = 60;
 /// Runs a session until `Shutdown` or until the front end drops its sender.
 pub(crate) async fn run(config: AgentConfig, ops: Receiver<Op>, events: Sender<AgentEvent>) {
     let current = Arc::new(Mutex::new(CancellationToken::new()));
+    let effort = Arc::new(Mutex::new(config.reasoning_effort));
     let (messages_tx, messages_rx) = async_channel::unbounded::<String>();
     let (approvals_tx, approvals_rx) = async_channel::unbounded::<(String, ApprovalDecision)>();
 
     // Ops are handled on their own task so Interrupt and Approval reach a
     // running turn, and user messages queue while one is in flight.
     let ops_current = Arc::clone(&current);
+    let ops_effort = Arc::clone(&effort);
     tokio::spawn(async move {
         while let Ok(op) = ops.recv().await {
             match op {
@@ -56,6 +63,11 @@ pub(crate) async fn run(config: AgentConfig, ops: Receiver<Op>, events: Sender<A
                 Op::Approval { call_id, decision } => {
                     let _ = approvals_tx.send((call_id, decision)).await;
                 }
+                Op::SetReasoningEffort(level) => {
+                    if let Ok(mut slot) = ops_effort.lock() {
+                        *slot = level;
+                    }
+                }
                 Op::Shutdown => break,
             }
         }
@@ -63,13 +75,16 @@ pub(crate) async fn run(config: AgentConfig, ops: Receiver<Op>, events: Sender<A
         messages_tx.close();
     });
 
-    let mut session = Session::new(config, events, approvals_rx);
+    let mut session = Session::new(config, events, approvals_rx, effort);
     while let Ok(text) = messages_rx.recv().await {
         let token = CancellationToken::new();
         if let Ok(mut slot) = current.lock() {
             *slot = token.clone();
         }
         session.run_turn(text, &token).await;
+    }
+    if let Some(saver) = session.saver.take() {
+        saver.flush().await;
     }
 }
 
@@ -89,7 +104,12 @@ struct Session {
     events: Sender<AgentEvent>,
     approvals: Receiver<(String, ApprovalDecision)>,
     turn_id: u64,
-    tool_specs: Vec<Value>,
+    /// Tool specs, serialized once.
+    tools_json: String,
+    effort: Arc<Mutex<Option<ReasoningEffort>>>,
+    effort_notice_sent: bool,
+    context: ContextTracker,
+    saver: Option<Saver>,
 }
 
 impl Session {
@@ -97,18 +117,57 @@ impl Session {
         config: AgentConfig,
         events: Sender<AgentEvent>,
         approvals: Receiver<(String, ApprovalDecision)>,
+        effort: Arc<Mutex<Option<ReasoningEffort>>>,
     ) -> Self {
+        let tools_json = serde_json::to_string(&tools::tool_specs()).unwrap_or_default();
+        let mut history = vec![Message::System(system_prompt(&config.workspace))];
+        let mut turn_id = 0;
+        if let Some(dir) = &config.session_dir {
+            match persist::load(dir) {
+                Ok(Some(restored)) => {
+                    turn_id = restored.turn_id;
+                    history.extend(restored.messages);
+                }
+                Ok(None) => {}
+                Err(message) => {
+                    let _ = events.try_send(AgentEvent::Error(format!(
+                        "Couldn't restore the saved conversation: {message}. Starting fresh."
+                    )));
+                }
+            }
+        }
         Self {
             provider: Provider::new(&config.base_url, &config.model, &config.api_key),
             jev: config.jev.clone().map(JevClient::new),
-            history: vec![Message::System(system_prompt(&config.workspace))],
+            context: ContextTracker::new(config.context_budget_tokens, tools_json.len()),
+            saver: config.session_dir.clone().map(Saver::new),
+            history,
             workspace: config.workspace,
             approval: config.approval,
             approve_always: false,
             events,
             approvals,
-            turn_id: 0,
-            tool_specs: tools::tool_specs(),
+            turn_id,
+            tools_json,
+            effort,
+            effort_notice_sent: false,
+        }
+    }
+
+    /// Queues a snapshot of the history for the background writer.
+    fn save(&self) {
+        if let Some(saver) = &self.saver {
+            saver.save(persist::snapshot(self.turn_id, &self.history));
+        }
+    }
+
+    /// Compacts old history when the context estimate is over the trigger.
+    fn compact_if_needed(&mut self) {
+        if let Some((before_tokens, after_tokens)) = self.context.maybe_compact(&mut self.history) {
+            self.emit(AgentEvent::ContextCompacted {
+                before_tokens,
+                after_tokens,
+            });
         }
     }
 
@@ -121,6 +180,7 @@ impl Session {
         let turn_id = self.turn_id;
         self.emit(AgentEvent::TurnStarted { turn_id });
         let reason = self.turn_loop(text, turn_id, cancel).await;
+        self.save();
         self.emit(AgentEvent::TurnFinished { turn_id, reason });
     }
 
@@ -130,7 +190,6 @@ impl Session {
         turn_id: u64,
         cancel: &CancellationToken,
     ) -> TurnEndReason {
-        let turn_start = self.history.len();
         self.history.push(Message::User(text.clone()));
         let mut harness = Harness::new(&text, self.jev.clone());
         let mut usage = Usage::default();
@@ -139,19 +198,15 @@ impl Session {
             if let Some(nudge) = harness.before_step().await {
                 self.nudge(NudgeReason::Stuck, nudge);
             }
+            self.compact_if_needed();
             self.emit(AgentEvent::StepStarted { turn_id, step });
-            let wire: Vec<Value> = self
-                .history
-                .iter()
-                .enumerate()
-                .map(|(i, message)| {
-                    // DeepSeek thinking mode wants reasoning back on this
-                    // turn's tool-call messages only.
-                    let replay = i > turn_start
-                        && matches!(message, Message::Assistant { tool_calls, .. } if !tool_calls.is_empty());
-                    message.to_wire(replay)
-                })
-                .collect();
+            // DeepSeek thinking mode needs reasoning back on tool-call
+            // messages. Replaying it on every turn's (not just this one's)
+            // keeps each message byte-identical once sent, so the provider's
+            // prompt cache survives turn boundaries; compaction drops old
+            // reasoning when space runs short.
+            let replay_reasoning_from = 0;
+            let effort = self.effort.lock().ok().and_then(|slot| *slot);
             let events = self.events.clone();
             let mut on_delta = move |delta: StreamDelta| {
                 let event = match delta {
@@ -160,9 +215,15 @@ impl Session {
                 };
                 let _ = events.try_send(event);
             };
+            let request = ChatRequest {
+                messages: &self.history,
+                replay_reasoning_from,
+                tools_json: &self.tools_json,
+                effort,
+            };
             let completion = match self
                 .provider
-                .complete(&wire, &self.tool_specs, &mut on_delta, cancel)
+                .complete(&request, &mut on_delta, cancel)
                 .await
             {
                 Ok(completion) => completion,
@@ -172,7 +233,15 @@ impl Session {
                     return TurnEndReason::Failed(message);
                 }
             };
+            if effort.is_some() && !self.provider.effort_supported() && !self.effort_notice_sent {
+                self.effort_notice_sent = true;
+                self.emit(AgentEvent::Error(
+                    "This model endpoint doesn't accept reasoning_effort; continuing without it."
+                        .to_string(),
+                ));
+            }
             if let Some(call_usage) = completion.usage {
+                self.context.observe(&self.history, call_usage.input_tokens);
                 usage.input_tokens += call_usage.input_tokens;
                 usage.cached_input_tokens += call_usage.cached_input_tokens;
                 usage.output_tokens += call_usage.output_tokens;
@@ -198,6 +267,7 @@ impl Session {
                 {
                     Some((reason, message)) => {
                         self.nudge(reason, message);
+                        self.save();
                         continue;
                     }
                     None => return TurnEndReason::Completed,
@@ -211,6 +281,7 @@ impl Session {
                 }
                 self.run_call(call, &mut harness, cancel).await;
             }
+            self.save();
             if cancel.is_cancelled() {
                 return TurnEndReason::Interrupted;
             }
@@ -223,7 +294,7 @@ impl Session {
             reason,
             message: message.clone(),
         });
-        self.history.push(Message::User(message));
+        self.history.push(Message::Nudge(message));
     }
 
     /// Repairs the tool name and arguments of a raw call.

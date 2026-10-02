@@ -1,13 +1,19 @@
-//! Right panel: files changed this session, and the full diff of the selected one.
+//! Right panel: the files changed this session. With several files, a list
+//! with a selection; for the selected file, its path, net stats, an "Open in
+//! editor" action, and one combined diff (original -> current) that scrolls
+//! sideways instead of clipping long lines.
 
 use gpui_kit::assets::IconName;
+use gpui_kit::component::button::*;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use crate::app::FlintApp;
 use crate::diff;
+use crate::header::HEADER_HEIGHT;
 use crate::theme::palette;
 use crate::theme::size;
+use crate::transcript::file_icon;
 use crate::ui;
 
 pub fn render(app: &FlintApp, cx: &mut Context<FlintApp>) -> impl IntoElement {
@@ -16,9 +22,13 @@ pub fn render(app: &FlintApp, cx: &mut Context<FlintApp>) -> impl IntoElement {
     let (added, removed) = changes
         .iter()
         .fold((0, 0), |(a, r), f| (a + f.added, r + f.removed));
+    let selected = app
+        .selected_change
+        .filter(|&ix| ix < changes.len())
+        .or(if changes.is_empty() { None } else { Some(0) });
 
     let header = div()
-        .h(px(crate::header::HEADER_HEIGHT))
+        .h(px(HEADER_HEIGHT))
         .flex_shrink_0()
         .px(px(18.))
         .flex()
@@ -39,7 +49,15 @@ pub fn render(app: &FlintApp, cx: &mut Context<FlintApp>) -> impl IntoElement {
                         .child("Changes"),
                 )
                 .when(!changes.is_empty(), |row| {
-                    row.child(ui::pill(changes.len().to_string(), p.text_muted, p.raised))
+                    row.child(ui::label(
+                        format!(
+                            "{} file{}",
+                            changes.len(),
+                            if changes.len() == 1 { "" } else { "s" }
+                        ),
+                        size::SM,
+                        p.text_subtle,
+                    ))
                 }),
         )
         .when(!changes.is_empty(), |row| {
@@ -52,138 +70,152 @@ pub fn render(app: &FlintApp, cx: &mut Context<FlintApp>) -> impl IntoElement {
             )
         });
 
-    let files = changes.iter().enumerate().map(|(ix, file)| {
-        let selected = app.selected_change == Some(ix);
-        let (dir, name) = split_path(&file.path);
-        div()
-            .id(("change", ix))
-            .mx(px(8.))
-            .px(px(12.))
-            .h(px(38.))
-            .rounded(px(9.))
+    if changes.is_empty() {
+        return div()
+            .size_full()
             .flex()
-            .items_center()
-            .gap(px(10.))
-            .cursor_pointer()
-            .when(selected, |row| row.bg(p.raised))
-            .when(!selected, |row| row.hover(|style| style.bg(p.surface)))
-            .on_click(cx.listener(move |this, _, _, cx| this.select_change(ix, cx)))
-            .child(ui::icon(
-                if file.created {
-                    IconName::FilePlus
-                } else {
-                    IconName::FileCode
-                },
-                13.,
-                p.text_muted,
-            ))
+            .flex_col()
+            .bg(p.chrome)
+            .child(header)
             .child(
                 div()
                     .flex_1()
-                    .min_w_0()
                     .flex()
-                    .items_baseline()
-                    .gap(px(6.))
-                    .overflow_hidden()
+                    .flex_col()
+                    .items_center()
+                    .justify_center()
+                    .gap(px(8.))
+                    .child(ui::icon(IconName::GitCompare, 22., p.text_subtle))
+                    .child(ui::label("No changes yet", size::BASE, p.text_muted))
+                    .child(ui::label(
+                        "Files the agent edits show up here.",
+                        size::SM,
+                        p.text_subtle,
+                    )),
+            );
+    }
+
+    // A file list only when there is something to choose between.
+    let list = (changes.len() > 1).then(|| {
+        div()
+            .py(px(6.))
+            .flex()
+            .flex_col()
+            .gap(px(1.))
+            .border_b_1()
+            .border_color(p.border)
+            .children(changes.iter().enumerate().map(|(ix, file)| {
+                let is_selected = selected == Some(ix);
+                let (dir, name) = file.path.rsplit_once('/').unwrap_or(("", &file.path));
+                div()
+                    .id(("change", ix))
+                    .mx(px(8.))
+                    .px(px(12.))
+                    .h(px(38.))
+                    .rounded(px(9.))
+                    .flex()
+                    .items_center()
+                    .gap(px(10.))
+                    .cursor_pointer()
+                    .when(is_selected, |row| row.bg(p.raised))
+                    .when(!is_selected, |row| row.hover(|style| style.bg(p.surface)))
+                    .on_click(cx.listener(move |this, _, _, cx| this.select_change(ix, cx)))
+                    .child(ui::icon(file_icon(&file.path), 15., p.text_muted))
+                    .child(ui::mono(name.to_string(), size::SM, p.text).flex_shrink_0())
                     .child(
                         div()
-                            .flex_shrink_0()
-                            .text_size(px(size::BASE))
-                            .text_color(p.text)
-                            .child(name.to_string()),
-                    )
-                    .child(
-                        div()
+                            .flex_1()
                             .min_w_0()
                             .truncate()
                             .text_size(px(size::XS))
                             .text_color(p.text_subtle)
                             .child(dir.to_string()),
-                    ),
-            )
-            .child(ui::mono(format!("+{}", file.added), size::XS, p.success))
-            .child(ui::mono(format!("−{}", file.removed), size::XS, p.danger))
+                    )
+                    .child(ui::mono(format!("+{}", file.added), size::XS, p.success))
+                    .child(ui::mono(format!("−{}", file.removed), size::XS, p.danger))
+                    .test_support()
+            }))
     });
 
-    let detail = app
-        .selected_change
-        .and_then(|ix| changes.get(ix))
-        .map(|file| {
-            let diffs = file.diffs.iter().enumerate().map(|(n, unified)| {
-                let (body, _) = diff::render(unified, usize::MAX);
+    let detail = selected.and_then(|ix| changes.get(ix)).map(|file| {
+        let unified = file
+            .combined
+            .clone()
+            .unwrap_or_else(|| file.diffs.join("\n"));
+        let path = app.session().workspace.join(&file.path);
+        div()
+            .flex_1()
+            .min_h_0()
+            .flex()
+            .flex_col()
+            .child(
                 div()
-                    .when(n > 0, |d| d.border_t_1().border_color(p.border))
-                    .child(body)
-            });
-            div()
-                .flex_1()
-                .min_h_0()
-                .flex()
-                .flex_col()
-                .border_t_1()
-                .border_color(p.border)
-                .child(
-                    div()
-                        .h(px(40.))
-                        .px(px(18.))
-                        .flex()
-                        .items_center()
-                        .bg(p.surface)
-                        .border_b_1()
-                        .border_color(p.border)
-                        .child(ui::mono(file.path.clone(), size::SM, p.text_muted)),
-                )
-                .child(
-                    div()
-                        .id("change-diff")
-                        .flex_1()
-                        .min_h_0()
-                        .overflow_y_scroll()
-                        .children(diffs),
-                )
-        });
-
-    let empty = div()
-        .flex_1()
-        .flex()
-        .flex_col()
-        .items_center()
-        .justify_center()
-        .gap(px(8.))
-        .child(ui::icon(IconName::GitCompare, 20., p.text_subtle))
-        .child(ui::label("No changes yet", size::BASE, p.text_muted))
-        .child(ui::label(
-            "Files the agent edits show up here.",
-            size::SM,
-            p.text_subtle,
-        ));
+                    .h(px(48.))
+                    .flex_shrink_0()
+                    .px(px(18.))
+                    .flex()
+                    .items_center()
+                    .gap(px(10.))
+                    .border_b_1()
+                    .border_color(p.border)
+                    .child(ui::icon(file_icon(&file.path), 15., p.text_muted))
+                    .child(
+                        ui::mono(file.path.clone(), size::SM, p.text)
+                            .flex_1()
+                            .min_w_0()
+                            .truncate(),
+                    )
+                    .child(ui::mono(format!("+{}", file.added), size::XS, p.success))
+                    .child(ui::mono(format!("−{}", file.removed), size::XS, p.danger))
+                    .child(
+                        div()
+                            .id("open-in-editor")
+                            .child(
+                                Button::new("open-editor")
+                                    .outline()
+                                    .label("Open in editor")
+                                    .on_click(move |_, _, _| open_in_editor(&path)),
+                            )
+                            .test_support(),
+                    ),
+            )
+            .child(
+                div()
+                    .id("change-diff")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_scroll()
+                    .child(diff::render_wide(&unified))
+                    .test_support(),
+            )
+    });
 
     div()
         .size_full()
         .flex()
         .flex_col()
         .bg(p.chrome)
-        .border_l_1()
-        .border_color(p.border)
         .child(header)
-        .when(changes.is_empty(), |panel| panel.child(empty))
-        .when(!changes.is_empty(), |panel| {
-            panel
-                .child(
-                    div()
-                        .py(px(10.))
-                        .flex()
-                        .flex_col()
-                        .gap(px(1.))
-                        .children(files),
-                )
-                .children(detail)
-        })
+        .children(list)
+        .children(detail)
 }
 
-fn split_path(path: &str) -> (&str, &str) {
-    match path.rsplit_once('/') {
-        Some((dir, name)) => (dir, name),
-        None => ("", path),
+/// `$EDITOR <path>` when set (a GUI editor command such as `code` or `zed`),
+/// otherwise the system default app via `open`.
+pub fn open_in_editor(path: &std::path::Path) {
+    let editor = std::env::var("EDITOR")
+        .ok()
+        .filter(|e| !e.trim().is_empty());
+    let spawned = editor.and_then(|editor| {
+        let mut parts = editor.split_whitespace();
+        let program = parts.next()?;
+        std::process::Command::new(program)
+            .args(parts)
+            .arg(path)
+            .spawn()
+            .ok()
+    });
+    if spawned.is_none() {
+        std::process::Command::new("open").arg(path).spawn().ok();
     }
 }

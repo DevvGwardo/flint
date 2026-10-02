@@ -1,6 +1,8 @@
 //! Pure parsing for Chat Completions streams: SSE framing and assembly of
 //! chunk deltas (text, reasoning, tool calls by index, trailing usage).
 
+use std::time::Duration;
+
 use serde_json::Value;
 
 use crate::protocol::Usage;
@@ -52,7 +54,7 @@ pub enum StreamDelta {
 }
 
 /// A tool call as the model sent it (arguments not yet parsed).
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct RawToolCall {
     pub id: String,
     pub name: String,
@@ -67,6 +69,19 @@ pub struct Completion {
     pub tool_calls: Vec<RawToolCall>,
     pub finish_reason: Option<String>,
     pub usage: Option<Usage>,
+    pub timing: Timing,
+}
+
+/// Latency of one model call, measured from sending the request.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct Timing {
+    /// Response headers received.
+    pub headers: Option<Duration>,
+    /// First body byte (first SSE data).
+    pub first_byte: Option<Duration>,
+    /// First text or reasoning delta.
+    pub first_delta: Option<Duration>,
+    pub total: Duration,
 }
 
 /// Accumulates chunks into a [`Completion`].

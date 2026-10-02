@@ -51,10 +51,15 @@ async fn mock_server(responses: Vec<String>) -> (String, Arc<StdMutex<Vec<Value>
             let sse = responses
                 .next()
                 .unwrap_or_else(|| sse_text("(script exhausted)"));
-            let reply = format!(
-                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{sse}",
-                sse.len()
-            );
+            // A scripted response starting with "HTTP/" is sent as-is.
+            let reply = if sse.starts_with("HTTP/") {
+                sse
+            } else {
+                format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{sse}",
+                    sse.len()
+                )
+            };
             let _ = socket.write_all(reply.as_bytes()).await;
             let _ = socket.shutdown().await;
         }
@@ -86,21 +91,53 @@ fn sse_text(text: &str) -> String {
     ])
 }
 
-async fn run_one_turn(url: String, workspace: PathBuf, prompt: &str) -> Vec<AgentEvent> {
-    let handle = crate::spawn_session(AgentConfig {
+fn test_config(url: String, workspace: PathBuf) -> AgentConfig {
+    AgentConfig {
         base_url: url,
         model: "test-model".to_string(),
         api_key: "test-key".to_string(),
         workspace,
         approval: ApprovalMode::Auto,
         jev: None,
-    });
-    handle
-        .ops
-        .send(Op::UserMessage(prompt.to_string()))
-        .await
-        .expect("send");
+        session_dir: None,
+        context_budget_tokens: crate::DEFAULT_CONTEXT_BUDGET_TOKENS,
+        reasoning_effort: None,
+    }
+}
+
+async fn run_one_turn(url: String, workspace: PathBuf, prompt: &str) -> Vec<AgentEvent> {
+    let events = run_turns(test_config(url, workspace), &[prompt]).await;
+    // Only the turn itself, as these tests were written.
+    let end = events
+        .iter()
+        .position(|e| matches!(e, AgentEvent::TurnFinished { .. }))
+        .map_or(events.len(), |i| i + 1);
+    events[..end].to_vec()
+}
+
+/// Runs each prompt as a turn in one session, then shuts it down cleanly.
+async fn run_turns(config: AgentConfig, prompts: &[&str]) -> Vec<AgentEvent> {
+    let handle = crate::spawn_session(config);
     let mut events = Vec::new();
+    for prompt in prompts {
+        handle
+            .ops
+            .send(Op::UserMessage((*prompt).to_string()))
+            .await
+            .expect("send");
+        collect_turn(&handle, &mut events).await;
+    }
+    let _ = handle.ops.send(Op::Shutdown).await;
+    // Wait for the session to end (and flush its history).
+    while let Ok(Ok(event)) =
+        tokio::time::timeout(Duration::from_secs(5), handle.events.recv()).await
+    {
+        events.push(event);
+    }
+    events
+}
+
+async fn collect_turn(handle: &crate::SessionHandle, events: &mut Vec<AgentEvent>) {
     loop {
         let event = tokio::time::timeout(Duration::from_secs(20), handle.events.recv())
             .await
@@ -112,8 +149,6 @@ async fn run_one_turn(url: String, workspace: PathBuf, prompt: &str) -> Vec<Agen
             break;
         }
     }
-    let _ = handle.ops.send(Op::Shutdown).await;
-    events
 }
 
 /// Compact names for asserting event order.
@@ -130,6 +165,7 @@ fn outline(events: &[AgentEvent]) -> Vec<String> {
             AgentEvent::HarnessNudge { reason, .. } => Some(format!("nudge {reason:?}")),
             AgentEvent::TurnFinished { reason, .. } => Some(format!("finished {reason:?}")),
             AgentEvent::Error(message) => Some(format!("error {message}")),
+            AgentEvent::ContextCompacted { .. } => Some("compacted".to_string()),
             AgentEvent::ReasoningDelta(_)
             | AgentEvent::TextDelta(_)
             | AgentEvent::ToolOutputDelta { .. }
@@ -277,4 +313,273 @@ async fn repairs_names_and_arguments() {
             },
         ]
     );
+}
+
+#[tokio::test]
+async fn saved_session_continues_after_restart() {
+    let (_guard, ws) = temp_workspace();
+    let sessions = tempfile::tempdir().expect("tempdir");
+    let (url, requests) =
+        mock_server(vec![sse_text("First answer."), sse_text("Second answer.")]).await;
+    let config = AgentConfig {
+        session_dir: Some(sessions.path().to_path_buf()),
+        ..test_config(url, ws)
+    };
+
+    run_turns(config.clone(), &["what is 2+2?"]).await;
+    let events = run_turns(config, &["and 3+3?"]).await;
+    assert_eq!(
+        events.first(),
+        Some(&AgentEvent::TurnStarted { turn_id: 2 })
+    );
+
+    let requests = requests.lock().expect("lock").clone();
+    let roles: Vec<(String, String)> = requests[1]["messages"]
+        .as_array()
+        .expect("messages")
+        .iter()
+        .skip(1)
+        .map(|m| {
+            (
+                m["role"].as_str().unwrap_or_default().to_string(),
+                m["content"].as_str().unwrap_or_default().to_string(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        roles,
+        vec![
+            ("user".to_string(), "what is 2+2?".to_string()),
+            ("assistant".to_string(), "First answer.".to_string()),
+            ("user".to_string(), "and 3+3?".to_string()),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn corrupt_history_starts_fresh_with_an_error() {
+    let (_guard, ws) = temp_workspace();
+    let sessions = tempfile::tempdir().expect("tempdir");
+    std::fs::write(
+        sessions.path().join("history.json"),
+        "{\"version\":1,\"turn_id\":3,\"messa",
+    )
+    .expect("write");
+    let (url, requests) = mock_server(vec![sse_text("Hi.")]).await;
+    let config = AgentConfig {
+        session_dir: Some(sessions.path().to_path_buf()),
+        ..test_config(url, ws)
+    };
+    let events = run_turns(config, &["hello"]).await;
+    assert!(
+        matches!(&events[0], AgentEvent::Error(m) if m.starts_with("Couldn't restore the saved conversation"))
+    );
+    assert_eq!(events[1], AgentEvent::TurnStarted { turn_id: 1 });
+    assert_eq!(
+        requests.lock().expect("lock")[0]["messages"]
+            .as_array()
+            .map(Vec::len),
+        Some(2)
+    );
+}
+
+#[tokio::test]
+async fn reasoning_effort_is_sent_and_dropped_once_rejected() {
+    let (_guard, ws) = temp_workspace();
+    let body = "{\"error\":{\"message\":\"unknown reasoning_effort\"}}";
+    let rejected = format!(
+        "HTTP/1.1 400 Bad Request\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    let (url, requests) = mock_server(vec![rejected, sse_text("One."), sse_text("Two.")]).await;
+    let config = AgentConfig {
+        reasoning_effort: Some(ReasoningEffort::High),
+        ..test_config(url, ws)
+    };
+    let events = run_turns(config, &["a", "b"]).await;
+    let errors: Vec<&AgentEvent> = events
+        .iter()
+        .filter(|e| matches!(e, AgentEvent::Error(_)))
+        .collect();
+    assert_eq!(
+        errors,
+        vec![&AgentEvent::Error(
+            "This model endpoint doesn't accept reasoning_effort; continuing without it."
+                .to_string()
+        )]
+    );
+    let finished: Vec<String> = outline(&events)
+        .into_iter()
+        .filter(|e| e.starts_with("finished"))
+        .collect();
+    assert_eq!(finished, vec!["finished Completed", "finished Completed"]);
+    let efforts: Vec<Value> = requests
+        .lock()
+        .expect("lock")
+        .iter()
+        .map(|r| r["reasoning_effort"].clone())
+        .collect();
+    assert_eq!(efforts, vec![json!("high"), Value::Null, Value::Null]);
+}
+
+#[tokio::test]
+async fn effort_can_change_mid_session() {
+    let (_guard, ws) = temp_workspace();
+    let (url, requests) = mock_server(vec![sse_text("One."), sse_text("Two.")]).await;
+    let handle = crate::spawn_session(test_config(url, ws));
+    let mut events = Vec::new();
+    handle
+        .ops
+        .send(Op::UserMessage("a".into()))
+        .await
+        .expect("send");
+    collect_turn(&handle, &mut events).await;
+    handle
+        .ops
+        .send(Op::SetReasoningEffort(Some(ReasoningEffort::Low)))
+        .await
+        .expect("send");
+    handle
+        .ops
+        .send(Op::UserMessage("b".into()))
+        .await
+        .expect("send");
+    collect_turn(&handle, &mut events).await;
+    let _ = handle.ops.send(Op::Shutdown).await;
+    let efforts: Vec<Value> = requests
+        .lock()
+        .expect("lock")
+        .iter()
+        .map(|r| r["reasoning_effort"].clone())
+        .collect();
+    assert_eq!(efforts, vec![Value::Null, json!("low")]);
+}
+
+#[tokio::test]
+async fn small_budget_compacts_and_reports_it() {
+    let (_guard, ws) = temp_workspace();
+    let big = "line of output\n".repeat(400);
+    let mut script = Vec::new();
+    for i in 0..6 {
+        std::fs::write(ws.join(format!("f{i}.txt")), &big).expect("write");
+        script.push(sse_tool_call(
+            &format!("c{i}"),
+            "read_file",
+            json!({"path": format!("f{i}.txt")}),
+        ));
+        script.push(sse_text("Read it."));
+    }
+    let (url, requests) = mock_server(script).await;
+    let config = AgentConfig {
+        context_budget_tokens: 6_000,
+        ..test_config(url, ws)
+    };
+    let prompts = [
+        "read f0", "read f1", "read f2", "read f3", "read f4", "read f5",
+    ];
+    let events = run_turns(config, &prompts).await;
+    let compactions: Vec<(u64, u64)> = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::ContextCompacted {
+                before_tokens,
+                after_tokens,
+            } => Some((*before_tokens, *after_tokens)),
+            _ => None,
+        })
+        .collect();
+    assert!(!compactions.is_empty());
+    for (before, after) in &compactions {
+        assert!(*before >= 4_800 && after < before, "{before} -> {after}");
+    }
+    // The last request still has every user message and stubs for old output.
+    let last = requests
+        .lock()
+        .expect("lock")
+        .last()
+        .cloned()
+        .expect("request");
+    let text = last["messages"].to_string();
+    for prompt in prompts {
+        assert!(text.contains(prompt), "{prompt} missing");
+    }
+    assert!(text.contains("[output trimmed:"));
+}
+
+#[test]
+fn every_event_round_trips_through_serde() {
+    let events = vec![
+        AgentEvent::TurnStarted { turn_id: 1 },
+        AgentEvent::StepStarted {
+            turn_id: 1,
+            step: 0,
+        },
+        AgentEvent::ReasoningDelta("r".into()),
+        AgentEvent::TextDelta("t".into()),
+        AgentEvent::ToolCallStarted {
+            call_id: "c".into(),
+            name: "run_command".into(),
+            kind: ToolKind::Command,
+            args: json!({"command": "ls", "n": [1, 2]}),
+            summary: "ls".into(),
+        },
+        AgentEvent::ToolOutputDelta {
+            call_id: "c".into(),
+            chunk: "out".into(),
+        },
+        AgentEvent::ToolCallFinished {
+            call_id: "c".into(),
+            output: "o".into(),
+            exit_code: Some(-1),
+            success: false,
+            diff: Some(crate::protocol::FileDiff {
+                path: "a".into(),
+                unified: "@@".into(),
+                added: 1,
+                removed: 2,
+                created: true,
+            }),
+            duration_ms: 5,
+        },
+        AgentEvent::ApprovalRequested {
+            call_id: "c".into(),
+            kind: ToolKind::Edit,
+            summary: "a.rs".into(),
+        },
+        AgentEvent::HarnessNudge {
+            reason: NudgeReason::LeakedCall,
+            message: "m".into(),
+        },
+        AgentEvent::ToolRepaired {
+            tool: "t".into(),
+            detail: "d".into(),
+        },
+        AgentEvent::Usage(Usage {
+            input_tokens: 1,
+            cached_input_tokens: 2,
+            output_tokens: 3,
+            reasoning_tokens: 4,
+        }),
+        AgentEvent::ContextCompacted {
+            before_tokens: 9,
+            after_tokens: 4,
+        },
+        AgentEvent::TurnFinished {
+            turn_id: 1,
+            reason: TurnEndReason::Failed("x".into()),
+        },
+        AgentEvent::TurnFinished {
+            turn_id: 2,
+            reason: TurnEndReason::StepLimit,
+        },
+        AgentEvent::Error("e".into()),
+    ];
+    for event in events {
+        let line = serde_json::to_string(&event).expect("serialize");
+        assert!(!line.contains('\n'));
+        assert_eq!(
+            serde_json::from_str::<AgentEvent>(&line).expect("deserialize"),
+            event
+        );
+    }
 }

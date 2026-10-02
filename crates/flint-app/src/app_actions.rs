@@ -1,12 +1,10 @@
 //! Workspace and sidebar actions on the root view: opening folders, Finder
-//! and Terminal, the effort chip, and the sidebar's search/filter.
+//! and Terminal, and the sidebar's search/filter.
 
 use gpui_kit::*;
 
-use crate::app::Effort;
 use crate::app::FlintApp;
 use crate::app::SessionFilter;
-use crate::session::Session;
 use crate::session::Status;
 
 impl FlintApp {
@@ -26,7 +24,8 @@ impl FlintApp {
             };
             this.update(cx, |app, cx| {
                 app.workspace = path.clone();
-                app.sessions.push(Session::new(path));
+                let session = app.new_session_value(path);
+                app.sessions.push(session);
                 app.active = app.sessions.len() - 1;
                 cx.notify();
             })
@@ -50,15 +49,6 @@ impl FlintApp {
             .arg(&self.session().workspace)
             .spawn()
             .ok();
-    }
-
-    pub fn cycle_effort(&mut self, cx: &mut Context<Self>) {
-        self.effort = match self.effort {
-            Effort::Low => Effort::Medium,
-            Effort::Medium => Effort::High,
-            Effort::High => Effort::Low,
-        };
-        cx.notify();
     }
 
     pub fn cycle_filter(&mut self, cx: &mut Context<Self>) {

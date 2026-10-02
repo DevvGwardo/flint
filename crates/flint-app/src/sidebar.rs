@@ -1,11 +1,10 @@
 //! The floating sidebar: new agent, search, sessions grouped by workspace with
 //! live status glyphs, and filter/settings at the bottom.
 
-use std::time::Instant;
+use std::time::SystemTime;
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::input::Input;
-use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::*;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -14,10 +13,8 @@ use crate::app::FlintApp;
 use crate::app::NewSession;
 use crate::app::OpenWorkspace;
 use crate::app::SessionFilter;
-use crate::app::TogglePalette;
 use crate::app::ToggleSidebar;
 use crate::layout::SIDEBAR_WIDTH;
-use crate::session::Session;
 use crate::session::Status;
 use crate::session::folder_name;
 use crate::theme::palette;
@@ -80,7 +77,6 @@ pub fn render(app: &FlintApp, cx: &mut Context<FlintApp>) -> impl IntoElement {
             .cleanable(true),
     );
 
-    let now = Instant::now();
     // Group by workspace, most recently active first.
     let mut ordered = app.visible_sessions(cx);
     ordered.sort_by_key(|&ix| std::cmp::Reverse(app.sessions[ix].touched));
@@ -96,7 +92,7 @@ pub fn render(app: &FlintApp, cx: &mut Context<FlintApp>) -> impl IntoElement {
     for (g, (workspace, rows)) in groups.into_iter().enumerate() {
         let rows: Vec<_> = rows
             .into_iter()
-            .map(|ix| session_row(ix, &app.sessions[ix], ix == app.active, now, cx))
+            .map(|ix| session_row(app, ix, cx))
             .collect();
         list.push(
             div()
@@ -140,11 +136,9 @@ pub fn render(app: &FlintApp, cx: &mut Context<FlintApp>) -> impl IntoElement {
                 .child(ui::label(filter_label, size::XS, p.text_subtle)),
         )
         .child(
-            nav_row("settings", IconName::Settings, "Settings", Some("⌘K")).on_click(cx.listener(
-                |_, _, window, cx| {
-                    window.dispatch_action(Box::new(TogglePalette), cx);
-                },
-            )),
+            nav_row("settings", IconName::Settings, "Settings", Some("⌘,"))
+                .on_click(cx.listener(|this, _, window, cx| this.open_settings(window, cx)))
+                .test_support(),
         );
 
     div()
@@ -198,17 +192,14 @@ fn nav_row(
         })
 }
 
-fn session_row(
-    ix: usize,
-    session: &Session,
-    active: bool,
-    now: Instant,
-    cx: &mut Context<FlintApp>,
-) -> Stateful<Div> {
+fn session_row(app: &FlintApp, ix: usize, cx: &mut Context<FlintApp>) -> AnyElement {
     let p = palette();
+    let session = &app.sessions[ix];
+    let active = ix == app.active;
     let status = session.status();
     let glyph: AnyElement = match status {
-        Status::Running => Spinner::new().xsmall().color(p.accent).into_any_element(),
+        Status::Running => ui::spinner(app.now(), 13., p.accent).into_any_element(),
+        Status::NeedsApproval => ui::icon(IconName::ShieldAlert, 13., p.warning).into_any_element(),
         Status::Unread => div()
             .size(px(7.))
             .rounded_full()
@@ -222,27 +213,56 @@ fn session_row(
             .border_color(p.text_subtle)
             .into_any_element(),
     };
-    let subtitle = match status {
-        Status::Running => match session.view.running_commands().last() {
-            Some(call) => format!("Running {}", call.summary),
-            None => "Working…".to_string(),
-        },
-        Status::Unread | Status::Done => match session.view.turns.last() {
-            Some(turn) if !turn.files.is_empty() => {
-                let n = turn.files.len();
-                format!(
-                    "{n} file{} changed · +{} −{}",
-                    if n == 1 { "" } else { "s" },
-                    turn.added,
-                    turn.removed
-                )
-            }
-            _ => "Answered".to_string(),
-        },
-        Status::Idle => "Idle".to_string(),
+    let (subtitle, subtitle_color) = match status {
+        Status::NeedsApproval => ("Needs approval".to_string(), p.warning),
+        Status::Running => (
+            match session.view.running_commands().last() {
+                Some(call) => format!("Running {}", call.summary),
+                None => "Working…".to_string(),
+            },
+            p.text_subtle,
+        ),
+        Status::Unread | Status::Done => (
+            match session.view.turns.last() {
+                Some(turn) if !turn.files.is_empty() => {
+                    let n = turn.files.len();
+                    format!(
+                        "{n} file{} changed · +{} −{}",
+                        if n == 1 { "" } else { "s" },
+                        turn.added,
+                        turn.removed
+                    )
+                }
+                _ => "Answered".to_string(),
+            },
+            p.text_subtle,
+        ),
+        Status::Idle => ("Idle".to_string(), p.text_subtle),
     };
-    let emphasized = active || status == Status::Unread;
-    div()
+    let emphasized = active || matches!(status, Status::Unread | Status::NeedsApproval);
+    let ago = SystemTime::now()
+        .duration_since(session.touched)
+        .unwrap_or_default();
+    let renaming = app
+        .renaming
+        .as_ref()
+        .filter(|(row, _)| *row == ix)
+        .map(|(_, input)| input.clone());
+    let title: AnyElement = match renaming {
+        Some(input) => Input::new(&input).small().into_any_element(),
+        None => div()
+            .flex_1()
+            .min_w_0()
+            .truncate()
+            .text_size(px(size::BASE))
+            .text_color(if emphasized { p.text } else { p.text_muted })
+            .when(status == Status::Unread, |t| {
+                t.font_weight(FontWeight::MEDIUM)
+            })
+            .child(session.title())
+            .into_any_element(),
+    };
+    let row = div()
         .id(("session", ix))
         .mx(px(8.))
         .px(px(12.))
@@ -254,6 +274,13 @@ fn session_row(
         .when(active, |row| row.bg(white(0.075)))
         .when(!active, |row| row.hover(|style| style.bg(white(0.04))))
         .on_click(cx.listener(move |this, _, window, cx| this.select_session(ix, window, cx)))
+        .on_mouse_down(
+            MouseButton::Right,
+            cx.listener(move |this, _, _, cx| {
+                this.session_menu = Some(ix);
+                cx.notify();
+            }),
+        )
         .child(
             div()
                 .w(px(16.))
@@ -276,30 +303,65 @@ fn session_row(
                         .flex()
                         .items_center()
                         .gap(px(8.))
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .truncate()
-                                .text_size(px(size::BASE))
-                                .text_color(if emphasized { p.text } else { p.text_muted })
-                                .when(status == Status::Unread, |t| {
-                                    t.font_weight(FontWeight::MEDIUM)
-                                })
-                                .child(session.title()),
-                        )
-                        .child(ui::label(
-                            ui::ago(now.saturating_duration_since(session.touched)),
-                            size::XS,
-                            p.text_subtle,
-                        )),
+                        .child(title)
+                        .child(ui::label(ui::ago(ago), size::XS, p.text_subtle)),
                 )
                 .child(
                     div()
                         .truncate()
                         .text_size(px(size::XS))
-                        .text_color(p.text_subtle)
+                        .text_color(subtitle_color)
                         .child(subtitle),
                 ),
         )
+        .test_support();
+    if app.session_menu != Some(ix) {
+        return row.into_any_element();
+    }
+    let item = |id: &'static str, icon: IconName, label: &'static str, color: Hsla| {
+        div()
+            .id((id, ix))
+            .h(px(34.))
+            .px(px(12.))
+            .flex()
+            .items_center()
+            .gap(px(10.))
+            .rounded(px(7.))
+            .cursor_pointer()
+            .hover(|s| s.bg(white(0.06)))
+            .child(ui::icon(icon, 14., color))
+            .child(ui::label(label, size::BASE - 1., color))
+    };
+    div()
+        .flex()
+        .flex_col()
+        .child(row)
+        .child(
+            div()
+                .mx(px(14.))
+                .my(px(4.))
+                .p(px(4.))
+                .rounded(px(10.))
+                .border_1()
+                .border_color(p.border_strong)
+                .bg(p.surface)
+                .shadow_lg()
+                .child(
+                    item("rename-session", IconName::Pencil, "Rename", p.text)
+                        .on_click(
+                            cx.listener(move |this, _, window, cx| {
+                                this.start_rename(ix, window, cx)
+                            }),
+                        )
+                        .test_support(),
+                )
+                .child(
+                    item("delete-session", IconName::Trash, "Delete", p.danger)
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.delete_session(ix, window, cx)
+                        }))
+                        .test_support(),
+                ),
+        )
+        .into_any_element()
 }

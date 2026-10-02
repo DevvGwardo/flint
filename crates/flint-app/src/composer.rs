@@ -1,19 +1,17 @@
-//! The floating composer, with the live status line above it and the
-//! running-task tray attached to its top edge.
+//! The floating composer: the live status line and pinned approval card
+//! above it, the `@`/`/` menus and help, attachment chips, the running-task
+//! tray, and the input with its toolbar.
 
 use std::time::Duration;
 
 use flint_agent::ApprovalMode;
+use flint_agent::ReasoningEffort;
 use gpui_kit::assets::IconName;
 use gpui_kit::component::input::Textarea;
-use gpui_kit::component::spinner::Spinner;
-use gpui_kit::component::*;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
-use crate::app::Effort;
 use crate::app::FlintApp;
-use crate::app::TogglePalette;
 use crate::theme::MONO_FONT;
 use crate::theme::palette;
 use crate::theme::size;
@@ -21,8 +19,6 @@ use crate::transcript::COLUMN_WIDTH;
 use crate::turns::Activity;
 use crate::ui;
 
-/// Status glyph frames, played back and forth.
-const GLYPHS: &[&str] = &["·", "✢", "✳", "✶", "✻", "✽", "✻", "✶", "✳", "✢"];
 const THINKING_VERBS: &[&str] = &["Thinking", "Reasoning", "Pondering", "Mulling"];
 const WORKING_VERBS: &[&str] = &["Working", "Forging", "Tempering", "Kindling"];
 
@@ -30,6 +26,7 @@ pub fn render(app: &FlintApp, cx: &mut Context<FlintApp>) -> AnyElement {
     let p = palette();
     let view = &app.session().view;
     let running = view.running;
+    let now = app.now();
     let tasks = view.running_commands();
 
     let tray = (!tasks.is_empty()).then(|| {
@@ -51,18 +48,17 @@ pub fn render(app: &FlintApp, cx: &mut Context<FlintApp>) -> AnyElement {
             .children(tasks.iter().map(|call| {
                 let last = call
                     .output
-                    .lines()
-                    .rev()
+                    .rsplit('\n')
                     .find(|line| !line.trim().is_empty())
                     .unwrap_or("")
                     .trim()
                     .to_string();
-                let elapsed = app.now().saturating_sub(call.started);
+                let elapsed = now.saturating_sub(call.started);
                 div()
                     .flex()
                     .items_center()
                     .gap(px(10.))
-                    .child(Spinner::new().small().color(p.accent))
+                    .child(ui::spinner(now, 14., p.accent))
                     .child(ui::mono(call.summary.clone(), size::SM, p.text).flex_shrink_0())
                     .child(
                         div()
@@ -83,10 +79,49 @@ pub fn render(app: &FlintApp, cx: &mut Context<FlintApp>) -> AnyElement {
             }))
     });
 
-    let effort = match app.effort {
-        Effort::Low => "Low",
-        Effort::Medium => "Medium",
-        Effort::High => "High",
+    let chips = (!app.attachments.is_empty()).then(|| {
+        div()
+            .px(px(14.))
+            .pt(px(12.))
+            .flex()
+            .flex_wrap()
+            .gap(px(6.))
+            .children(app.attachments.iter().enumerate().map(|(n, path)| {
+                let path_owned = path.clone();
+                div()
+                    .h(px(28.))
+                    .pl(px(10.))
+                    .pr(px(4.))
+                    .flex()
+                    .items_center()
+                    .gap(px(6.))
+                    .rounded(px(8.))
+                    .bg(p.raised)
+                    .child(ui::icon(IconName::FileText, 13., p.text_muted))
+                    .child(ui::mono(path.clone(), size::XS, p.text))
+                    .child(
+                        div()
+                            .id(("remove-attachment", n))
+                            .size(px(20.))
+                            .rounded(px(5.))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .cursor_pointer()
+                            .hover(|s| s.bg(p.border_strong))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.remove_attachment(&path_owned, cx)
+                            }))
+                            .child(ui::icon(IconName::X, 11., p.text_subtle)),
+                    )
+            }))
+    });
+
+    let effort_label = match app.effort {
+        Some(ReasoningEffort::Low) => "Low",
+        Some(ReasoningEffort::Medium) => "Medium",
+        Some(ReasoningEffort::High) => "High",
+        None => "Default",
     };
     let (mode_icon, mode_text, mode_color) = match app.approval {
         ApprovalMode::Auto => (IconName::ChevronsRight, "auto-run on", p.text_muted),
@@ -97,11 +132,13 @@ pub fn render(app: &FlintApp, cx: &mut Context<FlintApp>) -> AnyElement {
         round_button("stop", p.text, p.raised)
             .child(div().size(px(11.)).rounded(px(2.5)).bg(p.text))
             .on_click(cx.listener(|this, _, _, cx| this.interrupt(cx)))
+            .test_support()
             .into_any_element()
     } else {
         round_button("send", p.on_accent, p.accent)
             .child(ui::icon(IconName::ArrowUp, 18., p.on_accent))
             .on_click(cx.listener(|this, _, window, cx| this.submit(window, cx)))
+            .test_support()
             .into_any_element()
     };
 
@@ -117,17 +154,23 @@ pub fn render(app: &FlintApp, cx: &mut Context<FlintApp>) -> AnyElement {
                 .border_1()
                 .border_color(p.border_strong)
                 .child(ui::icon(IconName::Plus, 17., p.text_muted))
-                .on_click(cx.listener(|_, _, window, cx| {
-                    window.dispatch_action(Box::new(TogglePalette), cx);
-                })),
+                .on_click(cx.listener(|this, _, window, cx| this.open_mention_picker(window, cx)))
+                .test_support(),
         )
         .child(
             chip("model-chip")
-                .on_click(cx.listener(|this, _, _, cx| this.cycle_effort(cx)))
-                .child(ui::label(app.model.clone(), size::BASE - 1., p.text))
-                .child(ui::label(effort, size::BASE - 1., p.text_subtle))
-                .child(ui::icon(IconName::ChevronsUpDown, 13., p.text_subtle)),
+                .on_click(cx.listener(|this, _, window, cx| this.open_settings(window, cx)))
+                .child(ui::label(app.model.clone(), size::BASE - 1., p.text)),
         )
+        .when(app.effort_supported, |bar| {
+            bar.child(
+                chip("effort-chip")
+                    .on_click(cx.listener(|this, _, _, cx| this.cycle_effort(cx)))
+                    .child(ui::icon(IconName::Brain, 14., p.text_subtle))
+                    .child(ui::label(effort_label, size::BASE - 1., p.text_subtle))
+                    .test_support(),
+            )
+        })
         .child(div().flex_1())
         .child(
             chip("approval-hint")
@@ -148,6 +191,7 @@ pub fn render(app: &FlintApp, cx: &mut Context<FlintApp>) -> AnyElement {
         .shadow_lg()
         .overflow_hidden()
         .children(tray)
+        .children(chips)
         .child(
             div().px(px(12.)).pt(px(12.)).min_h(px(44.)).child(
                 Textarea::new(&app.composer)
@@ -158,13 +202,25 @@ pub fn render(app: &FlintApp, cx: &mut Context<FlintApp>) -> AnyElement {
         )
         .child(toolbar);
 
+    let pinned = app
+        .session()
+        .view
+        .pending_approval()
+        .map(|(call_id, kind, summary)| {
+            crate::transcript::pinned_approval(&call_id, kind, &summary, cx)
+        });
+
     div()
         .w_full()
         .max_w(px(COLUMN_WIDTH + 40.))
         .flex()
         .flex_col()
         .gap(px(10.))
-        .when(running, |col| col.child(status_line(app)))
+        .when(running && pinned.is_none(), |col| {
+            col.child(status_line(app))
+        })
+        .children(pinned)
+        .children(crate::menus::render(app, cx))
         .child(card)
         .into_any_element()
 }
@@ -174,7 +230,6 @@ fn status_line(app: &FlintApp) -> impl IntoElement {
     let p = palette();
     let view = &app.session().view;
     let now = app.now();
-    let tick = (now.as_millis() / 120) as usize;
     let rotate = (now.as_millis() / 2400) as usize;
     let verb = match view.activity() {
         Activity::Thinking => THINKING_VERBS[rotate % THINKING_VERBS.len()].to_string(),
@@ -191,17 +246,13 @@ fn status_line(app: &FlintApp) -> impl IntoElement {
         .unwrap_or_default();
     let tokens = view.usage.output_tokens + view.usage.reasoning_tokens;
     div()
+        .id("status-line")
         .px(px(18.))
         .flex()
         .items_center()
-        .gap(px(7.))
+        .gap(px(8.))
         .text_size(px(size::BASE))
-        .child(
-            div()
-                .w(px(14.))
-                .text_color(p.accent)
-                .child(GLYPHS[tick % GLYPHS.len()]),
-        )
+        .child(ui::work_glyph(now, 15., p.accent))
         .child(
             div()
                 .text_color(p.accent)
@@ -214,6 +265,7 @@ fn status_line(app: &FlintApp) -> impl IntoElement {
             p.text_subtle,
         ))
         .child(ui::label("· esc to interrupt", size::BASE, p.text_subtle))
+        .test_support()
 }
 
 fn round_button(id: &'static str, fg: Hsla, bg: Hsla) -> Stateful<Div> {

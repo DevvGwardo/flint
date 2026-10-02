@@ -7,6 +7,7 @@ license.workspace = true
 [dependencies]
 anyhow.workspace = true
 async-channel.workspace = true
+bytes = "1.12.1"
 futures-util = "0.3.34"
 regex = "1.13.1"
 reqwest = { version = "0.13.5", default-features = false, features = ["json", "stream", "rustls"] }

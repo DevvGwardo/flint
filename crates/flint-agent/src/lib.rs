@@ -2,8 +2,12 @@
 //! the flash harness (loop detection, verify-before-done, zero-edit watchdog,
 //! tool-call repair, optional JEV judge). No UI code lives here.
 
+#[cfg(test)]
+mod bench_tests;
 pub mod config;
+mod context;
 pub mod harness;
+mod persist;
 pub mod prompt;
 pub mod protocol;
 pub mod provider;

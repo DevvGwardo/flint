@@ -8,9 +8,8 @@ use flint_agent::NudgeReason;
 use flint_agent::ToolKind;
 use gpui_kit::assets::IconName;
 use gpui_kit::component::shimmer::ShimmerText;
-use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::text::TextView;
-use gpui_kit::component::*;
+use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
@@ -49,7 +48,27 @@ pub fn render(ix: usize, item: &Item, now: Duration, cx: &mut Context<FlintApp>)
             ..
         } => thinking(ix, text, *duration, *expanded, cx).into_any_element(),
         Item::Tool(call) => tool(ix, call, now, cx).into_any_element(),
-        Item::Nudge { reason, message } => nudge(*reason, message).into_any_element(),
+        Item::Nudge {
+            reason,
+            message,
+            expanded,
+        } => nudge(ix, *reason, message, *expanded, cx).into_any_element(),
+        Item::Compacted {
+            before_tokens,
+            after_tokens,
+        } => bullet(
+            ui::icon(IconName::Scissors, 12., palette().text_subtle),
+            ui::label(
+                format!(
+                    "Context trimmed {} → {} tokens to stay within the budget",
+                    ui::tokens(*before_tokens),
+                    ui::tokens(*after_tokens)
+                ),
+                size::SM,
+                palette().text_subtle,
+            ),
+        )
+        .into_any_element(),
         Item::Repair { tool, detail } => bullet(
             ui::icon(IconName::Wrench, 11., palette().text_subtle),
             ui::label(
@@ -64,12 +83,11 @@ pub fn render(ix: usize, item: &Item, now: Duration, cx: &mut Context<FlintApp>)
             kind,
             summary,
             decision,
-        } => super::approval::render(call_id, *kind, summary, *decision, cx).into_any_element(),
-        Item::Error(message) => bullet(
-            ui::icon(IconName::CircleAlert, 12., palette().danger),
-            ui::label(message.clone(), size::BASE, palette().danger),
-        )
-        .into_any_element(),
+        } => {
+            let _ = call_id;
+            super::approval::record(*kind, summary, *decision).into_any_element()
+        }
+        Item::Error(message) => super::errors::render(ix, message, cx),
         Item::TurnSummary { .. } => div().into_any_element(),
     }
 }
@@ -193,7 +211,7 @@ fn tool(ix: usize, call: &ToolCall, now: Duration, cx: &mut Context<FlintApp>) -
     let running = call.result.is_none();
     let failed = call.result.as_ref().is_some_and(|r| !r.success);
     let glyph: AnyElement = if running {
-        Spinner::new().xsmall().color(p.accent).into_any_element()
+        ui::spinner(now, 13., p.accent).into_any_element()
     } else if failed {
         dot(p.danger).into_any_element()
     } else {
@@ -254,30 +272,49 @@ fn tool(ix: usize, call: &ToolCall, now: Duration, cx: &mut Context<FlintApp>) -
         }
     };
 
-    let output: Vec<&str> = call
-        .output
-        .lines()
-        .filter(|line| !is_exit_code_line(line))
-        .collect();
+    // Only what this frame shows is read from the (possibly large) output:
+    // the tail from the end, the head from the start.
+    let tail_lines = |n: usize| -> Vec<&str> {
+        let mut lines: Vec<&str> = call
+            .output
+            .rsplit('\n')
+            .filter(|line| !line.trim().is_empty() && !is_exit_code_line(line))
+            .take(n)
+            .collect();
+        lines.reverse();
+        lines
+    };
     // The one-line summary under the row (the expanded view shows everything).
     let detail: Option<String> = if call.expanded || running {
         None
     } else {
         match call.kind {
-            ToolKind::Command => last_meaningful(&output).map(str::to_string),
-            ToolKind::Read => Some(plural(output.len(), "line")),
-            ToolKind::Search => output.first().map(|line| line.trim().to_string()),
-            ToolKind::Edit if failed => output.first().map(|line| line.to_string()),
+            ToolKind::Command => tail_lines(1).first().map(|line| line.trim().to_string()),
+            ToolKind::Read => Some(plural(call.output.lines().count(), "line")),
+            ToolKind::Search => call
+                .output
+                .lines()
+                .next()
+                .map(|line| line.trim().to_string()),
+            ToolKind::Edit if failed => call
+                .output
+                .lines()
+                .next()
+                .map(|line| line.trim().to_string()),
             _ => None,
         }
     };
     let live_tail: Vec<&str> = if running && call.kind == ToolKind::Command && !call.expanded {
-        let lines: Vec<&str> = output
-            .iter()
-            .copied()
-            .filter(|line| !line.trim().is_empty())
-            .collect();
-        lines[lines.len().saturating_sub(LIVE_TAIL_LINES)..].to_vec()
+        tail_lines(LIVE_TAIL_LINES)
+    } else {
+        Vec::new()
+    };
+    let output: Vec<&str> = if call.expanded {
+        call.output
+            .lines()
+            .filter(|line| !is_exit_code_line(line))
+            .take(MAX_OUTPUT_LINES)
+            .collect()
     } else {
         Vec::new()
     };
@@ -315,7 +352,8 @@ fn tool(ix: usize, call: &ToolCall, now: Duration, cx: &mut Context<FlintApp>) -
                         )
                         .child(meta)
                         .child(chevron(call.expanded)),
-                )),
+                ))
+                .test_support(),
         )
         .when_some(detail, |col, detail| {
             col.child(tree_child(
@@ -381,14 +419,6 @@ fn output_lines(lines: &[&str], color: Hsla) -> impl IntoElement {
         }))
 }
 
-fn last_meaningful<'a>(lines: &[&'a str]) -> Option<&'a str> {
-    lines
-        .iter()
-        .rev()
-        .map(|line| line.trim())
-        .find(|line| !line.is_empty())
-}
-
 fn plural(n: usize, unit: &str) -> String {
     format!("{n} {unit}{}", if n == 1 { "" } else { "s" })
 }
@@ -398,7 +428,13 @@ fn is_exit_code_line(line: &str) -> bool {
     line.starts_with("[exit code:") && line.ends_with(']')
 }
 
-fn nudge(reason: NudgeReason, message: &str) -> impl IntoElement {
+fn nudge(
+    ix: usize,
+    reason: NudgeReason,
+    message: &str,
+    expanded: bool,
+    cx: &mut Context<FlintApp>,
+) -> impl IntoElement {
     let p = palette();
     let title = match reason {
         NudgeReason::Stuck => "loop detected",
@@ -406,22 +442,41 @@ fn nudge(reason: NudgeReason, message: &str) -> impl IntoElement {
         NudgeReason::Watchdog => "no changes made yet",
         NudgeReason::LeakedCall => "tool call written as text",
     };
-    bullet(
-        ui::icon(IconName::ShieldAlert, 12., p.warning),
-        div()
-            .h(px(26.))
-            .flex()
-            .items_center()
-            .gap(px(10.))
-            .child(ui::label(format!("Guard · {title}"), size::BASE, p.warning).flex_shrink_0())
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .truncate()
-                    .text_size(px(size::SM))
-                    .text_color(p.text_subtle)
-                    .child(message.to_string()),
-            ),
-    )
+    let tip = message.to_string();
+    div()
+        .id(("nudge", ix))
+        .cursor_pointer()
+        .rounded(px(5.))
+        .hover(|style| style.bg(hsla(0., 0., 1., 0.025)))
+        .on_click(cx.listener(move |this, _, _, cx| this.toggle_item(ix, cx)))
+        .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
+        .child(bullet(
+            ui::icon(IconName::ShieldAlert, 12., p.warning),
+            div()
+                .min_h(px(26.))
+                .flex()
+                .items_start()
+                .gap(px(10.))
+                .child(
+                    div()
+                        .h(px(26.))
+                        .flex()
+                        .items_center()
+                        .child(ui::label(format!("Guard · {title}"), size::BASE, p.warning))
+                        .flex_shrink_0(),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .pt(px(4.))
+                        .text_size(px(size::SM))
+                        .line_height(px(20.))
+                        .text_color(p.text_subtle)
+                        .when(!expanded, |text| text.truncate())
+                        .child(message.to_string()),
+                )
+                .child(div().pt(px(6.)).child(chevron(expanded))),
+        ))
+        .test_support()
 }

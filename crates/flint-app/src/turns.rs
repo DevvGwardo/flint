@@ -32,6 +32,9 @@ pub struct TurnInfo {
     pub files: Vec<String>,
     pub added: usize,
     pub removed: usize,
+    /// Net per-file stats for this turn (original vs. current content), set
+    /// by the app once it has read the files; overrides the summed edits.
+    pub file_stats: Vec<(String, usize, usize)>,
     /// Thumbs up (true) / down (false), kept locally.
     pub feedback: Option<bool>,
 }
@@ -107,7 +110,8 @@ impl SessionView {
         turn.final_answer = (turn.first..end)
             .rev()
             .find(|&ix| matches!(self.items[ix], Item::Assistant { .. }));
-        turn.header = (turn.first..end).find(|&ix| Some(ix) != turn.final_answer);
+        turn.header = (turn.first..end)
+            .find(|&ix| Some(ix) != turn.final_answer && !matches!(self.items[ix], Item::Error(_)));
         turn.first..end
     }
 
@@ -123,6 +127,9 @@ impl SessionView {
         };
         if turn.end.is_none() {
             Role::Live
+        } else if matches!(self.items.get(ix), Some(Item::Error(_))) {
+            // Failures stay visible when the work collapses.
+            Role::Plain
         } else if turn.end == Some(ix) {
             Role::Summary
         } else if turn.final_answer == Some(ix) {
@@ -159,6 +166,41 @@ impl SessionView {
             appended: 0..0,
             updated: (turn.first..end).collect(),
         }
+    }
+
+    /// Replaces a file's stats with its combined diff (original -> current).
+    pub fn set_combined(&mut self, path: &str, unified: String, added: usize, removed: usize) {
+        if let Some(file) = self.changes.iter_mut().find(|f| f.path == path) {
+            file.combined = Some(unified);
+            file.added = added;
+            file.removed = removed;
+        }
+    }
+
+    /// Sets one file's net stats for a turn and re-totals the turn.
+    pub fn set_turn_file_stats(&mut self, turn: usize, path: &str, added: usize, removed: usize) {
+        let Some(turn) = self.turns.get_mut(turn) else {
+            return;
+        };
+        match turn.file_stats.iter_mut().find(|(p, _, _)| p == path) {
+            Some(entry) => *entry = (path.to_string(), added, removed),
+            None => turn.file_stats.push((path.to_string(), added, removed)),
+        }
+        turn.added = turn.file_stats.iter().map(|(_, a, _)| a).sum();
+        turn.removed = turn.file_stats.iter().map(|(_, _, r)| r).sum();
+    }
+
+    /// The oldest approval still waiting: (call id, kind, summary).
+    pub fn pending_approval(&self) -> Option<(String, ToolKind, String)> {
+        self.items.iter().find_map(|item| match item {
+            Item::Approval {
+                call_id,
+                kind,
+                summary,
+                decision: None,
+            } => Some((call_id.clone(), *kind, summary.clone())),
+            _ => None,
+        })
     }
 
     pub fn set_feedback(&mut self, ix: usize, positive: bool) -> Change {

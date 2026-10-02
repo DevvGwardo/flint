@@ -43,29 +43,38 @@ pub fn render(
             ))
     };
 
+    // The title takes every pixel the actions leave and only then truncates;
+    // the full title is in its tooltip.
+    let full_title = session.title();
     let title = div()
+        .flex_1()
+        .min_w_0()
         .flex()
         .items_center()
         .gap(px(8.))
-        .min_w_0()
         .when(has_items, |row| {
             row.child(
                 div()
+                    .id("session-title")
+                    .flex_shrink_1()
                     .min_w_0()
                     .truncate()
                     .text_size(px(size::BASE))
                     .font_weight(FontWeight::MEDIUM)
-                    .child(session.title()),
+                    .tooltip(move |window, cx| Tooltip::new(full_title.clone()).build(window, cx))
+                    .child(session.title())
+                    .test_support(),
             )
         })
-        .child(ui::label(
+        .child(div().flex_shrink_0().child(ui::label(
             folder_name(&session.workspace),
             size::SM,
             p.text_subtle,
-        ))
+        )))
         .when_some(app.branch(), |row, branch| {
             row.child(
                 div()
+                    .flex_shrink_0()
                     .flex()
                     .items_center()
                     .gap(px(3.))
@@ -79,14 +88,14 @@ pub fn render(
         .items_center()
         .gap(px(2.))
         .child(
-            icon_button("reveal", IconName::FolderOpen, "Open in Finder", false)
+            icon_button("reveal", IconName::FolderOpen, "Open in Finder  ⌘⇧R", false)
                 .on_click(cx.listener(|this, _, _, _| this.reveal_workspace())),
         )
         .child(
             icon_button(
                 "terminal",
                 IconName::SquareTerminal,
-                "Open in Terminal",
+                "Open in Terminal  ⌘⇧T",
                 false,
             )
             .on_click(cx.listener(|this, _, _, _| this.open_terminal())),
@@ -98,7 +107,7 @@ pub fn render(
                     icon_button(
                         "changes",
                         IconName::FileDiff,
-                        "Changes  ⌘J",
+                        "Changes panel  ⌘J",
                         app.changes_open,
                     )
                     .on_click(cx.listener(|this, _, _, cx| {

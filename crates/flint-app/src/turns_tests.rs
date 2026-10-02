@@ -104,6 +104,7 @@ fn finishing_collapses_work_and_promotes_the_answer() {
             files: vec!["a.ts".into()],
             added: 4,
             removed: 1,
+            file_stats: vec![],
             feedback: None,
         }]
     );

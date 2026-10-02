@@ -153,6 +153,7 @@ fn edits_accumulate_in_changes() {
             removed: 3,
             created: false,
             diffs: vec!["+3 -1".into(), "+2 -2".into()],
+            combined: None,
         }]
     );
 }
@@ -247,6 +248,7 @@ fn approvals_and_nudges() {
             Item::Nudge {
                 reason: NudgeReason::Verify,
                 message: "run the tests".into(),
+                expanded: false,
             },
         ]
     );

@@ -20,8 +20,13 @@ const DEFAULT_TIMEOUT_SECS: u64 = 120;
 const MAX_TIMEOUT_SECS: u64 = 600;
 /// Characters of command output the model sees.
 const MODEL_OUTPUT_CHARS: usize = 8_000;
-/// Raw output kept in memory before truncation (protects against floods).
-const MAX_CAPTURE_BYTES: usize = 4 * 1024 * 1024;
+/// Bytes kept from the start and the end of the output; the middle of a
+/// flood is counted, not stored.
+const CAPTURE_HEAD_BYTES: usize = 16 * 1024;
+const CAPTURE_TAIL_BYTES: usize = 32 * 1024;
+/// Live output forwarded to the front end per command. Past this the stream
+/// pauses (one notice) and the final result shows the head and tail.
+const STREAM_LIMIT_BYTES: usize = 256 * 1024;
 /// How long to keep reading after the shell exits.
 const DRAIN_AFTER_EXIT: Duration = Duration::from_millis(300);
 
@@ -67,7 +72,8 @@ pub(super) async fn run_command(
     }
     drop(tx);
 
-    let mut captured: Vec<u8> = Vec::new();
+    let mut captured = Capture::default();
+    let mut streamed = 0usize;
     let mut ended = None;
     let mut status = None;
     let deadline = tokio::time::sleep(timeout);
@@ -80,10 +86,14 @@ pub(super) async fn run_command(
         tokio::select! {
             chunk = rx.recv() => match chunk {
                 Ok(bytes) => {
-                    on_output(String::from_utf8_lossy(&bytes).into_owned());
-                    if captured.len() < MAX_CAPTURE_BYTES {
-                        captured.extend_from_slice(&bytes);
+                    if streamed < STREAM_LIMIT_BYTES {
+                        streamed += bytes.len();
+                        on_output(String::from_utf8_lossy(&bytes).into_owned());
+                        if streamed >= STREAM_LIMIT_BYTES {
+                            on_output("\n[live output paused after 256 KB; the result shows the start and the end]\n".to_string());
+                        }
                     }
+                    captured.push(&bytes);
                 }
                 // Both pipes closed: the process (group) is done writing.
                 Err(_) => break,
@@ -115,8 +125,7 @@ pub(super) async fn run_command(
         Some(_) => None,
         None => status.and_then(|s| s.code()),
     };
-    let text = String::from_utf8_lossy(&captured);
-    let mut output = head_tail(text.trim_end(), MODEL_OUTPUT_CHARS);
+    let mut output = captured.model_text(MODEL_OUTPUT_CHARS);
     if !output.is_empty() {
         output.push('\n');
     }
@@ -175,4 +184,52 @@ pub fn head_tail(text: &str, max: usize) -> String {
     let tail: String = text.chars().skip(total - tail_len).collect();
     let omitted = total - head_len - tail_len;
     format!("{head}\n… [{omitted} characters omitted] …\n{tail}")
+}
+
+/// Bounded capture of a command's output: the first and last few KB plus a
+/// byte count, so memory stays flat however much a command prints.
+#[derive(Debug, Default)]
+pub(crate) struct Capture {
+    head: Vec<u8>,
+    tail: Vec<u8>,
+    total: usize,
+}
+
+impl Capture {
+    pub(crate) fn push(&mut self, bytes: &[u8]) {
+        self.total += bytes.len();
+        let room = CAPTURE_HEAD_BYTES.saturating_sub(self.head.len());
+        let (to_head, rest) = bytes.split_at(room.min(bytes.len()));
+        self.head.extend_from_slice(to_head);
+        self.tail.extend_from_slice(rest);
+        if self.tail.len() > 2 * CAPTURE_TAIL_BYTES {
+            let excess = self.tail.len() - CAPTURE_TAIL_BYTES;
+            self.tail.drain(..excess);
+        }
+    }
+
+    /// Head and tail of the output, at most `max` characters plus a note.
+    pub(crate) fn model_text(&self, max: usize) -> String {
+        let kept = self.head.len() + self.tail.len().min(CAPTURE_TAIL_BYTES);
+        let tail_start = self.tail.len().saturating_sub(CAPTURE_TAIL_BYTES);
+        if kept == self.total {
+            // Nothing was dropped: head and tail are contiguous.
+            let mut all = self.head.clone();
+            all.extend_from_slice(&self.tail[tail_start..]);
+            return head_tail(String::from_utf8_lossy(&all).trim_end(), max);
+        }
+        let head = String::from_utf8_lossy(&self.head);
+        let tail = String::from_utf8_lossy(&self.tail[tail_start..]);
+        // The tail may start mid-character.
+        let tail = tail.trim_start_matches('\u{FFFD}').trim_end();
+        let head_len = max * 2 / 5;
+        let head: String = head.chars().take(head_len).collect();
+        let tail_chars = tail.chars().count();
+        let tail: String = tail
+            .chars()
+            .skip(tail_chars.saturating_sub(max - head_len))
+            .collect();
+        let omitted = self.total - head.len() - tail.len();
+        format!("{head}\n… [{omitted} bytes omitted] …\n{tail}")
+    }
 }

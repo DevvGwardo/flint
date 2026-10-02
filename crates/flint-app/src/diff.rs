@@ -8,8 +8,18 @@ use crate::theme::palette;
 use crate::theme::size;
 
 /// Renders up to `max_lines` lines of a unified diff; returns the element and
-/// how many lines were left out.
+/// how many lines were left out. Long lines are clipped (see [`render_wide`]).
 pub fn render(unified: &str, max_lines: usize) -> (Div, usize) {
+    render_lines(unified, max_lines, false)
+}
+
+/// The whole diff with long lines kept intact, for a horizontally scrolling
+/// container.
+pub fn render_wide(unified: &str) -> Div {
+    render_lines(unified, usize::MAX, true).0
+}
+
+fn render_lines(unified: &str, max_lines: usize, wide: bool) -> (Div, usize) {
     let p = palette();
     let lines: Vec<&str> = unified
         .lines()
@@ -26,7 +36,8 @@ pub fn render(unified: &str, max_lines: usize) -> (Div, usize) {
         };
         div()
             .flex()
-            .w_full()
+            .when(!wide, |row| row.w_full())
+            .when(wide, |row| row.min_w_full().flex_shrink_0())
             .min_h(px(18.))
             .when_some(bg, |row, bg| row.bg(bg))
             .child(
@@ -41,12 +52,11 @@ pub fn render(unified: &str, max_lines: usize) -> (Div, usize) {
             )
             .child(
                 div()
-                    .flex_1()
-                    .min_w_0()
-                    .pr(px(10.))
+                    .when(!wide, |cell| cell.flex_1().min_w_0().overflow_hidden())
+                    .when(wide, |cell| cell.flex_shrink_0())
+                    .pr(px(16.))
                     .text_color(fg)
                     .whitespace_nowrap()
-                    .overflow_hidden()
                     .child(if body.is_empty() {
                         " ".to_string()
                     } else {
@@ -55,7 +65,8 @@ pub fn render(unified: &str, max_lines: usize) -> (Div, usize) {
             )
     });
     let element = div()
-        .w_full()
+        .when(!wide, |col| col.w_full())
+        .when(wide, |col| col.min_w_full())
         .py(px(4.))
         .font_family(MONO_FONT)
         .font_features(FontFeatures::disable_ligatures())

@@ -2,7 +2,6 @@
 //! and the main column (header, transcript or empty state, composer) with the
 //! resizable changes panel.
 
-use flint_agent::ApprovalDecision;
 use gpui_kit::component::*;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -17,6 +16,7 @@ pub const SIDEBAR_WIDTH: f32 = 288.;
 
 impl Render for FlintApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let frame_started = std::time::Instant::now();
         let p = palette();
         // Narrow windows give the transcript the room: the sidebar steps
         // aside below 1000px, or below 1280px while the changes panel is open.
@@ -42,35 +42,47 @@ impl Render for FlintApp {
                     .size(px(460.))
                     .size_range(px(340.)..px(820.))
                     .visible(self.changes_open)
-                    .child(crate::changes_panel::render(self, cx)),
+                    .when(self.changes_open, |panel| {
+                        // Built only while visible: the diff can be large.
+                        panel.child(crate::changes_panel::render(self, cx))
+                    }),
             );
 
-        div()
+        let root = div()
             .id("flint")
-            .key_context("FlintApp")
+            .key_context(if self.mention.is_some() || self.slash.is_some() {
+                "FlintApp menu"
+            } else {
+                "FlintApp"
+            })
             .track_focus(&self.focus)
             // Shift+Tab and Esc are claimed before the composer's own bindings.
-            .capture_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
-                let key = &event.keystroke;
-                let pending = this.session().view.pending_approvals > 0;
-                if pending
-                    && key.modifiers.platform
-                    && (key.key == "enter" || key.key == "backspace")
-                {
-                    let decision = match (key.key.as_str(), key.modifiers.shift) {
-                        ("backspace", _) => ApprovalDecision::Deny,
-                        (_, true) => ApprovalDecision::ApproveAlways,
-                        _ => ApprovalDecision::Approve,
-                    };
-                    this.answer_pending(decision, cx);
+            .capture_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                let key = event.keystroke.clone();
+                if this.settings_form.is_some() {
+                    if key.key == "escape" {
+                        this.close_settings(window, cx);
+                        cx.stop_propagation();
+                    }
+                    return;
+                }
+                if this.renaming.is_some() {
+                    if key.key == "escape" {
+                        this.cancel_rename(window, cx);
+                        cx.stop_propagation();
+                    }
+                    return;
+                }
+                if this.palette.is_some() {
+                    return;
+                }
+                if this.handle_menu_key(&key, window, cx) {
                     cx.stop_propagation();
-                } else if key.key == "tab" && key.modifiers.shift && this.palette.is_none() {
-                    this.toggle_approval(cx);
+                } else if key.key == "escape" && this.help_open {
+                    this.help_open = false;
+                    cx.notify();
                     cx.stop_propagation();
-                } else if key.key == "escape"
-                    && this.palette.is_none()
-                    && this.session().view.running
-                {
+                } else if key.key == "escape" && this.session().view.running {
                     this.interrupt(cx);
                     cx.stop_propagation();
                 }
@@ -94,6 +106,30 @@ impl Render for FlintApp {
             .on_action(cx.listener(|this, _: &ToggleApproval, _, cx| this.toggle_approval(cx)))
             .on_action(cx.listener(|this, _: &OpenWorkspace, _, cx| this.open_workspace(cx)))
             .on_action(cx.listener(|this, _: &RevealWorkspace, _, _| this.reveal_workspace()))
+            .on_action(cx.listener(|this, _: &OpenTerminal, _, _| this.open_terminal()))
+            .on_action(cx.listener(|this, _: &MenuUp, window, cx| this.menu_key("up", window, cx)))
+            .on_action(
+                cx.listener(|this, _: &MenuDown, window, cx| this.menu_key("down", window, cx)),
+            )
+            .on_action(
+                cx.listener(|this, _: &MenuAccept, window, cx| this.menu_key("enter", window, cx)),
+            )
+            .on_action(
+                cx.listener(|this, _: &MenuDismiss, window, cx| {
+                    this.menu_key("escape", window, cx)
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &OpenSettings, window, cx| this.open_settings(window, cx)),
+            )
+            .on_action(cx.listener(|this, _: &RenameSession, window, cx| {
+                let ix = this.active;
+                this.start_rename(ix, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &DeleteSession, window, cx| {
+                let ix = this.active;
+                this.delete_session(ix, window, cx);
+            }))
             .on_action(cx.listener(|this, _: &Interrupt, _, cx| this.interrupt(cx)))
             .on_action(cx.listener(|this, _: &FocusComposer, window, cx| {
                 this.composer
@@ -133,6 +169,9 @@ impl Render for FlintApp {
             .when_some(self.palette.clone(), |root, state| {
                 root.child(crate::palette::render(&state, cx))
             })
+            .children(crate::settings_view::render(self, cx));
+        crate::automation::record_frame(frame_started);
+        root
     }
 }
 
