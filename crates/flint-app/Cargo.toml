@@ -1,0 +1,16 @@
+[package]
+name = "flint-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "flint"
+path = "src/main.rs"
+
+[dependencies]
+flint-agent.workspace = true
+anyhow.workspace = true
+async-channel.workspace = true
+serde_json.workspace = true
+gpui-kit = "0.7.0"
