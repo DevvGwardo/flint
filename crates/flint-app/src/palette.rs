@@ -12,6 +12,8 @@ use crate::app::DeleteSession;
 use crate::app::FlintApp;
 use crate::app::FocusComposer;
 use crate::app::Interrupt;
+use crate::app::NewClaudeSession;
+use crate::app::NewCodexSession;
 use crate::app::NewSession;
 use crate::app::OpenSettings;
 use crate::app::OpenTerminal;
@@ -43,6 +45,16 @@ pub fn render(state: &Entity<CommandState>, cx: &mut Context<FlintApp>) -> impl 
                     "New session",
                     IconName::SquarePen,
                     Box::new(NewSession),
+                ))
+                .item(item(
+                    "New Claude Code session",
+                    IconName::Bot,
+                    Box::new(NewClaudeSession),
+                ))
+                .item(item(
+                    "New Codex session",
+                    IconName::Bot,
+                    Box::new(NewCodexSession),
                 ))
                 .item(item(
                     "Stop the running turn",

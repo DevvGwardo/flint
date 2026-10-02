@@ -4,6 +4,7 @@
 
 use std::time::Duration;
 
+use flint_agent::AgentKind;
 use flint_agent::ApprovalMode;
 use flint_agent::ReasoningEffort;
 use gpui_kit::assets::IconName;
@@ -159,18 +160,28 @@ pub fn render(app: &FlintApp, cx: &mut Context<FlintApp>) -> AnyElement {
         )
         .child(
             chip("model-chip")
-                .on_click(cx.listener(|this, _, window, cx| this.open_settings(window, cx)))
-                .child(ui::label(app.model.clone(), size::BASE - 1., p.text)),
+                .on_click(cx.listener(|this, _, _, cx| this.toggle_agent_menu(cx)))
+                .child(ui::label(
+                    app.agent_label(app.session().agent),
+                    size::BASE - 1.,
+                    p.text,
+                ))
+                .child(ui::icon(IconName::ChevronDown, 12., p.text_subtle))
+                .test_support(),
         )
-        .when(app.effort_supported, |bar| {
-            bar.child(
-                chip("effort-chip")
-                    .on_click(cx.listener(|this, _, _, cx| this.cycle_effort(cx)))
-                    .child(ui::icon(IconName::Brain, 14., p.text_subtle))
-                    .child(ui::label(effort_label, size::BASE - 1., p.text_subtle))
-                    .test_support(),
-            )
-        })
+        // ACP agents choose their own reasoning depth; the chip is flint's.
+        .when(
+            app.effort_supported && app.session().agent == AgentKind::Flint,
+            |bar| {
+                bar.child(
+                    chip("effort-chip")
+                        .on_click(cx.listener(|this, _, _, cx| this.cycle_effort(cx)))
+                        .child(ui::icon(IconName::Brain, 14., p.text_subtle))
+                        .child(ui::label(effort_label, size::BASE - 1., p.text_subtle))
+                        .test_support(),
+                )
+            },
+        )
         .child(div().flex_1())
         .child(
             chip("approval-hint")

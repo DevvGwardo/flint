@@ -8,6 +8,7 @@ use std::time::Instant;
 use std::time::SystemTime;
 
 use flint_agent::AgentEvent;
+use flint_agent::AgentKind;
 use flint_agent::FileDiff;
 use flint_agent::Op;
 use gpui_kit::*;
@@ -25,6 +26,8 @@ pub struct Session {
     pub dir: Option<PathBuf>,
     pub view: SessionView,
     pub list: ListState,
+    /// flint's engine or an ACP agent; fixed once the session has started.
+    pub agent: AgentKind,
     pub workspace: PathBuf,
     pub created: SystemTime,
     /// Last activity, for ordering and the sidebar's relative time.
@@ -66,6 +69,7 @@ impl Session {
             dir: None,
             view: SessionView::default(),
             list,
+            agent: AgentKind::Flint,
             workspace,
             created: SystemTime::now(),
             touched: SystemTime::now(),
@@ -135,6 +139,7 @@ impl Session {
                 workspace: self.workspace.clone(),
                 created_at: unix_secs(self.created),
                 updated_at: unix_secs(self.touched),
+                agent: self.agent,
             },
         )
         .ok();

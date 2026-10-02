@@ -234,3 +234,25 @@ pub enum TurnEndReason {
     StepLimit,
     Failed(String),
 }
+
+/// Which agent runs a session: flint's own engine or an ACP agent. Saved in
+/// the session's metadata so the UI can badge it and reopen it the same way.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentKind {
+    #[default]
+    Flint,
+    ClaudeCode,
+    Codex,
+}
+
+impl AgentKind {
+    /// Display name.
+    pub fn label(self) -> &'static str {
+        match self {
+            AgentKind::Flint => "flint",
+            AgentKind::ClaudeCode => "Claude Code",
+            AgentKind::Codex => "Codex",
+        }
+    }
+}

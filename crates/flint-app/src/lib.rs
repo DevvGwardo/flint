@@ -3,6 +3,7 @@
 //! The binary (`src/main.rs`) is a thin launcher; everything lives here so the
 //! UI integration tests in `tests/` can drive the real views.
 
+pub mod agents;
 pub mod app;
 pub mod app_actions;
 pub mod app_demo;

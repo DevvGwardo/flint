@@ -26,6 +26,7 @@ impl FlintApp {
         for (dir, meta, records) in store::load_all(&self.home) {
             let mut session = self.new_session_value(meta.workspace.clone());
             session.dir = Some(dir);
+            session.agent = meta.agent;
             session.created = from_secs(meta.created_at);
             let mut clock = Duration::ZERO;
             for record in records {

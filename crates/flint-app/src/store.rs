@@ -9,6 +9,7 @@ use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
 use flint_agent::AgentEvent;
+use flint_agent::AgentKind;
 use serde::Deserialize;
 use serde::Serialize;
 
@@ -20,6 +21,9 @@ pub struct Meta {
     /// Unix seconds.
     pub created_at: i64,
     pub updated_at: i64,
+    /// Which agent runs the session (older sessions are flint's own).
+    #[serde(default)]
+    pub agent: AgentKind,
 }
 
 /// One line of `events.jsonl`.

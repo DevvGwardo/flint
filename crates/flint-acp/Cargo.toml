@@ -1,0 +1,20 @@
+[package]
+name = "flint-acp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+flint-agent.workspace = true
+anyhow.workspace = true
+async-channel.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+agent-client-protocol = { version = "2.2.0", features = ["unstable_end_turn_token_usage"] }
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "process", "io-util", "time", "sync", "fs"] }
+tokio-util = { version = "0.7.19", features = ["compat"] }
+futures = "0.3.34"
+
+[dev-dependencies]
+pretty_assertions = "1.4.1"
+tempfile = "3.27.0"

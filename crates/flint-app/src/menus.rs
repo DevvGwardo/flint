@@ -99,6 +99,42 @@ pub fn render(app: &FlintApp, cx: &mut Context<FlintApp>) -> Option<AnyElement> 
                 .into_any_element(),
         );
     }
+    if app.agent_menu {
+        let current = app.session().agent;
+        let rows = crate::agents::AGENTS
+            .into_iter()
+            .enumerate()
+            .map(|(n, kind)| {
+                item_row(("agent-item", n), kind == current)
+                    .on_click(
+                        cx.listener(move |this, _, window, cx| this.choose_agent(kind, window, cx)),
+                    )
+                    .child(ui::label(app.agent_label(kind), size::SM, p.text).w(px(220.)))
+                    .child(ui::label(
+                        crate::agents::about(kind),
+                        size::BASE - 1.,
+                        p.text_muted,
+                    ))
+                    .when(kind == current, |row| {
+                        row.child(div().flex_1())
+                            .child(ui::icon(IconName::Check, 13., p.accent))
+                    })
+                    .test_support()
+            });
+        let hint = if app.session().view.items.is_empty() {
+            "for this session"
+        } else {
+            "opens a new session"
+        };
+        return Some(
+            panel()
+                .id("agent-menu")
+                .child(header("Agent", hint))
+                .children(rows)
+                .test_support()
+                .into_any_element(),
+        );
+    }
     if let Some(menu) = &app.slash {
         let text = app.composer.read(cx).value().to_string();
         let commands = slash::active_query(&text)
@@ -161,7 +197,7 @@ pub fn render(app: &FlintApp, cx: &mut Context<FlintApp>) -> Option<AnyElement> 
                 .child(line("@", "Attach a workspace file"))
                 .child(line(
                     "/",
-                    "Commands: new, clear, model, effort, approval, review",
+                    "Commands: new, clear, agent, model, effort, approval, review",
                 ))
                 .child(line("⇧⇥", "Switch auto-run / ask before changes"))
                 .child(line(

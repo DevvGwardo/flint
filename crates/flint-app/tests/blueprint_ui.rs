@@ -1117,3 +1117,41 @@ fn files_changed_counts_survive_edits_landing_before_the_ui_reads_them(cx: &mut 
         "net change is two lines replaced, as git diff reports"
     );
 }
+
+#[gpui_kit::test]
+fn agent_picker_sets_a_fresh_session_and_opens_a_new_one_after_start(cx: &mut TestAppContext) {
+    use flint_agent::AgentKind;
+    let ui = open(cx);
+    // A fresh session takes the picked agent; the chip shows it.
+    ui.click(cx, "model-chip");
+    assert!(ui.read(cx, |app, _| app.agent_menu));
+    ui.click(cx, ("agent-item", 1usize));
+    assert_eq!(
+        ui.read(cx, |app, _| (
+            app.agent_menu,
+            app.sessions.len(),
+            app.session().agent
+        )),
+        (false, 1, AgentKind::ClaudeCode)
+    );
+    assert_eq!(
+        ui.read(cx, |app, _| app.agent_label(app.session().agent)),
+        "Claude Code"
+    );
+
+    // Once it has started, the session keeps its agent; /agent opens a new one.
+    let _engine = ui.engine(cx);
+    ui.input(cx, "first task");
+    ui.press(cx, "enter");
+    ui.input(cx, "/agent codex");
+    ui.press(cx, "escape");
+    ui.press(cx, "enter");
+    let agents = ui.read(cx, |app, _| {
+        (
+            app.sessions.iter().map(|s| s.agent).collect::<Vec<_>>(),
+            app.active,
+        )
+    });
+    assert_eq!(agents, (vec![AgentKind::ClaudeCode, AgentKind::Codex], 1));
+    assert_eq!(ui.composer_text(cx), "");
+}

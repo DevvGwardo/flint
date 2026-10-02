@@ -79,9 +79,11 @@ fn long_session_compacts_old_turns_in_one_chunk_and_keeps_the_last_two() {
         panic!("assistant")
     };
     assert_eq!(reasoning, "");
+    // Parsed: key order depends on serde_json's `preserve_order`, which
+    // other workspace crates may enable.
     assert_eq!(
-        tool_calls[0].arguments,
-        r#"{"content":"[trimmed: 2.0k chars]","path":"f0.py"}"#
+        serde_json::from_str::<serde_json::Value>(&tool_calls[0].arguments).ok(),
+        Some(serde_json::json!({"content": "[trimmed: 2.0k chars]", "path": "f0.py"}))
     );
     // The last two turns are untouched.
     let tail = session(40, 4200).split_off(history.len() - 10);

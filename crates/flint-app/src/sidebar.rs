@@ -239,6 +239,11 @@ fn session_row(app: &FlintApp, ix: usize, cx: &mut Context<FlintApp>) -> AnyElem
         ),
         Status::Idle => ("Idle".to_string(), p.text_subtle),
     };
+    // ACP sessions carry their agent's name, e.g. "Claude Code · Answered".
+    let subtitle = match session.agent {
+        flint_agent::AgentKind::Flint => subtitle,
+        agent => format!("{} · {subtitle}", agent.label()),
+    };
     let emphasized = active || matches!(status, Status::Unread | Status::NeedsApproval);
     let ago = SystemTime::now()
         .duration_since(session.touched)

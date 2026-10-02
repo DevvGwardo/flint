@@ -24,6 +24,8 @@ actions!(
     flint,
     [
         NewSession,
+        NewClaudeSession,
+        NewCodexSession,
         TogglePalette,
         ToggleChanges,
         ToggleSidebar,
@@ -125,6 +127,8 @@ pub struct FlintApp {
     pub attachments: Vec<String>,
     pub settings_form: Option<crate::settings_view::SettingsForm>,
     pub help_open: bool,
+    /// The agent picker above the composer is open.
+    pub agent_menu: bool,
     /// Summary row whose answer was just copied, and when.
     pub copied: Option<(usize, Instant)>,
     /// Sidebar row with its context menu open.
@@ -205,6 +209,7 @@ impl FlintApp {
             attachments: Vec::new(),
             settings_form: None,
             help_open: false,
+            agent_menu: false,
             copied: None,
             session_menu: None,
             renaming: None,

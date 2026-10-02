@@ -119,6 +119,12 @@ impl FlintApp {
         if text.is_empty() {
             return;
         }
+        if let Some(kind) = crate::agents::parse_command(&text) {
+            self.composer
+                .update(cx, |state, cx| state.set_value("", window, cx));
+            self.choose_agent(kind, window, cx);
+            return;
+        }
         let ix = self.active;
         if self.sessions[ix].view.running && self.sessions[ix].ops.is_none() {
             return;
@@ -192,6 +198,11 @@ impl FlintApp {
         cx: &mut Context<Self>,
     ) -> anyhow::Result<()> {
         if self.sessions[ix].ops.is_some() {
+            return Ok(());
+        }
+        let kind = self.sessions[ix].agent;
+        if let Some(handle) = self.spawn_acp(ix, kind) {
+            self.attach_engine(ix, handle, cx);
             return Ok(());
         }
         let session = &self.sessions[ix];

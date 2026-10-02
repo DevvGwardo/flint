@@ -120,6 +120,13 @@ impl FlintApp {
             SlashCommand::New => self.new_session(window, cx),
             SlashCommand::Clear => self.clear_session(window, cx),
             SlashCommand::Model => self.open_settings(window, cx),
+            SlashCommand::Agent => {
+                // Leave "/agent " for the user to finish with a name.
+                self.composer.update(cx, |state, cx| {
+                    state.set_value("/agent ", window, cx);
+                    state.focus(window, cx);
+                });
+            }
             SlashCommand::Effort => self.cycle_effort(cx),
             SlashCommand::Approval => self.toggle_approval(cx),
             SlashCommand::Review => self.review(None, cx),
@@ -160,6 +167,11 @@ impl FlintApp {
         cx: &mut Context<Self>,
     ) -> bool {
         let plain = !key.modifiers.platform && !key.modifiers.control && !key.modifiers.alt;
+        if self.agent_menu && key.key == "escape" {
+            self.agent_menu = false;
+            cx.notify();
+            return true;
+        }
         if let Some(menu) = &mut self.mention {
             let len = menu.results.len();
             match key.key.as_str() {

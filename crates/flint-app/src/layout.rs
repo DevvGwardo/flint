@@ -2,6 +2,7 @@
 //! and the main column (header, transcript or empty state, composer) with the
 //! resizable changes panel.
 
+use flint_agent::AgentKind;
 use gpui_kit::component::*;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -88,6 +89,12 @@ impl Render for FlintApp {
                 }
             }))
             .on_action(cx.listener(|this, _: &NewSession, window, cx| this.new_session(window, cx)))
+            .on_action(cx.listener(|this, _: &NewClaudeSession, window, cx| {
+                this.new_agent_session(AgentKind::ClaudeCode, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &NewCodexSession, window, cx| {
+                this.new_agent_session(AgentKind::Codex, window, cx)
+            }))
             .on_action(cx.listener(|this, _: &TogglePalette, window, cx| {
                 if this.palette.is_some() {
                     this.close_palette(window, cx);

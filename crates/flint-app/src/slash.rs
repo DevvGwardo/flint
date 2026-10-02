@@ -5,6 +5,7 @@ pub enum SlashCommand {
     New,
     Clear,
     Model,
+    Agent,
     Effort,
     Approval,
     Review,
@@ -22,6 +23,11 @@ pub const COMMANDS: &[(SlashCommand, &str, &str)] = &[
         SlashCommand::Model,
         "/model",
         "Change the model and endpoint",
+    ),
+    (
+        SlashCommand::Agent,
+        "/agent",
+        "Switch agent: /agent claude, codex or flint",
     ),
     (SlashCommand::Effort, "/effort", "Cycle reasoning effort"),
     (
