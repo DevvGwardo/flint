@@ -218,3 +218,12 @@ fn status_name(status: Status) -> &'static str {
         Status::Done => "done",
     }
 }
+
+/// Whether this launch must stay in the background (`FLINT_BP_NO_ACTIVATE`,
+/// set by the blueprint harness so windows never steal focus): the window
+/// opens without taking focus, so nothing is key yet. The composer is
+/// focused on first activation instead.
+pub fn background_launch() -> bool {
+    static BACKGROUND: OnceLock<bool> = OnceLock::new();
+    *BACKGROUND.get_or_init(|| std::env::var_os("FLINT_BP_NO_ACTIVATE").is_some())
+}

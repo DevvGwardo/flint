@@ -27,12 +27,12 @@ pub const COLUMN_WIDTH: f32 = 760.;
 
 pub fn render_main(
     app: &FlintApp,
-    _window: &mut Window,
+    window: &mut Window,
     cx: &mut Context<FlintApp>,
 ) -> impl IntoElement {
     let session = app.session();
     if session.view.items.is_empty() {
-        return empty::render(app, cx).into_any_element();
+        return empty::render(app, window, cx).into_any_element();
     }
     div()
         .size_full()

@@ -17,7 +17,7 @@ const SUGGESTIONS: &[(&str, IconName)] = &[
     ("Add input validation", IconName::ShieldCheck),
 ];
 
-pub fn render(app: &FlintApp, cx: &mut Context<FlintApp>) -> impl IntoElement {
+pub fn render(app: &FlintApp, window: &mut Window, cx: &mut Context<FlintApp>) -> impl IntoElement {
     let p = palette();
     let workspace = folder_name(&app.session().workspace);
     let composer = crate::composer::render(app, cx);
@@ -45,7 +45,10 @@ pub fn render(app: &FlintApp, cx: &mut Context<FlintApp>) -> impl IntoElement {
             .child(ui::label(text, size::BASE - 1., p.text_muted))
     });
 
-    let notice = (!app.settings.tip_dismissed).then(|| {
+    // The tip floats over the top-right corner, clear of the centered hero
+    // only on wide windows; on narrow ones it would sit on the headline.
+    let roomy = window.viewport_size().width >= px(1200.);
+    let notice = (!app.settings.tip_dismissed && roomy).then(|| {
         div()
             .id("welcome-tip")
             .absolute()

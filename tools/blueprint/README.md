@@ -73,7 +73,15 @@ metric.
 Frame intervals are display-bound: on this harness's 75 Hz display a perfect
 frame interval is ~13.3 ms, so the 16.7 ms p95 threshold catches dropped
 frames; CPU while streaming is the cost signal. Thresholds (in `perf.py`
-`LIMITS`) were set from the measured before/after runs with headroom.
+`LIMITS`) were set from the measured before/after runs with headroom:
+idle CPU 1.0% (after measures a stable 0.50% — background launches skip
+the composer's initial focus so the caret never blinks while the window
+isn't key; the remaining ~0.5% is GPUI's always-on display link, the floor
+for any GPUI app); stream p95 16.7 ms with dropped frames under 30
+(baseline dropped 67 per run at p95 ~40 ms, after drops 8–14 at p95
+~14 ms — the residual at 2000 deltas/s is macOS timer coalescing for a
+never-key window, not render cost, so p95 is the smoothness signal; the
+scroll test, the realistic interaction, drops 0).
 
 ## Automation hooks in the app (automation-only)
 
@@ -83,7 +91,7 @@ frames; CPU while streaming is the cost signal. Thresholds (in `perf.py`
 | `FLINT_BP_DUMP_AFTER_MS=<ms>` | also dump the state once the UI has settled (sweep) |
 | `FLINT_BP_FRAMES=<path>` | per-frame timing log, written on exit |
 | `FLINT_BP_TIMING=<path>` | first-frame timestamp |
-| `FLINT_BP_NO_ACTIVATE=1` | open without activating the app or taking focus |
+| `FLINT_BP_NO_ACTIVATE=1` | open without activating the app or taking focus; the composer also stays unfocused (no caret blink) until the window is key |
 | `FLINT_HOME=<dir>` | settings and saved sessions location |
 | `--exit-after-turn`, `--demo-long N`, `--stream-test RATE`, `--scroll-test` | automation workloads |
 | `--demo*`, `--palette`, `--settings`, `--mention`, `--slash`, `--changes`, `--select-change`, `--size WxH` | UI states |

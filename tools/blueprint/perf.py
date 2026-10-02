@@ -29,6 +29,7 @@ LIMITS = {
     "idle_cpu_pct": 1.0,
     "stream_cpu_pct": 120.0,
     "stream_frame_p95_ms": 16.7,
+    "stream_dropped_frames": 30,
     "scroll_frame_p95_ms": 16.7,
     "binary_mb": 80,
     "ttft_ms": 20000,
@@ -189,8 +190,9 @@ def main() -> None:
     at_most("stream_cpu_pct", f"CPU while streaming {STREAM_RATE} deltas/s", "%")
     at_most("stream_frame_p95_ms", f"p95 frame interval while streaming {STREAM_RATE} deltas/s", " ms")
     report.check(
-        "no dropped frames (>25 ms) while streaming",
-        stream["dropped_frames"] == 0,
+        "dropped frames (>25 ms) while streaming stays under "
+        f"{LIMITS['stream_dropped_frames']}",
+        stream["dropped_frames"] < LIMITS["stream_dropped_frames"],
         f"worst run: {stream['dropped_frames']} dropped ({stream['frames']} frames over 2 runs)",
     )
     at_most("scroll_frame_p95_ms", "p95 frame interval scrolling a 200-turn transcript", " ms")

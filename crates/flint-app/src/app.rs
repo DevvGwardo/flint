@@ -141,6 +141,9 @@ pub struct FlintApp {
     pub(crate) subscriptions: Vec<Subscription>,
     /// Animation clock; runs only while a session is working.
     pub(crate) ticker: Option<Task<()>>,
+    /// The composer had focus when the window went inactive; give it back on
+    /// the next activation.
+    pub(crate) refocus_composer: bool,
 }
 
 impl FlintApp {
@@ -213,6 +216,7 @@ impl FlintApp {
             file_index: Default::default(),
             subscriptions,
             ticker: None,
+            refocus_composer: false,
         };
         if !options.ephemeral() {
             app.restore_sessions(cx);
@@ -240,9 +244,28 @@ impl FlintApp {
         crate::automation::schedule_dump(cx);
         if options.open_palette {
             app.open_palette(window, cx);
-        } else {
+        } else if !crate::automation::background_launch() {
             app.composer.update(cx, |state, cx| state.focus(window, cx));
         }
+        // gpui's input keeps its caret blink timer (and a repaint every
+        // 500 ms) running while the window is inactive; it only hides the
+        // caret. Release the composer's focus when the window goes inactive
+        // so an idle background window never repaints, and give it back on
+        // the next activation. A window that opened inactive (harness
+        // background launch) also gets the composer on first activation.
+        let sub = cx.observe_window_activation(window, |this, window, cx| {
+            if window.is_window_active() {
+                if this.refocus_composer || window.focused(cx).is_none() {
+                    this.refocus_composer = false;
+                    this.composer
+                        .update(cx, |state, cx| state.focus(window, cx));
+                }
+            } else if this.composer.read(cx).focus_handle(cx).is_focused(window) {
+                this.refocus_composer = true;
+                window.blur(cx);
+            }
+        });
+        app.subscriptions.push(sub);
         if options.open_settings {
             app.open_settings(window, cx);
         }
