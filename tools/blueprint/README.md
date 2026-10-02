@@ -16,7 +16,7 @@ windows and measure CPU). They never steal keyboard focus
 ```sh
 python3 tools/blueprint/sweep.py      # UI states: launch, size, pixels, memory, CPU
 python3 tools/blueprint/interact.py   # headless UI tests, one check per test
-python3 tools/blueprint/live.py       # real turns on deepseek-v4.1-flash via Surplus
+python3 tools/blueprint/live.py       # real turns against your configured model endpoint
 python3 tools/blueprint/perf.py       # cold start, memory, CPU, frame cost, size, TTFT
 ```
 
@@ -57,8 +57,9 @@ For each fixture in `fixtures/<name>/` (`repo/`, `task.txt`, hidden
 `git init`s it, runs `flint --workspace <dir> --prompt <task>
 --exit-after-turn` with `FLINT_BP_STATE`, screenshots the final state, then
 independently runs `check.sh <dir> <fixture>` and compares the files-changed
-card with `git diff --numstat`. Needs the local Surplus shim on
-`127.0.0.1:18433` and a key at `~/.fx/surplus.key`.
+card with `git diff --numstat`. Needs a reachable OpenAI-compatible endpoint
+and a key (`FLINT_API_KEY`, plus `FLINT_BASE_URL` / `FLINT_MODEL` if you are
+not using the defaults).
 
 ### `perf.py` — performance (release build)
 Cold start to window and to first painted frame (median of 5), RSS idle /

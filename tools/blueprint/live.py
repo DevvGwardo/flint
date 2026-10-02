@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Live runs: real turns on deepseek-v4.1-flash through the local Surplus shim.
+"""Live runs: real turns against a configured model endpoint
+(`FLINT_API_KEY`, optionally `FLINT_BASE_URL` / `FLINT_MODEL`).
 
 For each fixture in `tools/blueprint/fixtures/`: copy `repo/` to a fresh temp
 dir (never the flint repo), `git init` it, launch

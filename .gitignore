@@ -1,3 +1,5 @@
 target/
 .DS_Store
 blueprint-out/
+__pycache__/
+*.pyc
