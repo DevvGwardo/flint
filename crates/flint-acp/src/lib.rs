@@ -99,6 +99,14 @@ async fn run_process(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    let keep_api_key = std::env::var_os("FLINT_CLAUDE_USE_API_KEY").is_some();
+    for (name, _) in std::env::vars_os() {
+        if let Some(name) = name.to_str()
+            && agent.drops_env(name, keep_api_key)
+        {
+            command.env_remove(name);
+        }
+    }
     #[cfg(unix)]
     command.process_group(0);
     let mut child = match command.spawn() {

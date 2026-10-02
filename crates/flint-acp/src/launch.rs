@@ -103,6 +103,28 @@ impl AcpAgent {
             }
         }
     }
+
+    /// Whether the adapter must not inherit the environment variable `name`.
+    ///
+    /// - Every agent drops the markers of an enclosing Claude Code session
+    ///   (`CLAUDECODE`, `CLAUDE_CODE_*`, `CLAUDE_PID`, ...): flint itself
+    ///   may have been started from one, and the child would think it runs
+    ///   nested inside it.
+    /// - Claude Code also drops `ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN`,
+    ///   which Claude Code prefers over the user's subscription login, so a
+    ///   stray key in the shell profile would otherwise bill (or break) API
+    ///   access instead of using the plan. Set `FLINT_CLAUDE_USE_API_KEY=1`
+    ///   to keep them.
+    pub fn drops_env(&self, name: &str, keep_api_key: bool) -> bool {
+        let session_marker = name == "CLAUDECODE"
+            || name.starts_with("CLAUDE_CODE_")
+            || matches!(name, "CLAUDE_PID" | "CLAUDE_EFFORT");
+        let api_key = matches!(name, "ANTHROPIC_API_KEY" | "ANTHROPIC_AUTH_TOKEN");
+        match self {
+            AcpAgent::ClaudeCode => session_marker || (api_key && !keep_api_key),
+            AcpAgent::Codex | AcpAgent::Custom { .. } => session_marker,
+        }
+    }
 }
 
 /// PATH for the adapter. A GUI app launched from Finder gets a minimal PATH,
@@ -201,6 +223,21 @@ mod tests {
             missing.contains("npm i -g @agentclientprotocol/claude-agent-acp"),
             "{missing}"
         );
+    }
+
+    #[test]
+    fn claude_uses_the_subscription_login_not_a_stray_api_key() {
+        let claude = AcpAgent::ClaudeCode;
+        assert!(claude.drops_env("ANTHROPIC_API_KEY", false));
+        assert!(!claude.drops_env("ANTHROPIC_API_KEY", true));
+        assert!(claude.drops_env("CLAUDECODE", true));
+        assert!(claude.drops_env("CLAUDE_CODE_SESSION_ID", true));
+        assert!(!claude.drops_env("PATH", false));
+        assert!(!claude.drops_env("CLAUDE_CONFIG_DIR", false));
+        let codex = AcpAgent::Codex;
+        assert!(!codex.drops_env("ANTHROPIC_API_KEY", false));
+        assert!(!codex.drops_env("OPENAI_API_KEY", false));
+        assert!(codex.drops_env("CLAUDE_CODE_ENTRYPOINT", false));
     }
 
     #[test]
