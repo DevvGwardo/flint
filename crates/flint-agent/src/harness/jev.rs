@@ -5,9 +5,12 @@
 //! author's benchmark ablation, disabling it cost 14 points (89% -> 75%).
 //!
 //! Wire shape:
-//!   POST {base}/v1/systemone   Authorization: Bearer <key>
-//!   {"model":"jev-latest","state":{…},"questions":{"stuck":{"type":"noul","instructions":"…","criteria":{"true":"…","false":"…"}}}}
-//!   -> {"answers":{"stuck":{"type":"noul","noul":0.79}}}
+//!
+//! ```text
+//! POST {base}/v1/systemone   Authorization: Bearer <key>
+//! {"model":"jev-latest","state":{…},"questions":{"stuck":{"type":"noul","instructions":"…","criteria":{"true":"…","false":"…"}}}}
+//! -> {"answers":{"stuck":{"type":"noul","noul":0.79}}}
+//! ```
 //!
 //! Contract: every failure resolves to `None`; judgment never fails a turn.
 
