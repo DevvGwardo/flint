@@ -19,6 +19,9 @@ Flint divides responsibilities across four specialized crates:
   <img src="../assets/architecture.jpg" alt="Flint System Architecture" width="100%" />
 </p>
 
+<details>
+  <summary><b>View Mermaid architecture topology</b></summary>
+
 ```mermaid
 %%{init: {
   'theme': 'base',
@@ -106,12 +109,20 @@ graph TD
     class Window,SessionMgr,Guard,SubagentOrch,ACPClient ember;
     class ClaudeCode,CodexCLI,DroidCLI,OpenAI cyan;
 ```
+</details>
 
 ---
 
 ## 2. Turn Execution Lifecycle & Harness Guard
 
 Every conversational turn in Flint's native engine passes through context window assembly, token budget trimming, model streaming, and the multi-stage **Harness Guard** pipeline.
+
+<p align="center">
+  <img src="../assets/turn_lifecycle.jpg" alt="Turn Execution Lifecycle" width="100%" />
+</p>
+
+<details>
+  <summary><b>View Mermaid sequence flow</b></summary>
 
 ```mermaid
 %%{init: {
@@ -180,10 +191,14 @@ sequenceDiagram
         Engine->>App: Final turn response & stats update
     end
 ```
+</details>
 
 <p align="center">
   <img src="../assets/harness_guard.jpg" alt="Harness Guard Pipeline" width="100%" />
 </p>
+
+<details>
+  <summary><b>View Mermaid guard logic tree</b></summary>
 
 ```mermaid
 %%{init: {
@@ -246,6 +261,7 @@ flowchart TD
     class TriggerLoop,TriggerWatchdog,HaltTurn,TestReminder red;
     class Repair,ConsultJEV cyan;
 ```
+</details>
 
 ---
 
@@ -263,6 +279,9 @@ Flint allows the native agent to spin off up to four independent, concurrent chi
 - **Unified Approvals:** Children inherit the parent's approval policy (`auto` vs `ask`).
 - **Resumability:** Each child run produces a durable `session_id`. The parent can invoke follow-ups on the same subagent session later.
 - **Recursion Guard:** Child subagents are restricted from spawning grandchildren, preventing unbounded agent explosion.
+
+<details>
+  <summary><b>View Mermaid sequence flow</b></summary>
 
 ```mermaid
 %%{init: {
@@ -311,12 +330,20 @@ sequenceDiagram
     Orch-->>Parent: Consolidated results [session_id_1, session_id_2]
     Parent->>Parent: Synthesize final result & present diffs to user
 ```
+</details>
 
 ---
 
 ## 4. Agent Client Protocol (ACP) Integration
 
 Flint acts as an ACP host, allowing Claude Code, Codex, and Droid to be launched and driven directly from the same native desktop UI without altering their native authentication or configuration workflows.
+
+<p align="center">
+  <img src="../assets/acp_diagram.jpg" alt="Agent Client Protocol Architecture" width="100%" />
+</p>
+
+<details>
+  <summary><b>View Mermaid protocol flow</b></summary>
 
 ```mermaid
 %%{init: {
@@ -374,3 +401,4 @@ flowchart LR
     class Claude,Codex,Droid cyan;
     class ClaudeAuth,CodexAuth,DroidAuth surface;
 ```
+</details>

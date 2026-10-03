@@ -65,6 +65,18 @@
   or terminal header onto another panel's left, right, top, or bottom edge.
   Drag dividers to resize. The layout is saved to `~/.flint/layout.json`;
   **Reset panel layout** in the command palette restores the default.
+- **Session panes.** Drag an actual session row from the sidebar onto the
+  left, right, top, or bottom edge of the conversation or another session pane.
+  Watch up to eight sessions side by side, resize their dividers, or use the
+  grid button to arrange balanced rows. Each pane has **Chat**, **Terminal**,
+  and **Both** controls, its own terminal tabs, and an independent draft.
+  Fresh panes follow live agent commands; choosing a shell tab keeps that
+  shell selected while the agent works.
+  A sidebar click focuses a visible session or replaces the focused pane.
+  Closing a pane keeps its session and terminals running; the expand button
+  returns to one session. The layout and pane modes are saved in
+  `~/.flint/session-layout.json`. After restarting, use **Open terminal** for
+  a fresh shell; terminal processes and unsent drafts do not survive restart.
 - **A terminal dock.** A real terminal (your shell, in the session's workspace)
   in tabs, docked at the bottom by default, with colours, scrollback,
   selection and links. Commands the agents run show up there too as read-only
@@ -87,6 +99,9 @@ Flint couples high-frame-rate native macOS rendering (Metal via GPUI) with an as
 <p align="center">
   <img src="assets/architecture.jpg" alt="Flint System Architecture" width="100%" />
 </p>
+
+<details>
+  <summary><b>View Mermaid specification</b></summary>
 
 ```mermaid
 %%{init: {
@@ -149,6 +164,7 @@ graph TD
     class GPUI,Engine,Guard,Bridge,Subagents ember;
     class ExternalAgents,Endpoints cyan;
 ```
+</details>
 
 > [!NOTE]
 > For in-depth component specifications, sequence diagrams, and lifecycle flows, see [Architecture & Internals](docs/ARCHITECTURE.md).
@@ -216,6 +232,9 @@ only its final answer plus a `session_id`. The parent can use that id for
 follow-ups, including after a saved session is reopened. Children cannot spawn
 more children. Interrupting a turn stops its children too.
 
+<details>
+  <summary><b>View Mermaid sequence flow</b></summary>
+
 ```mermaid
 %%{init: {
   'theme': 'base',
@@ -259,6 +278,7 @@ sequenceDiagram
     end
     Orch-->>Parent: Aggregated results & resumable IDs
 ```
+</details>
 
 Set **Subagent model** in Settings (`cmd-,`) or `subagent_model` in the config
 file. `FLINT_SUBAGENT_MODEL` overrides it for one run. These settings apply when
@@ -280,8 +300,11 @@ still use their own delegation implementations, not Flint's tool.
 ## Claude Code, Codex and Droid
 
 <p align="center">
-  <img src="assets/feature-agents.jpg" alt="Flint ACP Multi-Agent Integration" width="100%" />
+  <img src="assets/acp_diagram.jpg" alt="Agent Client Protocol Architecture" width="100%" />
 </p>
+
+<details>
+  <summary><b>View Mermaid protocol flow</b></summary>
 
 ```mermaid
 %%{init: {
@@ -327,6 +350,7 @@ flowchart LR
     class UI,Client ember;
     class Claude,Codex,Droid cyan;
 ```
+</details>
 
 For Claude Code and Codex, install the ACP adapters, then sign in once with
 each CLI so the adapter can reuse your login:
@@ -400,6 +424,9 @@ Flint equips models with autonomous **harness guard rules** that prevent runaway
   <img src="assets/harness_guard.jpg" alt="Harness Guard System" width="100%" />
 </p>
 
+<details>
+  <summary><b>View Mermaid guard logic tree</b></summary>
+
 ```mermaid
 %%{init: {
   'theme': 'base',
@@ -445,6 +472,7 @@ flowchart TD
     class BreakLoop,Warn,Intervene red;
     class Repair,Consult cyan;
 ```
+</details>
 
 ### Optional JEV judge
 
