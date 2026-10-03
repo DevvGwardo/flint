@@ -66,6 +66,9 @@ pub struct TermView {
     pub read_only: bool,
     /// Fixed label (e.g. "claude: npm test") instead of title/cwd.
     pub fixed_label: Option<String>,
+    /// Set on a mirror of a command an agent is running: the session it
+    /// belongs to and the agent's terminal id.
+    pub agent: Option<AgentTerminal>,
     pub exited: Option<Option<i32>>,
     bell_until: Option<Instant>,
     /// IME text being composed.
@@ -77,6 +80,12 @@ pub struct TermView {
     dragging: bool,
     _pump: Task<()>,
 }
+
+/// Identifies a mirrored agent command: its session and the agent's id.
+pub type AgentTerminal = (u64, String);
+
+/// Clears the screen, the scrollback and homes the cursor.
+const RESET: &[u8] = b"\x1b[2J\x1b[3J\x1b[H";
 
 impl TermView {
     /// `poll` checks for output on a frame timer instead of waiting on the
@@ -122,6 +131,7 @@ impl TermView {
             title: None,
             read_only,
             fixed_label: None,
+            agent: None,
             exited: None,
             bell_until: None,
             marked: None,
@@ -132,6 +142,43 @@ impl TermView {
             dragging: false,
             _pump: pump,
         }
+    }
+
+    /// A read-only mirror of a command an agent runs: flint feeds it the
+    /// output the agent reports, there is no process behind it.
+    pub fn mirror(
+        label: String,
+        agent: AgentTerminal,
+        cwd: PathBuf,
+        poll: bool,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let mut view = Self::new(
+            Terminal::detached(crate::term_panel::initial_size()),
+            cwd,
+            true,
+            poll,
+            cx,
+        );
+        view.fixed_label = Some(label);
+        view.agent = Some(agent);
+        view
+    }
+
+    /// Appends output the agent reported for this mirror (`replace` sends the
+    /// command's whole output so far, which resets the screen first).
+    pub fn feed(&mut self, data: &str, replace: bool, cx: &mut Context<Self>) {
+        if replace {
+            self.terminal.feed(RESET);
+        }
+        self.terminal.feed(data.as_bytes());
+        cx.notify();
+    }
+
+    /// The mirrored command finished.
+    pub fn mark_exited(&mut self, code: Option<i32>, cx: &mut Context<Self>) {
+        self.exited = Some(code);
+        cx.notify();
     }
 
     /// Tab label: a fixed label, the program's title, or the folder.

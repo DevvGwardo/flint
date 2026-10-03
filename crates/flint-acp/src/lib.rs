@@ -16,7 +16,9 @@ mod saved;
 #[cfg(test)]
 #[path = "session_options_tests.rs"]
 mod session_options_tests;
+mod shared;
 mod terminal_meta;
+mod terminals;
 #[cfg(test)]
 mod test_support;
 
@@ -48,6 +50,11 @@ pub struct AcpConfig {
     /// `Auto` answers the agent's permission requests with "allow";
     /// otherwise each one becomes an approval in the UI.
     pub approval: ApprovalMode,
+    /// Ask the agent to report each command's terminal (the ACP
+    /// "terminal output" extension), shown as read-only terminal tabs.
+    /// Claude Code's adapter then sends command output only that way, which
+    /// flint also shows on the tool card.
+    pub agent_terminals: bool,
 }
 
 /// Starts the agent's ACP adapter in the workspace and returns the session's
@@ -156,6 +163,7 @@ async fn run_process(
         workspace: config.workspace,
         session_dir: config.session_dir,
         approval: config.approval,
+        agent_terminals: config.agent_terminals,
         ops,
         events: events.clone(),
         stderr: Arc::clone(&stderr_tail),

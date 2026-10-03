@@ -248,6 +248,29 @@ impl SessionView {
     }
 }
 
+/// Characters of a command's output quoted back to the agent.
+const SENT_CHARS: usize = 8_000;
+/// Terminal lines quoted back to the agent (the most recent ones).
+const SENT_TERMINAL_LINES: usize = 200;
+
+/// What a command card's "Send to agent" says and sends: the command's
+/// output, bounded, in a fenced block.
+pub fn command_message(call: &ToolCall) -> (String, String) {
+    let shown = format!("Here's the output of `{}`:", call.summary);
+    let body = flint_agent::tools::head_tail(call.output.trim_end(), SENT_CHARS);
+    (shown.clone(), format!("{shown}\n\n```\n{body}\n```"))
+}
+
+/// What a terminal tab's "Send to agent" says and sends: the last lines of
+/// the terminal's buffer.
+pub fn terminal_message(label: &str, text: &str) -> (String, String) {
+    let shown = format!("Here's what my terminal ({label}) shows:");
+    let lines: Vec<&str> = text.lines().collect();
+    let tail = lines[lines.len().saturating_sub(SENT_TERMINAL_LINES)..].join("\n");
+    let body = flint_agent::tools::head_tail(tail.trim_end(), SENT_CHARS);
+    (shown.clone(), format!("{shown}\n\n```\n{body}\n```"))
+}
+
 #[cfg(test)]
 #[path = "turns_tests.rs"]
 mod tests;

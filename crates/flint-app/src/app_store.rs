@@ -118,6 +118,8 @@ impl FlintApp {
         if let Some(dir) = &session.dir {
             store::delete(dir).ok();
         }
+        // Its commands' read-only terminal tabs go with it.
+        self.close_agent_terminals(session.uid, cx);
         if self.sessions.is_empty() {
             let fresh = self.new_session_value(self.workspace.clone());
             self.sessions.push(fresh);

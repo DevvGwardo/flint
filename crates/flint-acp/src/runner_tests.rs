@@ -302,3 +302,146 @@ async fn auth_error_on_new_session_says_how_to_log_in() {
         )
     );
 }
+
+/// The ACP terminal extension: the agent asks flint to run a command, reads
+/// its output, waits for its exit and releases it. Each command becomes a
+/// read-only terminal tab (the `TerminalStarted`/`Output`/`Exited` events).
+#[tokio::test]
+async fn runs_the_terminals_the_agent_asks_for() {
+    let (harness, mut fake) = start(ApprovalMode::Auto);
+    let init = fake.expect("initialize").await;
+    assert_eq!(
+        init["params"]["clientCapabilities"]["terminal"],
+        json!(true),
+        "the terminal capability is advertised"
+    );
+    assert_eq!(
+        init["params"]["clientCapabilities"]["_meta"]["terminal_output"],
+        json!(true),
+        "the terminal output extension is opted into"
+    );
+    fake.respond(
+        &init,
+        json!({"protocolVersion": 1, "agentCapabilities": {"loadSession": false}}),
+    )
+    .await;
+    let new = fake.expect("session/new").await;
+    fake.respond(&new, json!({"sessionId": "s1"})).await;
+
+    let ask = |id: &str, method: &str, params: serde_json::Value| json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
+    fake.send(ask(
+        "t1",
+        "terminal/create",
+        json!({"sessionId": "s1", "command": "printf", "args": ["hi\\n"]}),
+    ))
+    .await;
+    let created = fake.answered("t1").await;
+    let terminal_id = created["result"]["terminalId"].as_str().expect("id");
+    assert!(terminal_id.starts_with("flint-term-"), "{created}");
+
+    let started = harness
+        .until(|e| matches!(e, AgentEvent::TerminalStarted { .. }))
+        .await;
+    let AgentEvent::TerminalStarted { label, cwd, .. } = started else {
+        panic!("terminal started")
+    };
+    assert_eq!(label, "claude: printf hi\\n");
+    assert_eq!(cwd.as_deref(), Some(harness.workspace.as_path()));
+
+    // Wait for the exit first, so the output below is the whole of it.
+    fake.send(ask(
+        "t2",
+        "terminal/wait_for_exit",
+        json!({"sessionId": "s1", "terminalId": terminal_id}),
+    ))
+    .await;
+    let waited = fake.answered("t2").await;
+    assert_eq!(waited["result"]["exitCode"], json!(0));
+
+    fake.send(ask(
+        "t3",
+        "terminal/output",
+        json!({"sessionId": "s1", "terminalId": terminal_id}),
+    ))
+    .await;
+    let output = fake.answered("t3").await;
+    assert_eq!(output["result"]["output"], json!("hi\n"));
+    assert_eq!(output["result"]["truncated"], json!(false));
+
+    let events: Vec<AgentEvent> = vec![
+        harness
+            .until(|e| matches!(e, AgentEvent::TerminalOutput { .. }))
+            .await,
+        harness
+            .until(|e| matches!(e, AgentEvent::TerminalExited { .. }))
+            .await,
+    ];
+    assert!(matches!(&events[0], AgentEvent::TerminalOutput { data, .. } if data == "hi\n"));
+    assert!(matches!(
+        &events[1],
+        AgentEvent::TerminalExited {
+            exit_code: Some(0),
+            ..
+        }
+    ));
+
+    fake.send(ask(
+        "t4",
+        "terminal/release",
+        json!({"sessionId": "s1", "terminalId": terminal_id}),
+    ))
+    .await;
+    assert!(fake.answered("t4").await["result"].is_object());
+    // The terminal is gone: further requests fail.
+    fake.send(ask(
+        "t5",
+        "terminal/output",
+        json!({"sessionId": "s1", "terminalId": terminal_id}),
+    ))
+    .await;
+    assert!(fake.answered("t5").await["error"].is_object());
+}
+
+/// Commands run in the workspace, and never outside it.
+#[tokio::test]
+async fn refuses_a_terminal_outside_the_workspace() {
+    let (harness, mut fake) = start(ApprovalMode::Auto);
+    fake.handshake().await;
+    fake.send(
+        json!({"jsonrpc": "2.0", "id": "t1", "method": "terminal/create",
+        "params": {"sessionId": "s1", "command": "pwd", "cwd": "/"}}),
+    )
+    .await;
+    let refused = fake.answered("t1").await;
+    assert!(
+        refused["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("outside the workspace")),
+        "{refused}"
+    );
+    let _ = harness;
+}
+
+/// The client kills a command when the agent asks, and reports the signal.
+#[tokio::test]
+async fn kills_a_terminal_on_request() {
+    let (harness, mut fake) = start(ApprovalMode::Auto);
+    fake.handshake().await;
+    fake.send(
+        json!({"jsonrpc": "2.0", "id": "t1", "method": "terminal/create",
+        "params": {"sessionId": "s1", "command": "sleep", "args": ["30"]}}),
+    )
+    .await;
+    let created = fake.answered("t1").await;
+    let terminal_id = created["result"]["terminalId"].as_str().expect("id");
+    fake.send(
+        json!({"jsonrpc": "2.0", "id": "t2", "method": "terminal/kill",
+        "params": {"sessionId": "s1", "terminalId": terminal_id}}),
+    )
+    .await;
+    assert!(fake.answered("t2").await["result"].is_object());
+    let exited = harness
+        .until(|e| matches!(e, AgentEvent::TerminalExited { .. }))
+        .await;
+    assert!(matches!(exited, AgentEvent::TerminalExited { .. }));
+}

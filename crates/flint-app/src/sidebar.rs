@@ -14,6 +14,7 @@ use crate::app::NewSession;
 use crate::app::OpenWorkspace;
 use crate::app::SessionFilter;
 use crate::app::ToggleSidebar;
+use crate::app::ToggleTerminal;
 use crate::layout::SIDEBAR_WIDTH;
 use crate::session::Status;
 use crate::session::folder_name;
@@ -70,6 +71,13 @@ pub fn render(app: &FlintApp, cx: &mut Context<FlintApp>) -> impl IntoElement {
     .on_click(cx.listener(|_, _, window, cx| {
         window.dispatch_action(Box::new(OpenWorkspace), cx);
     }));
+
+    let terminal = nav_row("terminal", IconName::SquareTerminal, "Terminal", Some("⌃`"))
+        .when(app.terminal.open, |row| row.bg(white(0.075)))
+        .on_click(cx.listener(|_, _, window, cx| {
+            window.dispatch_action(Box::new(ToggleTerminal), cx);
+        }))
+        .test_support();
 
     let search = div().mx(px(10.)).mt(px(12.)).mb(px(4.)).child(
         Input::new(&app.search)
@@ -154,6 +162,7 @@ pub fn render(app: &FlintApp, cx: &mut Context<FlintApp>) -> impl IntoElement {
         .child(top)
         .child(new_agent)
         .child(open_folder)
+        .child(terminal)
         .child(search)
         .child(
             div()

@@ -357,6 +357,9 @@ fn tool(ix: usize, call: &ToolCall, now: Duration, cx: &mut Context<FlintApp>) -
                                 .child(target),
                         )
                         .child(meta)
+                        .when(call.kind == ToolKind::Command, |row| {
+                            row.child(command_actions(ix, call, cx))
+                        })
                         .child(chevron(call.expanded)),
                 ))
                 .test_support(),
@@ -402,6 +405,60 @@ fn tool(ix: usize, call: &ToolCall, now: Duration, cx: &mut Context<FlintApp>) -
                     .bg(p.surface)
                     .overflow_hidden()
                     .child(block),
+            )
+        })
+}
+
+/// A command card's two small actions: bring the command's terminal up, and
+/// send its output back to the agent.
+fn command_actions(ix: usize, call: &ToolCall, cx: &mut Context<FlintApp>) -> Div {
+    let p = palette();
+    let button = |id: (&'static str, usize), icon: IconName, tip: &'static str| {
+        div()
+            .id(id)
+            .size(px(22.))
+            .flex_shrink_0()
+            .rounded(px(6.))
+            .flex()
+            .items_center()
+            .justify_center()
+            .cursor_pointer()
+            .hover(|style| style.bg(p.raised))
+            .tooltip(move |window, cx| Tooltip::new(tip).build(window, cx))
+            .child(ui::icon(icon, 13., p.text_subtle))
+    };
+    div()
+        .flex()
+        .items_center()
+        .gap(px(2.))
+        .child(
+            button(
+                ("tool-terminal", ix),
+                if call.terminal_id.is_some() {
+                    IconName::Bot
+                } else {
+                    IconName::SquareTerminal
+                },
+                "Open in terminal",
+            )
+            .on_click(cx.listener(move |this, _, window, cx| {
+                cx.stop_propagation();
+                this.open_in_terminal(ix, window, cx);
+            }))
+            .test_support(),
+        )
+        .when(!call.output.trim().is_empty(), |row| {
+            row.child(
+                button(
+                    ("tool-send", ix),
+                    IconName::Send,
+                    "Send the output to the agent",
+                )
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.send_command_to_agent(ix, cx);
+                }))
+                .test_support(),
             )
         })
 }

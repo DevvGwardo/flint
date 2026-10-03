@@ -71,6 +71,9 @@ pub struct ToolCall {
     pub args: serde_json::Value,
     /// Live output while running; replaced by the final output when finished.
     pub output: String,
+    /// The agent's own terminal for this command, when it reported one; it
+    /// has a read-only tab in the terminal dock.
+    pub terminal_id: Option<String>,
     pub started: Duration,
     pub result: Option<ToolResult>,
     pub expanded: bool,
@@ -180,6 +183,7 @@ impl SessionView {
                     summary,
                     args,
                     output: String::new(),
+                    terminal_id: None,
                     started: now,
                     result: None,
                     expanded: false,
@@ -286,9 +290,26 @@ impl SessionView {
             // Kept on the session (composer chips), not in the transcript.
             // Kept on the session or in terminal tabs, not in the transcript.
             AgentEvent::SessionOptions(_)
-            | AgentEvent::TerminalStarted { .. }
             | AgentEvent::TerminalOutput { .. }
             | AgentEvent::TerminalExited { .. } => Change::default(),
+            // The agent's command has a terminal of its own; remember which,
+            // so its card can bring that tab up.
+            AgentEvent::TerminalStarted {
+                terminal_id,
+                call_id,
+                ..
+            } => {
+                let Some(call_id) = call_id else {
+                    return Change::default();
+                };
+                let Some(ix) = self.tool_index(&call_id) else {
+                    return Change::default();
+                };
+                if let Item::Tool(call) = &mut self.items[ix] {
+                    call.terminal_id = Some(terminal_id);
+                }
+                Change::updated(ix)
+            }
         }
     }
 

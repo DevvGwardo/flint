@@ -1523,3 +1523,165 @@ fn terminal_copy_and_paste(cx: &mut TestAppContext) {
     let lines = wait_for_terminal(&ui, cx, |l| l == "pasted-2");
     assert!(lines.iter().any(|l| l == "pasted-2"), "{lines:?}");
 }
+
+/// A running command card (the transcript's second row, after the message).
+fn running_command(ui: &Ui, cx: &mut TestAppContext, engine: &Engine, command: &str) -> usize {
+    ui.input(cx, "run it");
+    ui.press(cx, "enter");
+    engine.send(cx, AgentEvent::TurnStarted { turn_id: 1 });
+    engine.send(cx, tool_started("c1", ToolKind::Command, command));
+    engine.sent();
+    ui.read(cx, |app, _| {
+        app.session()
+            .view
+            .items
+            .iter()
+            .position(|item| matches!(item, Item::Tool(_)))
+            .expect("tool row")
+    })
+}
+
+#[gpui_kit::test]
+fn a_command_card_opens_in_a_terminal(cx: &mut TestAppContext) {
+    let ui = open_with(cx, terminal_options());
+    let engine = ui.engine(cx);
+    let row = running_command(&ui, cx, &engine, "npm test");
+    assert!(!has(&ui, cx, "terminal-panel"));
+    ui.click(cx, ("tool-terminal", row));
+    let (open, tabs, read_only) = ui.read(cx, |app, cx| {
+        (
+            app.terminal.open,
+            app.terminal.tabs.len(),
+            app.terminal
+                .active_view()
+                .map(|view| view.read(cx).read_only),
+        )
+    });
+    assert_eq!((open, tabs, read_only), (true, 1, Some(false)));
+    // The command is on the new shell's prompt, ready to run.
+    let lines = wait_for_terminal(&ui, cx, |l| l.contains("npm test"));
+    assert!(lines.iter().any(|l| l.contains("npm test")), "{lines:?}");
+}
+
+#[gpui_kit::test]
+fn a_command_card_sends_its_output_to_the_agent(cx: &mut TestAppContext) {
+    let ui = open_with(cx, terminal_options());
+    let engine = ui.engine(cx);
+    let row = running_command(&ui, cx, &engine, "npm test");
+    engine.send(cx, tool_finished("c1", "2 tests failed\n", None));
+    engine.sent();
+    ui.click(cx, ("tool-send", row));
+    assert!(
+        matches!(
+            engine.sent().as_slice(),
+            [Op::UserMessage(message)]
+                if message.contains("2 tests failed") && message.contains("npm test")
+        ),
+        "output not sent back"
+    );
+    // It shows in the transcript as a user message; the output itself is
+    // what was sent, in a fenced block.
+    let last = ui.read(cx, |app, _| app.session().view.items.last().cloned());
+    assert!(
+        matches!(&last, Some(Item::User(text)) if text.contains("output of `npm test`")),
+        "{last:?}"
+    );
+}
+
+#[gpui_kit::test]
+fn an_agents_command_mirrors_into_a_read_only_tab(cx: &mut TestAppContext) {
+    let ui = open_with(cx, terminal_options());
+    let engine = ui.engine(cx);
+    let row = running_command(&ui, cx, &engine, "npm test");
+    engine.send(
+        cx,
+        AgentEvent::TerminalStarted {
+            terminal_id: "t1".into(),
+            call_id: Some("c1".into()),
+            label: "claude: npm test".into(),
+            cwd: None,
+        },
+    );
+    // Mirrored, but not in the way until the card asks for it.
+    assert_eq!(
+        ui.read(cx, |app, _| (app.terminal.open, app.terminal.tabs.len())),
+        (false, 1)
+    );
+    engine.send(
+        cx,
+        AgentEvent::TerminalOutput {
+            terminal_id: "t1".into(),
+            data: "2 tests failed\n".into(),
+            replace: false,
+        },
+    );
+    ui.click(cx, ("tool-terminal", row));
+    assert!(ui.read(cx, |app, _| app.terminal.open));
+    let lines = wait_for_terminal(&ui, cx, |l| l == "2 tests failed");
+    assert!(lines.iter().any(|l| l == "2 tests failed"), "{lines:?}");
+    // A whole-output update replaces the screen instead of appending.
+    engine.send(
+        cx,
+        AgentEvent::TerminalOutput {
+            terminal_id: "t1".into(),
+            data: "all green\n".into(),
+            replace: true,
+        },
+    );
+    let lines = wait_for_terminal(&ui, cx, |l| l == "all green");
+    assert!(!lines.iter().any(|l| l == "2 tests failed"), "{lines:?}");
+    engine.send(
+        cx,
+        AgentEvent::TerminalExited {
+            terminal_id: "t1".into(),
+            exit_code: Some(1),
+        },
+    );
+    let label = ui.read(cx, |app, cx| {
+        app.terminal
+            .active_view()
+            .map(|view| view.read(cx).label())
+            .unwrap_or_default()
+    });
+    assert_eq!(label, "claude: npm test (exit 1)");
+}
+
+#[gpui_kit::test]
+fn a_mirrored_command_tab_is_never_typed_into(cx: &mut TestAppContext) {
+    let ui = open_with(cx, terminal_options());
+    let engine = ui.engine(cx);
+    running_command(&ui, cx, &engine, "npm test");
+    engine.send(
+        cx,
+        AgentEvent::TerminalStarted {
+            terminal_id: "t1".into(),
+            call_id: Some("c1".into()),
+            label: "claude: npm test".into(),
+            cwd: None,
+        },
+    );
+    ui.click(cx, "terminal");
+    assert!(ui.read(cx, |app, _| app.terminal.open));
+    ui.input(cx, "echo nope");
+    ui.press(cx, "enter");
+    let lines = ui.read(cx, |app, cx| {
+        app.terminal
+            .active_view()
+            .map(|view| view.read(cx).terminal.snapshot().text_lines())
+            .unwrap_or_default()
+    });
+    assert!(!lines.iter().any(|l| l.contains("nope")), "{lines:?}");
+    // Its tab offers no "send to agent": there is nothing to type.
+    assert!(!has(&ui, cx, "terminal-send"));
+}
+
+#[gpui_kit::test]
+fn the_sidebar_opens_the_terminal_dock(cx: &mut TestAppContext) {
+    let ui = open_with(cx, terminal_options());
+    assert!(!ui.read(cx, |app, _| app.terminal.open));
+    ui.click(cx, "terminal");
+    assert!(ui.read(cx, |app, _| app.terminal.open));
+    assert_eq!(ui.read(cx, |app, _| app.terminal.tabs.len()), 1);
+    ui.click(cx, "terminal");
+    assert!(!ui.read(cx, |app, _| app.terminal.open));
+}

@@ -40,6 +40,23 @@ impl FlintApp {
         let active = self.active;
         let mut finished = false;
         for event in events {
+            // A command an agent runs gets a read-only tab in the terminal
+            // dock; the event itself carries nothing the transcript shows.
+            match &event {
+                AgentEvent::TerminalStarted {
+                    terminal_id, label, ..
+                } => self.agent_terminal_started(uid, terminal_id.clone(), label.clone(), cx),
+                AgentEvent::TerminalOutput {
+                    terminal_id,
+                    data,
+                    replace,
+                } => self.agent_terminal_output(uid, terminal_id, data, *replace, cx),
+                AgentEvent::TerminalExited {
+                    terminal_id,
+                    exit_code,
+                } => self.agent_terminal_exited(uid, terminal_id, *exit_code, cx),
+                _ => {}
+            }
             let session = &mut self.sessions[ix];
             session.log(Logged::Event(event.clone()));
             session.note_timing(&event);

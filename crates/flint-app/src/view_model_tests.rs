@@ -108,6 +108,7 @@ fn tool_output_streams_then_finishes_and_failed_commands_open() {
             summary: "npm test".into(),
             args: json!({}),
             output: "FAIL src/a.test.ts".into(),
+            terminal_id: None,
             started: secs(1),
             result: Some(ToolResult {
                 exit_code: Some(1),
@@ -293,4 +294,37 @@ fn live_output_keeps_only_the_tail() {
     };
     assert_eq!(call.output.lines().count(), MAX_LIVE_OUTPUT_LINES);
     assert_eq!(call.output.lines().next(), Some("line 50"));
+}
+
+#[test]
+fn a_terminals_call_gets_the_terminals_id() {
+    let mut view = SessionView::default();
+    view.fold(started("c1", ToolKind::Command, "npm test"), secs(0));
+    let change = view.fold(
+        AgentEvent::TerminalStarted {
+            terminal_id: "t1".into(),
+            call_id: Some("c1".into()),
+            label: "claude: npm test".into(),
+            cwd: None,
+        },
+        secs(1),
+    );
+    assert_eq!(change, Change::updated(0));
+    let Item::Tool(call) = &view.items[0] else {
+        panic!("expected a tool card");
+    };
+    assert_eq!(call.terminal_id.as_deref(), Some("t1"));
+    // A terminal with no call (an agent's own shell) touches nothing.
+    assert_eq!(
+        view.fold(
+            AgentEvent::TerminalStarted {
+                terminal_id: "t2".into(),
+                call_id: None,
+                label: "claude: zsh".into(),
+                cwd: None,
+            },
+            secs(2),
+        ),
+        Change::default()
+    );
 }

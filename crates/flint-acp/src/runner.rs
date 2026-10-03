@@ -16,23 +16,28 @@ use agent_client_protocol::ConnectionTo;
 use agent_client_protocol::Responder;
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::schema::v1::ClientCapabilities;
+use agent_client_protocol::schema::v1::CreateTerminalRequest;
+use agent_client_protocol::schema::v1::CreateTerminalResponse;
 use agent_client_protocol::schema::v1::FileSystemCapabilities;
 use agent_client_protocol::schema::v1::Implementation;
 use agent_client_protocol::schema::v1::InitializeRequest;
+use agent_client_protocol::schema::v1::KillTerminalRequest;
+use agent_client_protocol::schema::v1::KillTerminalResponse;
 use agent_client_protocol::schema::v1::LoadSessionRequest;
 use agent_client_protocol::schema::v1::NewSessionRequest;
-use agent_client_protocol::schema::v1::PermissionOption;
-use agent_client_protocol::schema::v1::PermissionOptionKind;
 use agent_client_protocol::schema::v1::ReadTextFileRequest;
 use agent_client_protocol::schema::v1::ReadTextFileResponse;
-use agent_client_protocol::schema::v1::RequestPermissionOutcome;
+use agent_client_protocol::schema::v1::ReleaseTerminalRequest;
+use agent_client_protocol::schema::v1::ReleaseTerminalResponse;
 use agent_client_protocol::schema::v1::RequestPermissionRequest;
 use agent_client_protocol::schema::v1::RequestPermissionResponse;
-use agent_client_protocol::schema::v1::SelectedPermissionOutcome;
-use agent_client_protocol::schema::v1::SessionConfigOption;
 use agent_client_protocol::schema::v1::SessionId;
 use agent_client_protocol::schema::v1::SessionNotification;
 use agent_client_protocol::schema::v1::SessionUpdate;
+use agent_client_protocol::schema::v1::TerminalOutputRequest;
+use agent_client_protocol::schema::v1::TerminalOutputResponse;
+use agent_client_protocol::schema::v1::WaitForTerminalExitRequest;
+use agent_client_protocol::schema::v1::WaitForTerminalExitResponse;
 use agent_client_protocol::schema::v1::WriteTextFileRequest;
 use agent_client_protocol::schema::v1::WriteTextFileResponse;
 use async_channel::Receiver;
@@ -54,6 +59,9 @@ use crate::mapper::Mapper;
 use crate::options::Options;
 use crate::saved::Saved;
 use crate::saved::load_saved;
+pub(crate) use crate::shared::Shared;
+use crate::shared::permission_response;
+use crate::terminals::Terminals;
 
 /// What a runner needs besides the byte streams.
 pub(crate) struct RunContext {
@@ -61,120 +69,11 @@ pub(crate) struct RunContext {
     pub workspace: PathBuf,
     pub session_dir: Option<PathBuf>,
     pub approval: ApprovalMode,
+    pub agent_terminals: bool,
     pub ops: Receiver<Op>,
     pub events: Sender<AgentEvent>,
     /// Last stderr lines of the adapter, for error messages.
     pub stderr: Arc<Mutex<String>>,
-}
-
-type PendingPermission = (Responder<RequestPermissionResponse>, Vec<PermissionOption>);
-
-/// State shared by the connection's handlers and the session loop.
-pub(crate) struct Shared {
-    pub agent: AcpAgent,
-    pub workspace: PathBuf,
-    pub events: Sender<AgentEvent>,
-    pub stderr: Arc<Mutex<String>>,
-    mapper: Mutex<Mapper>,
-    pending: Mutex<HashMap<String, PendingPermission>>,
-    auto_approve: AtomicBool,
-    /// `session/load` replays history as updates; the UI already has it.
-    loading: AtomicBool,
-    options: Mutex<Options>,
-}
-
-impl Shared {
-    pub fn emit_all(&self, events: Vec<AgentEvent>) {
-        for event in events {
-            let _ = self.events.try_send(event);
-        }
-    }
-
-    pub fn with_mapper<T>(&self, f: impl FnOnce(&mut Mapper) -> T) -> Option<T> {
-        self.mapper.lock().ok().map(|mut mapper| f(&mut mapper))
-    }
-
-    pub fn stderr_tail(&self) -> String {
-        self.stderr.lock().map(|s| s.clone()).unwrap_or_default()
-    }
-
-    pub fn options(&self) -> Options {
-        self.options.lock().map(|o| o.clone()).unwrap_or_default()
-    }
-
-    /// Stores the agent's options and tells the UI. When the agent has a
-    /// permission mode, that mode decides approvals: flint stops answering
-    /// permission requests on its own and shows each one.
-    pub fn set_options(&self, raw: &[SessionConfigOption]) {
-        let options = Options::from_acp(raw);
-        let first_mode = options.has_mode() && !self.options().has_mode();
-        if first_mode {
-            self.auto_approve.store(false, Ordering::Relaxed);
-        }
-        let list = options.list.clone();
-        if let Ok(mut slot) = self.options.lock() {
-            *slot = options;
-        }
-        self.emit_all(vec![AgentEvent::SessionOptions(list)]);
-    }
-
-    /// Answers a pending permission with the option matching `decision`.
-    pub fn resolve(&self, call_id: &str, decision: ApprovalDecision) {
-        let Some((responder, options)) =
-            self.pending.lock().ok().and_then(|mut p| p.remove(call_id))
-        else {
-            return;
-        };
-        if decision == ApprovalDecision::ApproveAlways {
-            self.auto_approve.store(true, Ordering::Relaxed);
-        }
-        let _ = responder.respond(permission_response(&options, decision));
-    }
-
-    /// Cancels every unanswered permission (the turn is being cancelled).
-    pub fn cancel_pending(&self) {
-        let pending: Vec<PendingPermission> = self
-            .pending
-            .lock()
-            .map(|mut p| p.drain().map(|(_, v)| v).collect())
-            .unwrap_or_default();
-        for (responder, _) in pending {
-            let _ = responder.respond(RequestPermissionResponse::new(
-                RequestPermissionOutcome::Cancelled,
-            ));
-        }
-    }
-}
-
-/// The ACP outcome for a flint decision: the closest option the agent offered.
-pub(crate) fn permission_response(
-    options: &[PermissionOption],
-    decision: ApprovalDecision,
-) -> RequestPermissionResponse {
-    let preference: &[PermissionOptionKind] = match decision {
-        ApprovalDecision::Approve => &[
-            PermissionOptionKind::AllowOnce,
-            PermissionOptionKind::AllowAlways,
-        ],
-        ApprovalDecision::ApproveAlways => &[
-            PermissionOptionKind::AllowAlways,
-            PermissionOptionKind::AllowOnce,
-        ],
-        ApprovalDecision::Deny => &[
-            PermissionOptionKind::RejectOnce,
-            PermissionOptionKind::RejectAlways,
-        ],
-    };
-    let chosen = preference
-        .iter()
-        .find_map(|kind| options.iter().find(|option| option.kind == *kind));
-    let outcome = match chosen {
-        Some(option) => RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new(
-            option.option_id.clone(),
-        )),
-        None => RequestPermissionOutcome::Cancelled,
-    };
-    RequestPermissionResponse::new(outcome)
 }
 
 /// Runs the connection until Shutdown, the ops sender closing, or the agent
@@ -194,14 +93,20 @@ where
         workspace: ctx.workspace.clone(),
         events: ctx.events.clone(),
         stderr: Arc::clone(&ctx.stderr),
-        mapper: Mutex::new(Mapper::new(
-            &ctx.workspace,
-            saved.as_ref().map_or(0, |s| s.turn_id),
-        )),
+        mapper: Mutex::new(
+            Mapper::new(&ctx.workspace, saved.as_ref().map_or(0, |s| s.turn_id))
+                .with_label_prefix(&ctx.agent.label_prefix()),
+        ),
         pending: Mutex::new(HashMap::new()),
         auto_approve: AtomicBool::new(ctx.approval == ApprovalMode::Auto),
         loading: AtomicBool::new(false),
         options: Mutex::new(Options::default()),
+        terminals: Terminals::new(
+            &ctx.workspace,
+            ctx.events.clone(),
+            &ctx.agent.label_prefix(),
+        ),
+        agent_terminals: ctx.agent_terminals,
     });
 
     let on_update = Arc::clone(&shared);
@@ -209,6 +114,11 @@ where
     let on_read = Arc::clone(&shared);
     let on_write = Arc::clone(&shared);
     let main_shared = Arc::clone(&shared);
+    let on_create = Arc::clone(&shared);
+    let on_output = Arc::clone(&shared);
+    let on_wait = Arc::clone(&shared);
+    let on_kill = Arc::clone(&shared);
+    let on_release = Arc::clone(&shared);
     let result = Client
         .builder()
         .name("flint")
@@ -284,6 +194,71 @@ where
             },
             agent_client_protocol::on_receive_request!(),
         )
+        .on_receive_request(
+            async move |request: CreateTerminalRequest,
+                        responder: Responder<CreateTerminalResponse>,
+                        _cx| {
+                match on_create.terminals.create(&request) {
+                    Ok(id) => responder.respond(CreateTerminalResponse::new(id)),
+                    Err(message) => responder.respond_with_error(rpc_error(message)),
+                }
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            async move |request: TerminalOutputRequest,
+                        responder: Responder<TerminalOutputResponse>,
+                        _cx| {
+                match on_output.terminals.output(&request.terminal_id.0) {
+                    Ok((output, truncated, exit)) => responder.respond(
+                        TerminalOutputResponse::new(output, truncated)
+                            .exit_status(exit.map(|e| e.to_acp())),
+                    ),
+                    Err(message) => responder.respond_with_error(rpc_error(message)),
+                }
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            async move |request: WaitForTerminalExitRequest,
+                        responder: Responder<WaitForTerminalExitResponse>,
+                        _cx| {
+                // Waits off the dispatch loop so other messages keep flowing.
+                let shared = Arc::clone(&on_wait);
+                tokio::spawn(async move {
+                    let _ = match shared.terminals.wait_for_exit(&request.terminal_id.0).await {
+                        Ok(exit) => {
+                            responder.respond(WaitForTerminalExitResponse::new(exit.to_acp()))
+                        }
+                        Err(message) => responder.respond_with_error(rpc_error(message)),
+                    };
+                });
+                Ok(())
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            async move |request: KillTerminalRequest,
+                        responder: Responder<KillTerminalResponse>,
+                        _cx| {
+                match on_kill.terminals.kill(&request.terminal_id.0) {
+                    Ok(()) => responder.respond(KillTerminalResponse::new()),
+                    Err(message) => responder.respond_with_error(rpc_error(message)),
+                }
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            async move |request: ReleaseTerminalRequest,
+                        responder: Responder<ReleaseTerminalResponse>,
+                        _cx| {
+                match on_release.terminals.release(&request.terminal_id.0) {
+                    Ok(()) => responder.respond(ReleaseTerminalResponse::new()),
+                    Err(message) => responder.respond_with_error(rpc_error(message)),
+                }
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
         .connect_with(ByteStreams::new(writer, reader), async move |cx| {
             if let Some(live) = open_session(cx, main_shared, ctx.session_dir, saved).await {
                 live.run(ctx.ops).await;
@@ -324,9 +299,17 @@ async fn open_session(
         )
     };
 
-    let capabilities = ClientCapabilities::new().fs(FileSystemCapabilities::new()
-        .read_text_file(true)
-        .write_text_file(true));
+    let mut meta = serde_json::Map::new();
+    meta.insert(
+        "terminal_output".into(),
+        serde_json::Value::Bool(shared.agent_terminals),
+    );
+    let capabilities = ClientCapabilities::new()
+        .fs(FileSystemCapabilities::new()
+            .read_text_file(true)
+            .write_text_file(true))
+        .terminal(true)
+        .meta(meta);
     let init = cx
         .send_request(
             InitializeRequest::new(ProtocolVersion::V1)

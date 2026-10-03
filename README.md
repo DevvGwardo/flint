@@ -26,6 +26,11 @@ OpenAI-compatible model, or drive Claude Code and Codex from the same window.
   the composer (`y` approve, `a` approve always, `n` deny when the composer is
   empty).
 - **Diffs.** A files-changed card per turn and a changes panel to review them.
+- **A terminal dock.** A real terminal (your shell, in the session's workspace)
+  in tabs at the bottom of the window, with colours, scrollback, selection and
+  links. Commands the agents run show up there too as read-only tabs; any
+  command card can send its terminal to the agent, or its output back as a
+  message.
 - **`@` mentions** of workspace files, **`/` commands**
   (`/new`, `/clear`, `/model`, `/agent`, `/effort`, `/approval`, `/review`,
   `/help`) and a **command palette**.
@@ -122,6 +127,7 @@ while the adapter starts.
 | `cmd-j` | Toggle the changes panel |
 | `cmd-b` | Toggle the sidebar |
 | `cmd-shift-r` | Reveal the workspace in Finder |
+| `` ctrl-` `` | Show or hide the terminal dock |
 | `cmd-shift-t` | Open a terminal in the workspace |
 | `cmd-,` | Settings |
 | `cmd-q` | Quit |

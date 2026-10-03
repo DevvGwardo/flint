@@ -28,6 +28,7 @@ fn main() {
                 workspace: workspace.clone(),
                 session_dir: Some(session_dir.clone()),
                 approval: ApprovalMode::AskForChanges,
+                agent_terminals: true,
             },
         );
         let mut result = format!("{}: timed out after 150s", agent.name());

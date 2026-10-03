@@ -119,6 +119,7 @@ impl FlintApp {
                 workspace: session.workspace.clone(),
                 session_dir: session.dir.clone(),
                 approval: self.approval,
+                agent_terminals: true,
             },
         ))
     }

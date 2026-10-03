@@ -50,6 +50,16 @@ impl Fake {
         }
     }
 
+    /// The client's answer to the request with this id.
+    pub async fn answered(&mut self, id: &str) -> Value {
+        loop {
+            let message = self.recv().await;
+            if message["method"].is_null() && message["id"] == id {
+                return message;
+            }
+        }
+    }
+
     pub async fn send(&mut self, value: Value) {
         let mut line = value.to_string();
         line.push('\n');
@@ -171,6 +181,7 @@ pub(crate) fn start_with(approval: ApprovalMode, session_dir: Option<&str>) -> (
         workspace: workspace.clone(),
         session_dir: session_dir.map(|d| workspace.join(d)),
         approval,
+        agent_terminals: true,
         ops: ops_rx,
         events: events_tx,
         stderr: Arc::clone(&stderr),

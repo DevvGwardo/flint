@@ -29,6 +29,15 @@ impl AcpAgent {
         }
     }
 
+    /// Short lowercase name for terminal tab labels ("claude: npm test").
+    pub fn label_prefix(&self) -> String {
+        match self {
+            AcpAgent::ClaudeCode => "claude".to_string(),
+            AcpAgent::Codex => "codex".to_string(),
+            AcpAgent::Custom { name, .. } => name.to_lowercase(),
+        }
+    }
+
     /// Stable id stored in `acp.json`.
     pub fn id(&self) -> String {
         match self {
