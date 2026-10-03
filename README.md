@@ -16,6 +16,7 @@
 <p align="center">
   <a href="#features">Features</a> •
   <a href="#architecture">Architecture</a> •
+  <a href="#workspace--interface">Workspace</a> •
   <a href="#requirements">Requirements</a> •
   <a href="#build-and-run">Quick Start</a> •
   <a href="#configure-a-provider">Configuration</a> •
@@ -169,6 +170,154 @@ graph TD
 > [!NOTE]
 > For in-depth component specifications, sequence diagrams, and lifecycle flows, see [Architecture & Internals](docs/ARCHITECTURE.md).
 
+## Workspace & Interface
+
+Flint is designed around a responsive, low-latency macOS native interface powered by GPUI, combining modular dockable panels, a real PTY terminal dock, and an interactive changes reviewer.
+
+### Dockable Panels & Dynamic Layout
+
+Drag the six-dot grip on any panel header (Sidebar, Chat, Changes, or Terminal) onto another panel's top, bottom, left, or right edge to dock them side-by-side or stacked. Dividers can be dragged freely to resize panels.
+
+<p align="center">
+  <img src="assets/dockable_panels_diagram.jpg" alt="Dockable Panels Layout System" width="100%" />
+</p>
+
+<details>
+  <summary><b>View Mermaid docking layout flow</b></summary>
+
+```mermaid
+%%{init: {
+  'theme': 'base',
+  'themeVariables': {
+    'darkMode': true,
+    'primaryColor': '#1b1b20',
+    'primaryTextColor': '#e7e7ea',
+    'primaryBorderColor': '#ff8a3d',
+    'lineColor': '#ff8a3d',
+    'secondaryColor': '#141418',
+    'tertiaryColor': '#0e0e10',
+    'mainBkg': '#141418',
+    'nodeBorder': '#ff8a3d',
+    'clusterBkg': '#141418',
+    'clusterBorder': '#222228',
+    'defaultLinkColor': '#ff8a3d',
+    'titleColor': '#e7e7ea',
+    'edgeLabelBackground': '#1b1b20'
+  }
+}}%%
+flowchart TD
+    classDef default fill:#141418,stroke:#222228,stroke-width:1.5px,color:#e7e7ea;
+    classDef ember fill:#1b1b20,stroke:#ff8a3d,stroke-width:2px,color:#e7e7ea;
+    classDef cyan fill:#141418,stroke:#00e5ff,stroke-width:2px,color:#e7e7ea;
+
+    Grip["Drag 6-Dot Panel Grip"] --> Drop{"Hover Drop Target Edge"}
+    Drop -->|Left / Right| HorizSplit["Create Horizontal Split View"]
+    Drop -->|Top / Bottom| VertSplit["Create Vertical Stack View"]
+    HorizSplit --> SaveLayout["Persist to ~/.flint/layout.json"]
+    VertSplit --> SaveLayout
+    SaveLayout --> Restore["Restore Custom Arrangement on Launch"]
+
+    class Grip,Drop ember;
+    class HorizSplit,VertSplit cyan;
+```
+</details>
+
+### Integrated Terminal Dock
+
+The terminal dock embeds a full PTY shell session directly within your project workspace, complete with ANSI colours, full scrollback, and clickable links.
+
+<p align="center">
+  <img src="assets/terminal_dock_diagram.jpg" alt="Integrated Terminal Dock Workflow" width="100%" />
+</p>
+
+<details>
+  <summary><b>View Mermaid terminal dock flow</b></summary>
+
+```mermaid
+%%{init: {
+  'theme': 'base',
+  'themeVariables': {
+    'darkMode': true,
+    'primaryColor': '#1b1b20',
+    'primaryTextColor': '#e7e7ea',
+    'primaryBorderColor': '#ff8a3d',
+    'lineColor': '#ff8a3d',
+    'secondaryColor': '#141418',
+    'tertiaryColor': '#0e0e10',
+    'mainBkg': '#141418',
+    'nodeBorder': '#ff8a3d',
+    'clusterBkg': '#141418',
+    'clusterBorder': '#222228',
+    'defaultLinkColor': '#ff8a3d',
+    'titleColor': '#e7e7ea',
+    'edgeLabelBackground': '#1b1b20'
+  }
+}}%%
+sequenceDiagram
+    autonumber
+    participant Agent as Agent Execution Turn
+    participant Dock as Terminal Dock (crates/flint-term)
+    participant Shell as Interactive PTY Shell
+    actor Dev as Developer
+
+    Agent->>Dock: Run command (read-only execution tab)
+    Dock-->>Agent: Live stdout/stderr stream
+    Dev->>Dock: Open interactive tab (`cmd-shift-t`)
+    Dev->>Shell: Run manual shell commands
+    Dev->>Agent: Send terminal card output back as composer prompt
+```
+</details>
+
+### Diffs & Changes Inspector
+
+Review code changes turn-by-turn with syntax-highlighted unified and side-by-side diff viewers before applying changes or committing work.
+
+<p align="center">
+  <img src="assets/diffs_changes_diagram.jpg" alt="Diffs & Changes Review Pipeline" width="100%" />
+</p>
+
+<details>
+  <summary><b>View Mermaid diff review flow</b></summary>
+
+```mermaid
+%%{init: {
+  'theme': 'base',
+  'themeVariables': {
+    'darkMode': true,
+    'primaryColor': '#1b1b20',
+    'primaryTextColor': '#e7e7ea',
+    'primaryBorderColor': '#ff8a3d',
+    'lineColor': '#ff8a3d',
+    'secondaryColor': '#141418',
+    'tertiaryColor': '#0e0e10',
+    'mainBkg': '#141418',
+    'nodeBorder': '#ff8a3d',
+    'clusterBkg': '#141418',
+    'clusterBorder': '#222228',
+    'defaultLinkColor': '#ff8a3d',
+    'titleColor': '#e7e7ea',
+    'edgeLabelBackground': '#1b1b20'
+  }
+}}%%
+flowchart LR
+    classDef default fill:#141418,stroke:#222228,stroke-width:1.5px,color:#e7e7ea;
+    classDef ember fill:#1b1b20,stroke:#ff8a3d,stroke-width:2px,color:#e7e7ea;
+    classDef green fill:#141418,stroke:#4cc38a,stroke-width:2px,color:#e7e7ea;
+    classDef cyan fill:#141418,stroke:#00e5ff,stroke-width:2px,color:#e7e7ea;
+
+    Edit["Agent Tool: Edit / Write"] --> Capture["Diff Snapshot Capture"]
+    Capture --> Card["Turn Card: Files Changed (+ / -)"]
+    Card --> Inspector["Changes Panel Inspector (cmd-j)"]
+    Inspector --> Review{"Developer Review"}
+    Review -->|Accept| Commit["Stage in Workspace Git"]
+    Review -->|Revert / Deny| Undo["Revert File Changes"]
+
+    class Edit,Capture,Review ember;
+    class Card,Inspector cyan;
+    class Commit green;
+```
+</details>
+
 ## Requirements
 
 - Rust, pinned by [`rust-toolchain.toml`](rust-toolchain.toml); `rustup`
@@ -296,6 +445,117 @@ parallel (up to four at a time). Children edit the same workspace, not separate 
 so delegated edits must target different files. A parent retains up to 32 child
 sessions; further tasks can resume an existing child. Claude Code, Codex and Droid
 still use their own delegation implementations, not Flint's tool.
+
+### Approvals & Permission Security Gate
+
+Flint provides two execution modes configured via `approval`:
+- **`auto` (Auto-Run):** The agent executes tools autonomously without interrupting you.
+- **`ask` (Ask-Before-Changes):** Actions that modify files or run shell commands are paused for review.
+
+When `ask` mode is active, approvals are pinned directly above the composer with dedicated single-key shortcuts:
+- <kbd>Y</kbd>: Approve the current action.
+- <kbd>A</kbd>: Approve always for the current session.
+- <kbd>N</kbd>: Deny the action and return to the composer to redirect the agent.
+
+<p align="center">
+  <img src="assets/approvals_workflow_diagram.jpg" alt="Approvals and Permission Security Gate" width="100%" />
+</p>
+
+<details>
+  <summary><b>View Mermaid approvals gate flow</b></summary>
+
+```mermaid
+%%{init: {
+  'theme': 'base',
+  'themeVariables': {
+    'darkMode': true,
+    'primaryColor': '#1b1b20',
+    'primaryTextColor': '#e7e7ea',
+    'primaryBorderColor': '#ff8a3d',
+    'lineColor': '#ff8a3d',
+    'secondaryColor': '#141418',
+    'tertiaryColor': '#0e0e10',
+    'mainBkg': '#141418',
+    'nodeBorder': '#ff8a3d',
+    'clusterBkg': '#141418',
+    'clusterBorder': '#222228',
+    'defaultLinkColor': '#ff8a3d',
+    'titleColor': '#e7e7ea',
+    'edgeLabelBackground': '#1b1b20'
+  }
+}}%%
+flowchart TD
+    classDef default fill:#141418,stroke:#222228,stroke-width:1.5px,color:#e7e7ea;
+    classDef ember fill:#1b1b20,stroke:#ff8a3d,stroke-width:2px,color:#e7e7ea;
+    classDef green fill:#141418,stroke:#4cc38a,stroke-width:2px,color:#e7e7ea;
+    classDef red fill:#141418,stroke:#f2555a,stroke-width:2px,color:#e7e7ea;
+
+    ToolReq["Agent Requests Tool Execution"] --> Mode{"Approval Mode"}
+    Mode -->|Auto| RunDirect["Execute in Workspace Sandbox"]
+    Mode -->|Ask| PromptBar["Show Pinned Banner in Composer"]
+    PromptBar --> KeyChoice{"User Keypress"}
+    KeyChoice -->|'y'| RunDirect
+    KeyChoice -->|'a'| Always["Set Session to Auto & Run"]
+    Always --> RunDirect
+    KeyChoice -->|'n'| Deny["Halt Tool & Inject User Feedback"]
+
+    class ToolReq,Mode,PromptBar ember;
+    class RunDirect,Always green;
+    class Deny red;
+```
+</details>
+
+### Sessions & Context Token Budgeting
+
+Flint retains conversation history and automatically protects model context limits:
+- **Local Persistence:** All conversations are durably saved to `~/.flint/sessions/<session_id>.json` and restored on app launch.
+- **Context Budgeting:** When conversation length approaches the model's context ceiling, Flint preserves the system instructions and recent turns while compacting earlier history into concise summaries.
+- **Dynamic Grouping:** Organize your active sessions by **Project**, **Status**, or **Agent Type** via the session sidebar with <kbd>⌘</kbd> <kbd>⇧</kbd> <kbd>G</kbd>.
+
+<p align="center">
+  <img src="assets/session_context_diagram.jpg" alt="Session Persistence and Context Window Budgeting" width="100%" />
+</p>
+
+<details>
+  <summary><b>View Mermaid session context flow</b></summary>
+
+```mermaid
+%%{init: {
+  'theme': 'base',
+  'themeVariables': {
+    'darkMode': true,
+    'primaryColor': '#1b1b20',
+    'primaryTextColor': '#e7e7ea',
+    'primaryBorderColor': '#ff8a3d',
+    'lineColor': '#ff8a3d',
+    'secondaryColor': '#141418',
+    'tertiaryColor': '#0e0e10',
+    'mainBkg': '#141418',
+    'nodeBorder': '#ff8a3d',
+    'clusterBkg': '#141418',
+    'clusterBorder': '#222228',
+    'defaultLinkColor': '#ff8a3d',
+    'titleColor': '#e7e7ea',
+    'edgeLabelBackground': '#1b1b20'
+  }
+}}%%
+flowchart LR
+    classDef default fill:#141418,stroke:#222228,stroke-width:1.5px,color:#e7e7ea;
+    classDef ember fill:#1b1b20,stroke:#ff8a3d,stroke-width:2px,color:#e7e7ea;
+    classDef cyan fill:#141418,stroke:#00e5ff,stroke-width:2px,color:#e7e7ea;
+
+    Turn["New Turn Completed"] --> Disk["Save to ~/.flint/sessions/"]
+    Turn --> TokenCheck{"Context Token Utilization"}
+    TokenCheck -->|Within Limit| Normal["Full Turn History"]
+    TokenCheck -->|Approaching Budget| Compact["Prune & Summarize Older Turns"]
+    Compact --> ContextWindow["Assemble Next Prompt Frame"]
+    Normal --> ContextWindow
+    Disk --> Sidebar["Sidebar Grouping (cmd-shift-g)"]
+
+    class Turn,TokenCheck ember;
+    class Compact,ContextWindow,Sidebar cyan;
+```
+</details>
 
 ## Claude Code, Codex and Droid
 
