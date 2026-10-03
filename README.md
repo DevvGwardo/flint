@@ -100,6 +100,14 @@ Pick the agent for a session from the agent picker, with `/agent claude`,
 their own loops, so flint's harness guard rules do not apply to them. They use
 your own Claude and ChatGPT subscriptions, not an API key from flint.
 
+Claude Code prefers `ANTHROPIC_API_KEY` over a subscription login whenever it
+is set, so flint removes `ANTHROPIC_API_KEY` and `ANTHROPIC_AUTH_TOKEN` from the
+adapter's environment and Claude Code uses your plan. To bill an API key
+instead, launch flint with `FLINT_CLAUDE_USE_API_KEY=1`.
+
+The first message in a new Claude Code or Codex session can take 20–50 seconds
+while the adapter starts.
+
 ## Keyboard shortcuts
 
 | Shortcut | Action |
