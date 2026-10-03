@@ -12,7 +12,7 @@ jobs:
   check:
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       # rust-toolchain.toml pins the version; rustup installs it on first use.
       - name: Install the pinned toolchain
         run: rustup show active-toolchain || rustup toolchain install
