@@ -26,14 +26,21 @@ pub struct AgentConfig {
     /// `None` keeps the session in memory only.
     pub session_dir: Option<PathBuf>,
     /// Token budget for the model context. History is compacted when the
-    /// estimate passes 80% of it.
+    /// estimate passes 80% of it. `0` (the default) sizes it from the model's
+    /// reported context window.
     pub context_budget_tokens: u64,
     /// Sent as `reasoning_effort`; `None` leaves the provider default.
     pub reasoning_effort: Option<ReasoningEffort>,
 }
 
-/// Default for [`AgentConfig::context_budget_tokens`].
-pub const DEFAULT_CONTEXT_BUDGET_TOKENS: u64 = 100_000;
+/// Default for [`AgentConfig::context_budget_tokens`]: `0` sizes the budget
+/// from the model's context window as the provider reports it (see
+/// [`crate::provider::Provider::model_limits`]), falling back to
+/// [`FALLBACK_CONTEXT_WINDOW_TOKENS`] when it doesn't.
+pub const DEFAULT_CONTEXT_BUDGET_TOKENS: u64 = 0;
+
+/// Context window assumed when the provider doesn't report one.
+pub const FALLBACK_CONTEXT_WINDOW_TOKENS: u64 = 128_000;
 
 /// How hard a reasoning model should think.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

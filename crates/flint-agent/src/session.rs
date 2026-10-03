@@ -25,6 +25,7 @@ use crate::protocol::AgentConfig;
 use crate::protocol::AgentEvent;
 use crate::protocol::ApprovalDecision;
 use crate::protocol::ApprovalMode;
+use crate::protocol::FALLBACK_CONTEXT_WINDOW_TOKENS;
 use crate::protocol::NudgeReason;
 use crate::protocol::Op;
 use crate::protocol::ReasoningEffort;
@@ -33,6 +34,7 @@ use crate::protocol::TurnEndReason;
 use crate::protocol::Usage;
 use crate::provider::ChatRequest;
 use crate::provider::Message;
+use crate::provider::ModelLimits;
 use crate::provider::Provider;
 use crate::provider::ProviderError;
 use crate::provider::RawToolCall;
@@ -77,7 +79,12 @@ pub(crate) async fn run(config: AgentConfig, ops: Receiver<Op>, events: Sender<A
         messages_tx.close();
     });
 
+    let auto_budget = config.context_budget_tokens == 0;
     let mut session = Session::new(config, events, approvals_rx, effort);
+    if auto_budget {
+        let limits = session.provider.model_limits().await;
+        session.context.set_budget(budget_for_window(limits));
+    }
     while let Ok(text) = messages_rx.recv().await {
         let token = CancellationToken::new();
         if let Ok(mut slot) = current.lock() {
@@ -88,6 +95,21 @@ pub(crate) async fn run(config: AgentConfig, ops: Receiver<Op>, events: Sender<A
     if let Some(saver) = session.saver.take() {
         saver.flush().await;
     }
+}
+
+/// Prompt budget for a model: its context window minus room for the reply.
+/// The reserve is the model's output cap, capped at 64k so a huge cap
+/// (deepseek-v4.1-flash allows 384k) doesn't swallow the window, and at least
+/// 8k. Unknown windows fall back to [`FALLBACK_CONTEXT_WINDOW_TOKENS`].
+pub(crate) fn budget_for_window(limits: Option<ModelLimits>) -> u64 {
+    let Some(limits) = limits else {
+        return FALLBACK_CONTEXT_WINDOW_TOKENS - 16_000;
+    };
+    let reserve = limits.max_output.unwrap_or(32_000).clamp(8_000, 64_000);
+    limits
+        .context_window
+        .saturating_sub(reserve)
+        .max(limits.context_window / 2)
 }
 
 fn cancel_current(current: &Mutex<CancellationToken>) {
@@ -141,7 +163,14 @@ impl Session {
         Self {
             provider: Provider::new(&config.base_url, &config.model, &config.api_key),
             jev: config.jev.clone().map(JevClient::new),
-            context: ContextTracker::new(config.context_budget_tokens, tools_json.len()),
+            context: ContextTracker::new(
+                if config.context_budget_tokens == 0 {
+                    budget_for_window(None)
+                } else {
+                    config.context_budget_tokens
+                },
+                tools_json.len(),
+            ),
             saver: config.session_dir.clone().map(Saver::new),
             history,
             workspace: config.workspace,

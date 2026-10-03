@@ -53,6 +53,11 @@ impl ContextTracker {
         }
     }
 
+    /// Replaces the budget, e.g. once the model's context window is known.
+    pub fn set_budget(&mut self, budget: u64) {
+        self.budget = budget;
+    }
+
     /// Estimated prompt tokens for `history`.
     pub fn estimate(&self, history: &[Message]) -> u64 {
         (self.raw_estimate(history) as f64 * self.ratio).round() as u64

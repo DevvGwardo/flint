@@ -100,7 +100,8 @@ fn test_config(url: String, workspace: PathBuf) -> AgentConfig {
         approval: ApprovalMode::Auto,
         jev: None,
         session_dir: None,
-        context_budget_tokens: crate::DEFAULT_CONTEXT_BUDGET_TOKENS,
+        // Explicit, so the mock server only sees chat requests (0 would fetch `/models`).
+        context_budget_tokens: 100_000,
         reasoning_effort: None,
     }
 }

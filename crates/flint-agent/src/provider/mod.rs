@@ -44,6 +44,8 @@ pub enum ProviderError {
 pub struct Provider {
     http: reqwest::Client,
     url: String,
+    /// `{base}/models`, for [`Provider::model_limits`].
+    models_url: String,
     model: String,
     api_key: String,
     /// Set once the endpoint rejected `reasoning_effort`; it is not sent again.
@@ -61,10 +63,33 @@ impl Provider {
         Self {
             http,
             url: format!("{}/chat/completions", base_url.trim_end_matches('/')),
+            models_url: format!("{}/models", base_url.trim_end_matches('/')),
             model: model.to_string(),
             api_key: api_key.to_string(),
             effort_rejected: AtomicBool::new(false),
         }
+    }
+
+    /// The model's context window and output cap, from the endpoint's
+    /// `GET /models` listing. Reads the fields OpenAI-compatible servers use:
+    /// `context_length` / `top_provider.context_length` (OpenRouter and
+    /// gateways like it), `max_model_len` (vLLM), `context_window`, and
+    /// `max_completion_tokens` / `top_provider.max_completion_tokens`.
+    /// `None` when the listing is unavailable or doesn't say.
+    pub async fn model_limits(&self) -> Option<ModelLimits> {
+        let response = self
+            .http
+            .get(&self.models_url)
+            .bearer_auth(&self.api_key)
+            .timeout(Duration::from_secs(10))
+            .send()
+            .await
+            .ok()?;
+        if !response.status().is_success() {
+            return None;
+        }
+        let listing: serde_json::Value = response.json().await.ok()?;
+        model_limits_from_listing(&listing, &self.model)
     }
 
     /// False once the endpoint rejected `reasoning_effort` in this session.
@@ -234,3 +259,37 @@ enum Attempt {
     Retryable(String),
     Fatal(String),
 }
+
+/// What the endpoint says about a model's size limits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ModelLimits {
+    pub context_window: u64,
+    pub max_output: Option<u64>,
+}
+
+/// Finds `model` in a `GET /models` listing and reads its limits.
+pub fn model_limits_from_listing(listing: &serde_json::Value, model: &str) -> Option<ModelLimits> {
+    let entry = listing
+        .get("data")?
+        .as_array()?
+        .iter()
+        .find(|entry| entry.get("id").and_then(serde_json::Value::as_str) == Some(model))?;
+    let top = entry.get("top_provider");
+    let number = |value: Option<&serde_json::Value>| value.and_then(serde_json::Value::as_u64);
+    let context_window = number(entry.get("context_length"))
+        .or_else(|| number(top.and_then(|top| top.get("context_length"))))
+        .or_else(|| number(entry.get("max_model_len")))
+        .or_else(|| number(entry.get("context_window")))
+        .filter(|tokens| *tokens > 0)?;
+    let max_output = number(top.and_then(|top| top.get("max_completion_tokens")))
+        .or_else(|| number(entry.get("max_completion_tokens")))
+        .or_else(|| number(entry.get("max_output_tokens")));
+    Some(ModelLimits {
+        context_window,
+        max_output,
+    })
+}
+
+#[cfg(test)]
+#[path = "limits_tests.rs"]
+mod limits_tests;
