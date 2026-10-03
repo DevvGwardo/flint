@@ -15,6 +15,7 @@
 
 <p align="center">
   <a href="#features">Features</a> •
+  <a href="#architecture">Architecture</a> •
   <a href="#requirements">Requirements</a> •
   <a href="#build-and-run">Quick Start</a> •
   <a href="#configure-a-provider">Configuration</a> •
@@ -79,6 +80,53 @@
 > [!TIP]
 > **Limitations:** There is no light theme yet, and the thumbs up/down feedback on answers is only stored locally on your machine.
 
+## Architecture
+
+Flint couples high-frame-rate native macOS rendering (Metal via GPUI) with an asynchronous agent engine capable of orchestrating native LLM tool execution and external CLI coding agents through the [Agent Client Protocol (ACP)](https://agentclientprotocol.com).
+
+<p align="center">
+  <img src="assets/architecture.jpg" alt="Flint System Architecture" width="100%" />
+</p>
+
+```mermaid
+graph TD
+    subgraph UI ["Desktop UI (crates/flint-app & crates/flint-term)"]
+        GPUI["GPUI Metal Window"] --> Panels["Dockable Panels Layout"]
+        Panels --> Composer["Composer & Palette"]
+        Panels --> Diffs["Diffs & Changes"]
+        Panels --> Terminal["Terminal Dock (PTY)"]
+    end
+
+    subgraph Core ["Agent Engine Core (crates/flint-agent)"]
+        Engine["Session & Context Manager"]
+        Guard["Harness Guard (Loops, Watchdog, Tests)"]
+        Tools["Tool Runner (sh, read, write, edit, grep)"]
+        Subagents["Subagent Coordinator (1 to 4)"]
+        Engine --> Guard --> Tools
+        Engine -.-> Subagents
+    end
+
+    subgraph ACP ["ACP Gateway (crates/flint-acp)"]
+        Bridge["JSON-RPC over stdio"]
+    end
+
+    subgraph Providers ["Model Providers & External Agents"]
+        Endpoints["OpenAI / OpenRouter / DeepSeek / Ollama"]
+        ExternalAgents["Claude Code / Codex / Droid"]
+        JEV["Typesafe JEV Judge"]
+    end
+
+    Composer --> Engine
+    Composer --> Bridge
+    Tools --> Terminal
+    Engine <--> Endpoints
+    Bridge <--> ExternalAgents
+    Guard -.-> JEV
+```
+
+> [!NOTE]
+> For in-depth component specifications, sequence diagrams, and lifecycle flows, see [Architecture & Internals](docs/ARCHITECTURE.md).
+
 ## Requirements
 
 - Rust, pinned by [`rust-toolchain.toml`](rust-toolchain.toml); `rustup`
@@ -132,11 +180,37 @@ Model names change often; check your provider's list.
 
 ### Subagents
 
+<p align="center">
+  <img src="assets/subagents_workflow.jpg" alt="Subagents Parallel Delegation Workflow" width="100%" />
+</p>
+
 The native agent's `spawn_agent` tool follows Zed's delegation design: each child
 has its own conversation, shares the workspace and approval mode, and returns
 only its final answer plus a `session_id`. The parent can use that id for
 follow-ups, including after a saved session is reopened. Children cannot spawn
 more children. Interrupting a turn stops its children too.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Parent as Parent Agent
+    participant Orch as Subagent Coordinator
+    participant Sub1 as Subagent A (Isolated)
+    participant Sub2 as Subagent B (Isolated)
+    participant Disk as Workspace Filesystem
+
+    Parent->>Orch: spawn_agent(task, model)
+    par Up to 4 Parallel Subagents
+        Orch->>Sub1: Autonomous prompt loop
+        Sub1->>Disk: Read & edit targeted files
+        Sub1-->>Orch: Result + session_id_A
+    and
+        Orch->>Sub2: Autonomous prompt loop
+        Sub2->>Disk: Read & edit targeted files
+        Sub2-->>Orch: Result + session_id_B
+    end
+    Orch-->>Parent: Aggregated results & resumable IDs
+```
 
 Set **Subagent model** in Settings (`cmd-,`) or `subagent_model` in the config
 file. `FLINT_SUBAGENT_MODEL` overrides it for one run. These settings apply when
@@ -156,6 +230,29 @@ sessions; further tasks can resume an existing child. Claude Code, Codex and Dro
 still use their own delegation implementations, not Flint's tool.
 
 ## Claude Code, Codex and Droid
+
+<p align="center">
+  <img src="assets/feature-agents.jpg" alt="Flint ACP Multi-Agent Integration" width="100%" />
+</p>
+
+```mermaid
+flowchart LR
+    subgraph FlintApp ["Flint Native Host (macOS)"]
+        UI["GPUI Unified Window"]
+        Client["crates/flint-acp Gateway"]
+        UI <--> Client
+    end
+
+    subgraph Agents ["External Agents (stdio JSON-RPC)"]
+        Claude["Claude Code\n(claude-agent-acp)"]
+        Codex["Codex\n(codex-acp)"]
+        Droid["Droid\n(native ACP)"]
+    end
+
+    Client <==> Claude
+    Client <==> Codex
+    Client <==> Droid
+```
 
 For Claude Code and Codex, install the ACP adapters, then sign in once with
 each CLI so the adapter can reuse your login:
@@ -217,7 +314,35 @@ while the adapter starts.
 In the `@` and `/` menus: up/down to move, enter or tab to accept, escape to
 dismiss.
 
-## Optional JEV judge
+## Harness Guard & JEV Judge
+
+Flint equips models with autonomous **harness guard rules** that prevent runaway execution and guarantee completion quality:
+- **Loop Detection:** Detects repeated cyclical tool invocation patterns and breaks out before tokens are wasted.
+- **Watchdog:** Monitors turns that execute without editing code or making forward progress.
+- **Test-Before-Done:** Requires execution and verification of tests before concluding tasks that touched source files.
+- **Tool-Call Repair:** Automatically repairs malformed JSON or invalid parameter signatures from cheaper models.
+
+<p align="center">
+  <img src="assets/harness_guard.jpg" alt="Harness Guard System" width="100%" />
+</p>
+
+```mermaid
+flowchart TD
+    In["Agent Action Proposal"] --> Guard{"Guard Rules Inspection"}
+    Guard -->|Cyclic Loops| BreakLoop["Break Infinite Loop"]
+    Guard -->|Malformed Syntax| Repair["Automatic Tool-Call Repair"]
+    Guard -->|No Edits Made| Warn["Watchdog Guidance Nudge"]
+    Guard -->|Clean Request| Execute["Execute Action via Sandbox"]
+
+    BreakLoop --> JEV{"Optional JEV Judge?"}
+    Warn --> JEV
+    JEV -->|Yes| Consult["Typesafe JEV Confirmation"]
+    Consult -->|Confirmed| Intervene["Intervene / Re-prompt Turn"]
+    Consult -->|False Alarm| Execute
+    JEV -->|No (Heuristic)| Intervene
+```
+
+### Optional JEV judge
 
 Set `TYPESAFE_API_KEY` to have the guard ask a Typesafe "JEV" judge to confirm
 loop and verification suspicions instead of relying on heuristics alone.
