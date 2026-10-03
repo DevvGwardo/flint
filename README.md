@@ -1,13 +1,43 @@
-# flint
+<p align="center">
+  <img src="assets/banner.jpg" alt="Flint Banner" width="100%" />
+</p>
 
-A native macOS desktop app for coding agents, written in Rust with
-[GPUI](https://github.com/zed-industries/zed). Run flint's own agent against any
-OpenAI-compatible model, or drive Claude Code, Codex and Droid from the same window.
+<p align="center">
+  <img src="assets/logo.jpg" alt="Flint Logo" width="120" height="120" style="border-radius: 24px;" />
+</p>
 
-![flint](docs/screenshot.png)
+<h1 align="center">Flint</h1>
 
-> **Status: early preview.** macOS first. Linux and Windows are untested.
-> Expect rough edges and breaking changes.
+<p align="center">
+  <strong>A native macOS desktop app for coding agents, written in Rust with <a href="https://github.com/zed-industries/zed">GPUI</a>.</strong><br />
+  Run Flint's own agent against any OpenAI-compatible model, or drive Claude Code, Codex, and Droid from the same window.
+</p>
+
+<p align="center">
+  <a href="#features">Features</a> •
+  <a href="#requirements">Requirements</a> •
+  <a href="#build-and-run">Quick Start</a> •
+  <a href="#configure-a-provider">Configuration</a> •
+  <a href="#claude-code-codex-and-droid">ACP Agents</a> •
+  <a href="#keyboard-shortcuts">Shortcuts</a> •
+  <a href="#contributing">Contributing</a>
+</p>
+
+<p align="center">
+  <img src="https://img.shields.io/badge/Platform-macOS-black?style=flat-square&logo=apple" alt="macOS" />
+  <img src="https://img.shields.io/badge/Rust-2021-dea584?style=flat-square&logo=rust" alt="Rust" />
+  <img src="https://img.shields.io/badge/GUI-GPUI-blue?style=flat-square" alt="GPUI" />
+  <img src="https://img.shields.io/badge/License-Apache--2.0-green?style=flat-square" alt="License" />
+</p>
+
+---
+
+<p align="center">
+  <img src="docs/screenshot.png" alt="Flint Interface Screenshot" width="100%" />
+</p>
+
+> [!NOTE]
+> **Status: Early Preview.** macOS first. Linux and Windows are untested. Expect rough edges and breaking changes.
 
 ## Features
 
@@ -46,8 +76,8 @@ OpenAI-compatible model, or drive Claude Code, Codex and Droid from the same win
   GIF or WebP images (5 MB each), including files outside the workspace.
   Image prompts require a vision-capable model or ACP agent.
 
-Not done yet: there is no light theme, and the thumbs up/down on answers are
-only stored on your machine.
+> [!TIP]
+> **Limitations:** There is no light theme yet, and the thumbs up/down feedback on answers is only stored locally on your machine.
 
 ## Requirements
 
@@ -168,20 +198,21 @@ while the adapter starts.
 
 | Shortcut | Action |
 | --- | --- |
-| `cmd-n` | New session |
-| `cmd-o` | Open a folder |
-| `cmd-k` or `cmd-shift-p` | Command palette |
-| `cmd-l` | Focus the composer |
-| `cmd-.` | Interrupt the running turn |
-| `shift-tab` | Toggle auto-run / ask before changes |
-| `cmd-shift-a` | Toggle approval mode |
-| `cmd-j` | Toggle the changes panel |
-| `cmd-b` | Toggle the sidebar |
-| `cmd-shift-r` | Reveal the workspace in Finder |
-| `` ctrl-` `` | Show or hide the terminal dock |
-| `cmd-shift-t` | Open a terminal in the workspace |
-| `cmd-,` | Settings |
-| `cmd-q` | Quit |
+| <kbd>⌘</kbd> <kbd>N</kbd> | New session |
+| <kbd>⌘</kbd> <kbd>O</kbd> | Open a folder |
+| <kbd>⌘</kbd> <kbd>K</kbd> or <kbd>⌘</kbd> <kbd>⇧</kbd> <kbd>P</kbd> | Command palette |
+| <kbd>⌘</kbd> <kbd>L</kbd> | Focus the composer |
+| <kbd>⌘</kbd> <kbd>.</kbd> | Interrupt the running turn |
+| <kbd>⇧</kbd> <kbd>Tab</kbd> | Toggle auto-run / ask before changes |
+| <kbd>⌘</kbd> <kbd>⇧</kbd> <kbd>A</kbd> | Toggle approval mode |
+| <kbd>⌘</kbd> <kbd>J</kbd> | Toggle the changes panel |
+| <kbd>⌘</kbd> <kbd>B</kbd> | Toggle the sidebar |
+| <kbd>⌘</kbd> <kbd>⇧</kbd> <kbd>G</kbd> | Group sessions by project, status or agent |
+| <kbd>⌘</kbd> <kbd>⇧</kbd> <kbd>R</kbd> | Reveal the workspace in Finder |
+| <kbd>Ctrl</kbd> <kbd>`</kbd> | Show or hide the terminal dock |
+| <kbd>⌘</kbd> <kbd>⇧</kbd> <kbd>T</kbd> | Open a terminal in the workspace |
+| <kbd>⌘</kbd> <kbd>,</kbd> | Settings |
+| <kbd>⌘</kbd> <kbd>Q</kbd> | Quit |
 
 In the `@` and `/` menus: up/down to move, enter or tab to accept, escape to
 dismiss.
