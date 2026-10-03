@@ -72,7 +72,13 @@ pub fn search<'a>(files: &'a [String], query: &str) -> Vec<&'a String> {
         .iter()
         .filter_map(|path| score(query, path).map(|s| (s, path)))
         .collect();
-    hits.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(b.1)));
+    let rank = |a: &(i64, &String), b: &(i64, &String)| b.0.cmp(&a.0).then_with(|| a.1.cmp(b.1));
+    // Only the visible results need ordering, not the entire workspace.
+    if hits.len() > MAX_RESULTS {
+        hits.select_nth_unstable_by(MAX_RESULTS, rank);
+        hits.truncate(MAX_RESULTS);
+    }
+    hits.sort_by(rank);
     hits.into_iter().take(MAX_RESULTS).map(|(_, p)| p).collect()
 }
 

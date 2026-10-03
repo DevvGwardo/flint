@@ -5,6 +5,7 @@ use flint_agent::ApprovalDecision;
 use flint_agent::ToolKind;
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::*;
+use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use super::rows::GUTTER;
@@ -41,12 +42,22 @@ fn key(text: &str) -> Div {
 
 /// The pinned card above the composer.
 pub fn pinned(
+    app: &FlintApp,
     call_id: &str,
     kind: ToolKind,
     summary: &str,
     cx: &mut Context<FlintApp>,
 ) -> AnyElement {
     let p = palette();
+    let native = app.session().agent == flint_agent::AgentKind::Flint;
+    let preview = app
+        .session()
+        .view
+        .approval_preview(call_id, &app.session().workspace, native);
+    let no_details = preview.fields.is_empty();
+    let expanded = app.approval_preview.as_deref() == Some(call_id);
+    let confirming = app.approval_confirm.as_deref() == Some(call_id);
+    let count = app.session().view.pending_approvals;
     let answer = |id: &'static str, label: &'static str, decision: ApprovalDecision| {
         let call_id = call_id.to_string();
         Button::new(id)
@@ -55,8 +66,17 @@ pub fn pinned(
                 this.answer_approval(call_id.clone(), decision, cx);
             }))
     };
-    let approve = answer("approve", "Approve", ApprovalDecision::Approve).primary();
-    let always = answer("always", "Always allow", ApprovalDecision::ApproveAlways).outline();
+    let approve = answer("approve", "Approve once", ApprovalDecision::Approve).primary();
+    let always = answer(
+        "always",
+        if confirming {
+            "Confirm broad approval"
+        } else {
+            "Approve broadly…"
+        },
+        ApprovalDecision::ApproveAlways,
+    )
+    .outline();
     let deny = answer("deny", "Deny", ApprovalDecision::Deny);
     div()
         .id("approval-card")
@@ -84,6 +104,87 @@ pub fn pinned(
                         .truncate(),
                 ),
         )
+        .child(ui::label(
+            if native {
+                "Native engine · asks before commands and edits in this session"
+            } else {
+                "ACP agent · permissions come from the agent or ACP adapter, not the native engine"
+            },
+            size::SM,
+            p.text_muted,
+        ))
+        .when_some(preview.agent, |card, agent| {
+            card.child(ui::label(format!("Requesting agent: {agent}"), size::SM, p.text_muted))
+        })
+        .when(count > 1, |card| {
+            card.child(ui::label(
+                format!("{count} pending requests in this session"),
+                size::SM,
+                p.warning,
+            ))
+        })
+        .child(
+            div()
+                .id("approval-preview-toggle")
+                .aria_label(if expanded { "Hide request details" } else { "Inspect request details" })
+                .tab_index(0)
+                .focus_visible(|style| style.border_1().border_color(p.accent))
+                .cursor_pointer()
+                .text_color(p.text)
+                .on_click(cx.listener({
+                    let call_id = call_id.to_string();
+                    move |this, _, _, cx| {
+                        this.approval_preview = if this.approval_preview.as_deref() == Some(&call_id) {
+                            None
+                        } else {
+                            Some(call_id.clone())
+                        };
+                        cx.notify();
+                    }
+                }))
+                .child(if expanded { "Hide request details" } else { "Inspect request details" })
+                .test_support(),
+        )
+        .when(expanded, |card| {
+            card.child(
+                div()
+                    .id("approval-preview")
+                    .max_h(px(210.))
+                    .overflow_y_scroll()
+                    .overflow_x_scroll()
+                    .flex()
+                    .flex_col()
+                    .gap(px(8.))
+                    .children(preview.fields.into_iter().map(|(label, value)| {
+                        div()
+                            .flex()
+                            .flex_col()
+                            .child(ui::label(label, size::SM, p.text_muted))
+                            .children(value.lines().map(|line| {
+                                ui::mono(line.to_string(), size::SM, p.text)
+                            }))
+                    }))
+                    .when(no_details, |details| {
+                        details.child(ui::label(
+                            "The agent did not provide a full command or edit preview.",
+                            size::SM,
+                            p.text_muted,
+                        ))
+                    })
+                    .test_support(),
+            )
+        })
+        .when(confirming, |card| {
+            card.child(ui::label(
+                if native {
+                    "This approves ALL pending parent and subagent requests and skips future approvals in this native engine, including later turns. It does not change other sessions or your saved setting."
+                } else {
+                    "This asks the ACP agent to allow this request broadly and makes Flint auto-approve later requests in this ACP session. The agent may apply its own permission rules. It does not change other sessions."
+                },
+                size::SM,
+                p.warning,
+            ))
+        })
         .child(
             div()
                 .flex()
@@ -122,7 +223,7 @@ pub fn record(
         }
         Some(ApprovalDecision::ApproveAlways) => (
             IconName::ShieldCheck,
-            "Approved · always allow".to_string(),
+            "Approved broadly in this session".to_string(),
             p.success,
         ),
         Some(ApprovalDecision::Deny) => (IconName::ShieldX, "Denied".to_string(), p.danger),

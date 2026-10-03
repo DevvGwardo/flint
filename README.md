@@ -2,7 +2,7 @@
 
 A native macOS desktop app for coding agents, written in Rust with
 [GPUI](https://github.com/zed-industries/zed). Run flint's own agent against any
-OpenAI-compatible model, or drive Claude Code and Codex from the same window.
+OpenAI-compatible model, or drive Claude Code, Codex and Droid from the same window.
 
 ![flint](docs/screenshot.png)
 
@@ -13,11 +13,15 @@ OpenAI-compatible model, or drive Claude Code and Codex from the same window.
 
 - **Its own agent.** A Chat Completions agent loop with tools: shell, read,
   write, edit and grep. It works with any OpenAI-compatible endpoint.
+- **Subagents.** Flint's native agent can delegate independent tasks to isolated,
+  resumable child sessions, with up to four running in parallel. Choose a
+  different default model in Settings, or let the agent select a model per task.
+  Expand a delegation card to inspect the child's activity.
 - **Harness guard rules** that help cheaper models finish the job: loop
   detection, test-before-done checks, a watchdog for turns that edit nothing,
   and tool-call repair. An optional [JEV judge](#optional-jev-judge) can confirm
   the guard's suspicions.
-- **Claude Code and Codex** as alternative agents over the
+- **Claude Code, Codex and Droid** as alternative agents over the
   [Agent Client Protocol](https://agentclientprotocol.com), using your own
   subscriptions.
 - **Sessions.** Several run concurrently, are saved to `~/.flint/sessions/`, and
@@ -26,14 +30,21 @@ OpenAI-compatible model, or drive Claude Code and Codex from the same window.
   the composer (`y` approve, `a` approve always, `n` deny when the composer is
   empty).
 - **Diffs.** A files-changed card per turn and a changes panel to review them.
+- **Dockable panels.** Drag the six-dot grip in the sidebar, chat, changes,
+  or terminal header onto another panel's left, right, top, or bottom edge.
+  Drag dividers to resize. The layout is saved to `~/.flint/layout.json`;
+  **Reset panel layout** in the command palette restores the default.
 - **A terminal dock.** A real terminal (your shell, in the session's workspace)
-  in tabs at the bottom of the window, with colours, scrollback, selection and
-  links. Commands the agents run show up there too as read-only tabs; any
-  command card can send its terminal to the agent, or its output back as a
-  message.
+  in tabs, docked at the bottom by default, with colours, scrollback,
+  selection and links. Commands the agents run show up there too as read-only
+  tabs; any command card can send its terminal to the agent, or its output
+  back as a message.
 - **`@` mentions** of workspace files, **`/` commands**
   (`/new`, `/clear`, `/model`, `/agent`, `/effort`, `/approval`, `/review`,
   `/help`) and a **command palette**.
+- **Image prompts.** Use **+ → Attach image…** to send up to four PNG, JPEG,
+  GIF or WebP images (5 MB each), including files outside the workspace.
+  Image prompts require a vision-capable model or ACP agent.
 
 Not done yet: there is no light theme, and the thumbs up/down on answers are
 only stored on your machine.
@@ -70,6 +81,7 @@ Settings live in `~/.flint/config.toml` (or `$FLINT_HOME/config.toml`):
 
 ```toml
 model = "gpt-4.1-mini"
+subagent_model = ""                   # empty inherits the parent model
 base_url = "https://api.openai.com/v1"
 api_key_env = "OPENAI_API_KEY"        # or: api_key_file = "~/.config/flint/key"
 approval = "auto"                     # or "ask"
@@ -88,10 +100,35 @@ Other providers, changing only those lines:
 
 Model names change often; check your provider's list.
 
-## Claude Code and Codex
+### Subagents
 
-Install the ACP adapters, then sign in once with each CLI so the adapter can
-reuse your login:
+The native agent's `spawn_agent` tool follows Zed's delegation design: each child
+has its own conversation, shares the workspace and approval mode, and returns
+only its final answer plus a `session_id`. The parent can use that id for
+follow-ups, including after a saved session is reopened. Children cannot spawn
+more children. Interrupting a turn stops its children too.
+
+Set **Subagent model** in Settings (`cmd-,`) or `subagent_model` in the config
+file. `FLINT_SUBAGENT_MODEL` overrides it for one run. These settings apply when
+a new Flint engine session starts. Model selection for new children is:
+explicit `spawn_agent.model`, then the configured subagent model, then the parent
+model. Resumed children keep their original model and reasoning effort.
+
+All models use the configured endpoint and API key. For models from different
+vendors, use a multi-model gateway such as OpenRouter. The agent can call
+`list_models` to discover exact ids; an unavailable explicit model returns an
+error rather than silently falling back.
+
+Consecutive independent `spawn_agent` calls in one model response run in
+parallel (up to four at a time). Children edit the same workspace, not separate git worktrees,
+so delegated edits must target different files. A parent retains up to 32 child
+sessions; further tasks can resume an existing child. Claude Code, Codex and Droid
+still use their own delegation implementations, not Flint's tool.
+
+## Claude Code, Codex and Droid
+
+For Claude Code and Codex, install the ACP adapters, then sign in once with
+each CLI so the adapter can reuse your login:
 
 ```sh
 npm i -g @agentclientprotocol/claude-agent-acp
@@ -101,9 +138,23 @@ codex     # log in once
 ```
 
 Pick the agent for a session from the agent picker, with `/agent claude`,
-`/agent codex` or `/agent flint`, or from the command palette. These agents run
-their own loops, so flint's harness guard rules do not apply to them. They use
-your own Claude and ChatGPT subscriptions, not an API key from flint.
+`/agent codex`, `/agent droid` or `/agent flint`, or from the command palette.
+These agents run their own loops, so flint's harness guard rules do not apply
+to them. They use your own agent accounts, not an API key from flint.
+
+Droid speaks ACP natively, so it needs no adapter. Install Droid and sign in
+once in a terminal:
+
+```sh
+npm i -g droid                      # or: brew install --cask droid
+droid                              # log in to Factory
+```
+
+Choose **Droid** in the agent picker, type `/agent droid`, or use **New Droid
+session** in the command palette. Flint launches `droid exec --output-format acp`
+and uses Droid's own model and mode options when it reports them. Droid runs
+its own tools, settings, and subagents; Flint's native `subagent_model` setting
+does not change Droid's subagent models.
 
 Claude Code prefers `ANTHROPIC_API_KEY` over a subscription login whenever it
 is set, so flint removes `ANTHROPIC_API_KEY` and `ANTHROPIC_AUTH_TOKEN` from the
@@ -146,7 +197,7 @@ the key the harness uses its heuristics; flint works fine either way.
 
 ```
 crates/flint-agent/   the agent engine: provider client, tools, harness, sessions
-crates/flint-acp/     Claude Code and Codex over the Agent Client Protocol
+crates/flint-acp/     Claude Code, Codex and Droid over the Agent Client Protocol
 crates/flint-app/     the GPUI app (binary: flint)
 tools/blueprint/      evidence harness that drives the real app (Python + Swift)
 ```

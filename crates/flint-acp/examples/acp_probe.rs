@@ -2,7 +2,7 @@
 //! prompt (no model usage): proves the adapter launches, the handshake works
 //! and the agent is logged in.
 //!
-//! cargo run -p flint-acp --example acp_probe -- [claude|codex]...
+//! cargo run -p flint-acp --example acp_probe -- [claude|codex|droid]...
 
 use std::time::Duration;
 use std::time::Instant;
@@ -15,11 +15,19 @@ use flint_agent::Op;
 
 fn main() {
     let wanted: Vec<String> = std::env::args().skip(1).collect();
-    for (key, agent) in [("claude", AcpAgent::ClaudeCode), ("codex", AcpAgent::Codex)] {
+    for (key, agent) in [
+        ("claude", AcpAgent::ClaudeCode),
+        ("codex", AcpAgent::Codex),
+        ("droid", AcpAgent::Droid),
+    ] {
         if !wanted.is_empty() && !wanted.iter().any(|w| w == key) {
             continue;
         }
-        let workspace = tempfile_dir(key);
+        let temp = tempfile::Builder::new()
+            .prefix(&format!("flint-acp-probe-{key}-"))
+            .tempdir()
+            .expect("temp dir");
+        let workspace = temp.path().to_path_buf();
         let session_dir = workspace.join(".session");
         let started = Instant::now();
         let handle = flint_acp::spawn_acp_session(
@@ -68,13 +76,11 @@ fn main() {
             std::thread::sleep(Duration::from_millis(100));
         }
         let _ = handle.ops.send_blocking(Op::Shutdown);
+        let shutdown = Instant::now();
+        while !handle.events.is_closed() && shutdown.elapsed() < Duration::from_secs(5) {
+            while handle.events.try_recv().is_ok() {}
+            std::thread::sleep(Duration::from_millis(20));
+        }
         println!("{result}");
-        let _ = std::fs::remove_dir_all(&workspace);
     }
-}
-
-fn tempfile_dir(key: &str) -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!("flint-acp-probe-{key}-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("temp dir");
-    dir
 }

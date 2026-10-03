@@ -69,6 +69,15 @@ fn main() -> anyhow::Result<()> {
                 format!("⇣ context compacted {before_tokens} -> {after_tokens} tokens")
             }
             AgentEvent::SessionOptions(options) => format!("options: {}", options.len()),
+            AgentEvent::SessionStopped { history_saved } => {
+                format!("session stopped: history_saved={history_saved}")
+            }
+            AgentEvent::SubagentStarted {
+                session_id, model, ..
+            } => {
+                format!("subagent: {session_id} ({model})")
+            }
+            AgentEvent::SubagentEvent { .. } => continue,
             AgentEvent::TerminalStarted { label, .. } => format!("terminal: {label}"),
             AgentEvent::TerminalOutput { .. } | AgentEvent::TerminalExited { .. } => continue,
         };

@@ -10,13 +10,34 @@ use tokio::net::TcpListener;
 
 use super::*;
 
+#[path = "archive_shutdown_tests.rs"]
+mod archive_shutdown_tests;
+#[path = "subagent_tests.rs"]
+mod subagent_tests;
+
 /// A one-request-per-connection HTTP server that answers each POST with the
 /// next scripted SSE body and records the request bodies.
 async fn mock_server(responses: Vec<String>) -> (String, Arc<StdMutex<Vec<Value>>>) {
+    mock_server_with_models(
+        responses,
+        json!({"data": [
+            {"id": "test-model", "context_length": 128000},
+            {"id": "child-model", "context_length": 200000},
+            {"id": "override-model", "context_length": 32000}
+        ]}),
+    )
+    .await
+}
+
+async fn mock_server_with_models(
+    responses: Vec<String>,
+    listing: Value,
+) -> (String, Arc<StdMutex<Vec<Value>>>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let url = format!("http://{}/v1", listener.local_addr().expect("addr"));
     let requests = Arc::new(StdMutex::new(Vec::new()));
     let seen = Arc::clone(&requests);
+    let listing = listing.to_string();
     tokio::spawn(async move {
         let mut responses = responses.into_iter();
         while let Ok((mut socket, _)) = listener.accept().await {
@@ -32,6 +53,15 @@ async fn mock_server(responses: Vec<String>) -> (String, Arc<StdMutex<Vec<Value>
                 let Some(split) = text.find("\r\n\r\n") else {
                     continue;
                 };
+                if text.starts_with("GET /v1/models ") {
+                    let reply = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{listing}",
+                        listing.len()
+                    );
+                    let _ = socket.write_all(reply.as_bytes()).await;
+                    let _ = socket.shutdown().await;
+                    break None;
+                }
                 let length = text[..split]
                     .lines()
                     .find_map(|l| {
@@ -95,6 +125,7 @@ fn test_config(url: String, workspace: PathBuf) -> AgentConfig {
     AgentConfig {
         base_url: url,
         model: "test-model".to_string(),
+        subagent_model: None,
         api_key: "test-key".to_string(),
         workspace,
         approval: ApprovalMode::Auto,
@@ -168,6 +199,8 @@ fn outline(events: &[AgentEvent]) -> Vec<String> {
             AgentEvent::Error(message) => Some(format!("error {message}")),
             AgentEvent::ContextCompacted { .. } => Some("compacted".to_string()),
             AgentEvent::SessionOptions(_) => None,
+            AgentEvent::SessionStopped { .. } => None,
+            AgentEvent::SubagentStarted { .. } | AgentEvent::SubagentEvent { .. } => None,
             AgentEvent::TerminalStarted { .. }
             | AgentEvent::TerminalOutput { .. }
             | AgentEvent::TerminalExited { .. } => None,
@@ -582,6 +615,15 @@ fn every_event_round_trips_through_serde() {
             call_id: "c".into(),
             kind: ToolKind::Edit,
             summary: "a.rs".into(),
+        },
+        AgentEvent::SubagentStarted {
+            call_id: "c".into(),
+            session_id: "agent-1".into(),
+            model: "child-model".into(),
+        },
+        AgentEvent::SubagentEvent {
+            call_id: "c".into(),
+            event: Box::new(AgentEvent::TextDelta("child text".into())),
         },
         AgentEvent::HarnessNudge {
             reason: NudgeReason::LeakedCall,

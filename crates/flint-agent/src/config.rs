@@ -24,6 +24,7 @@ impl AgentConfig {
         Self {
             base_url,
             model,
+            subagent_model: env_var("FLINT_SUBAGENT_MODEL"),
             api_key,
             workspace,
             approval: ApprovalMode::Auto,

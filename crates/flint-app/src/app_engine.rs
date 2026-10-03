@@ -8,7 +8,7 @@ use std::time::SystemTime;
 
 use flint_agent::AgentEvent;
 use flint_agent::ApprovalDecision;
-use flint_agent::ApprovalMode;
+use flint_agent::ImageAttachment;
 use flint_agent::Op;
 use flint_agent::ReasoningEffort;
 use flint_agent::TurnEndReason;
@@ -37,6 +37,8 @@ impl FlintApp {
         let Some(ix) = self.session_index(uid) else {
             return;
         };
+        let started = Instant::now();
+        let event_count = events.len();
         let active = self.active;
         let mut finished = false;
         for event in events {
@@ -58,19 +60,33 @@ impl FlintApp {
                 _ => {}
             }
             let session = &mut self.sessions[ix];
-            session.log(Logged::Event(event.clone()));
+            if let AgentEvent::SessionStopped { history_saved } = &event {
+                session.engine_shutdown_verified = *history_saved;
+                session.history_save_failed |= !history_saved;
+            }
+            if matches!(&event, AgentEvent::Error(message)
+                if message.starts_with("Couldn't save engine history.")
+                    || message.starts_with("Session panicked"))
+            {
+                session.history_save_failed = true;
+            }
+            if let Err(err) = session.log(Logged::Event(event.clone())) {
+                self.store_error = Some(format!("Couldn't save session event: {err}"));
+                // Stop production at the first storage failure, retaining all
+                // queued records without allowing more turns to accumulate.
+                if !session.stopping
+                    && let Some(ops) = &session.ops
+                    && ops.try_send(Op::Shutdown).is_ok()
+                {
+                    session.stopping = true;
+                }
+            }
             session.note_timing(&event);
             if let AgentEvent::Error(message) = &event
                 && message.contains("doesn't accept reasoning_effort")
             {
                 self.effort_supported = false;
             }
-            let diff = match &event {
-                AgentEvent::ToolCallFinished {
-                    diff: Some(diff), ..
-                } => Some(diff.clone()),
-                _ => None,
-            };
             finished |= matches!(event, AgentEvent::TurnFinished { .. });
             match &event {
                 AgentEvent::SessionOptions(options) => {
@@ -83,21 +99,24 @@ impl FlintApp {
                 _ => {}
             }
             let session = &mut self.sessions[ix];
+            session.record_event_edit(&event);
             let change = session.view.fold(event, now);
             session.apply(change);
-            if let Some(diff) = diff {
-                session.record_edit(diff);
-            }
         }
         let session = &mut self.sessions[ix];
         session.touched = SystemTime::now();
         if finished {
-            session.settle_changes();
-            session.save_meta();
+            if let Err(err) = session.save_meta() {
+                self.store_error = Some(format!("Couldn't save session details: {err}"));
+            }
             if ix != active {
                 session.unread = true;
             }
         }
+        if finished {
+            self.settle_changes_async(uid, cx);
+        }
+        self.watch_persistence(uid, cx);
         if finished && crate::automation::dump_state(self) && self.options.exit_after_turn {
             // Leave time for the harness to take its final screenshot.
             cx.spawn(async move |_, cx| {
@@ -108,6 +127,96 @@ impl FlintApp {
         }
         self.ensure_ticker(cx);
         cx.notify();
+        crate::automation::record_event_batch(event_count, started);
+    }
+
+    pub(crate) fn settle_changes_async(&mut self, uid: u64, cx: &mut Context<Self>) {
+        let Some(ix) = self.session_index(uid) else {
+            return;
+        };
+        if self.sessions[ix].view.running {
+            return;
+        }
+        let Some(snapshot) = self.sessions[ix].changes_snapshot() else {
+            return;
+        };
+        let compute = cx
+            .background_executor()
+            .spawn(async move { snapshot.compute() });
+        self.sessions[ix].changes_task = Some(cx.spawn(async move |this, cx| {
+            let settled = compute.await;
+            this.update(cx, |app, cx| {
+                if let Some(ix) = app.session_index(uid) {
+                    let session = &mut app.sessions[ix];
+                    if session.apply_settled_changes(settled) {
+                        crate::automation::dump_state(app);
+                        cx.notify();
+                    }
+                }
+            })
+            .ok();
+        }));
+    }
+
+    fn watch_persistence(&mut self, uid: u64, cx: &mut Context<Self>) {
+        let Some(ix) = self.session_index(uid) else {
+            return;
+        };
+        let session = &mut self.sessions[ix];
+        if session.persistence_task.is_some() {
+            return;
+        }
+        let Some(writer) = &session.event_writer else {
+            return;
+        };
+        let failures = writer.failures();
+        let poll = self.options.engine_poll;
+        session.persistence_task = Some(cx.spawn(async move |this, cx| {
+            loop {
+                let error = if poll {
+                    match failures.try_recv() {
+                        Ok(error) => error,
+                        Err(async_channel::TryRecvError::Closed) => break,
+                        Err(async_channel::TryRecvError::Empty) => {
+                            cx.background_executor()
+                                .timer(Duration::from_millis(8))
+                                .await;
+                            continue;
+                        }
+                    }
+                } else {
+                    let Ok(error) = failures.recv().await else {
+                        break;
+                    };
+                    error
+                };
+                if this
+                    .update(cx, |app, cx| {
+                        if let Some(ix) = app.session_index(uid) {
+                            let session = &mut app.sessions[ix];
+                            if !session
+                                .event_writer
+                                .as_ref()
+                                .is_some_and(store::EventWriter::has_error)
+                            {
+                                return;
+                            }
+                            app.store_error = Some(format!("Couldn't save session event: {error}"));
+                            if !session.stopping
+                                && let Some(ops) = &session.ops
+                                && ops.try_send(Op::Shutdown).is_ok()
+                            {
+                                session.stopping = true;
+                            }
+                            cx.notify();
+                        }
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        }));
     }
 
     /// Starts the animation clock while any session is working; it stops
@@ -138,30 +247,70 @@ impl FlintApp {
     }
 
     pub fn submit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.permission_choice_open || self.pending_image_pastes > 0 {
+            return;
+        }
         if self.slash.is_some() {
             self.run_selected_slash(window, cx);
             return;
         }
         let text = self.composer.read(cx).value().trim().to_string();
-        if text.is_empty() {
+        if text.is_empty() && self.image_attachments.is_empty() {
             return;
         }
-        if let Some(kind) = crate::agents::parse_command(&text) {
+        if self.image_attachments.is_empty()
+            && let Some(kind) = crate::agents::parse_command(&text)
+        {
             self.composer
                 .update(cx, |state, cx| state.set_value("", window, cx));
             self.choose_agent(kind, window, cx);
             return;
         }
         let ix = self.active;
+        if self.sessions[ix].stopping {
+            return;
+        }
+        if !self.storage_ready(ix, cx) {
+            return;
+        }
+        if self
+            .store_error
+            .as_deref()
+            .is_some_and(|message| message.starts_with("Engine stopped."))
+        {
+            self.store_error = None;
+        }
         if self.sessions[ix].view.running && self.sessions[ix].ops.is_none() {
             return;
         }
+        let images: Vec<ImageAttachment> = match self
+            .image_attachments
+            .iter()
+            .map(|path| crate::image_attach::load(path))
+            .collect()
+        {
+            Ok(images) => images,
+            Err(error) => {
+                self.store_error = Some(error);
+                cx.notify();
+                return;
+            }
+        };
+        let shown = images.iter().fold(text.clone(), |mut shown, image| {
+            if !shown.is_empty() {
+                shown.push('\n');
+            }
+            shown.push_str(&format!("[Image: {}]", image.name));
+            shown
+        });
         self.composer
             .update(cx, |state, cx| state.set_value("", window, cx));
         self.mention = None;
         let attachments = std::mem::take(&mut self.attachments);
+        self.image_attachments.clear();
+        self.pasted_image_files.clear();
         let message = crate::mention::attach(&text, &self.sessions[ix].workspace, &attachments);
-        self.send_message(ix, text, message, cx);
+        self.send_message_with_images(ix, shown, message, images, cx);
     }
 
     /// Shows `text` in the transcript and sends `message` (the text plus any
@@ -173,6 +322,27 @@ impl FlintApp {
         message: String,
         cx: &mut Context<Self>,
     ) {
+        self.send_message_with_images(ix, text, message, Vec::new(), cx);
+    }
+
+    fn send_message_with_images(
+        &mut self,
+        ix: usize,
+        text: String,
+        message: String,
+        images: Vec<ImageAttachment>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.sessions[ix].stopping {
+            self.store_error = Some(
+                "The engine is stopping. Wait for it to finish saving before continuing.".into(),
+            );
+            cx.notify();
+            return;
+        }
+        if !self.storage_ready(ix, cx) {
+            return;
+        }
         let session = &mut self.sessions[ix];
         let change = session.view.push_user(text.clone());
         session.apply(change);
@@ -180,17 +350,40 @@ impl FlintApp {
         session.submitted_at = Some(Instant::now());
         session.first_token = None;
         session.first_text = None;
-        session.last_message = Some((text.clone(), message.clone()));
+        session.last_message = Some((text.clone(), message.clone(), images.clone()));
         if !self.options.ephemeral() && session.dir.is_none() {
             session.dir = Some(store::sessions_dir(&self.home).join(store::new_id()));
         }
+        // Save even when engine setup fails. A shown prompt must survive restart
+        // before any engine can act on it.
+        if let Err(err) = session
+            .log(Logged::User(text))
+            .and_then(|()| session.flush_records())
+            .and_then(|()| session.save_meta())
+        {
+            self.store_error = Some(format!("Couldn't save session message: {err}"));
+            if let Some(ops) = &session.ops
+                && ops.try_send(Op::Shutdown).is_ok()
+            {
+                session.stopping = true;
+            }
+            self.watch_persistence(self.sessions[ix].uid, cx);
+            cx.notify();
+            return;
+        }
+        self.watch_persistence(self.sessions[ix].uid, cx);
         match self.ensure_engine(ix, cx) {
             Ok(()) => {
-                let session = &mut self.sessions[ix];
-                session.log(Logged::User(text));
-                session.save_meta();
-                if let Some(ops) = &session.ops {
-                    ops.try_send(Op::UserMessage(message)).ok();
+                if let Some(ops) = &self.sessions[ix].ops {
+                    if images.is_empty() {
+                        ops.try_send(Op::UserMessage(message)).ok();
+                    } else {
+                        ops.try_send(Op::UserMessageWithImages {
+                            text: message,
+                            images,
+                        })
+                        .ok();
+                    }
                 }
             }
             Err(err) => self.apply_event(ix, AgentEvent::Error(format!("{err:#}")), cx),
@@ -198,10 +391,26 @@ impl FlintApp {
         cx.notify();
     }
 
+    fn storage_ready(&mut self, ix: usize, cx: &mut Context<Self>) -> bool {
+        if self.sessions[ix].storage_failed()
+            && let Err(error) = self.sessions[ix].flush_records()
+        {
+            self.store_error = Some(format!(
+                "Couldn't save session events: {error}. Fix storage before continuing."
+            ));
+            cx.notify();
+            return false;
+        }
+        true
+    }
+
     /// Re-sends the last message of the active session (error card "Retry").
     pub fn retry(&mut self, cx: &mut Context<Self>) {
         let ix = self.active;
-        let Some((text, message)) = self.sessions[ix].last_message.clone() else {
+        if self.sessions[ix].stopping {
+            return;
+        }
+        let Some((text, message, images)) = self.sessions[ix].last_message.clone() else {
             return;
         };
         if self.sessions[ix].view.running {
@@ -216,7 +425,7 @@ impl FlintApp {
             self.sessions[ix].ops = None;
             self.sessions[ix].agent_failed = false;
         }
-        self.send_message(ix, text, message, cx);
+        self.send_message_with_images(ix, text, message, images, cx);
     }
 
     /// Starts the engine for a session on its first message.
@@ -243,6 +452,10 @@ impl FlintApp {
         )?;
         config.session_dir = session.dir.clone();
         config.reasoning_effort = self.effort.filter(|_| self.effort_supported);
+        self.sessions[ix].native_model = Some(config.model.clone());
+        self.sessions[ix].native_approval = Some(config.approval);
+        self.sessions[ix].native_allow_all = false;
+        self.sessions[ix].engine_shutdown_verified = false;
         self.attach_engine(ix, flint_agent::spawn_session(config), cx);
         Ok(())
     }
@@ -258,11 +471,29 @@ impl FlintApp {
         cx: &mut Context<Self>,
     ) {
         let events = handle.events.clone();
+        let poll = self.options.engine_poll;
         let uid = self.sessions[ix].uid;
         let session = &mut self.sessions[ix];
         session.ops = Some(handle.ops);
         session.pump = Some(cx.spawn(async move |this, cx| {
-            while let Ok(first) = events.recv().await {
+            loop {
+                let first = if poll {
+                    match events.try_recv() {
+                        Ok(event) => event,
+                        Err(async_channel::TryRecvError::Closed) => break,
+                        Err(async_channel::TryRecvError::Empty) => {
+                            cx.background_executor()
+                                .timer(Duration::from_millis(8))
+                                .await;
+                            continue;
+                        }
+                    }
+                } else {
+                    let Ok(event) = events.recv().await else {
+                        break;
+                    };
+                    event
+                };
                 let mut batch = vec![first];
                 while let Ok(more) = events.try_recv() {
                     batch.push(more);
@@ -279,6 +510,46 @@ impl FlintApp {
                     .timer(Duration::from_millis(8))
                     .await;
             }
+            this.update(cx, |app, cx| {
+                if let Some(ix) = app.session_index(uid) {
+                    app.sessions[ix].ops = None;
+                    app.sessions[ix].pump = None;
+                    app.sessions[ix].native_model = None;
+                    app.sessions[ix].native_approval = None;
+                    app.sessions[ix].native_allow_all = false;
+                    if !app.sessions[ix].engine_shutdown_verified {
+                        app.apply_events(
+                            uid,
+                            vec![AgentEvent::SessionStopped {
+                                history_saved: false,
+                            }],
+                            app.now(),
+                            cx,
+                        );
+                    }
+                    if app.sessions[ix].view.running {
+                        app.apply_events(
+                            uid,
+                            vec![AgentEvent::TurnFinished {
+                                turn_id: app.sessions[ix].view.turn_id,
+                                reason: TurnEndReason::Interrupted,
+                            }],
+                            app.now(),
+                            cx,
+                        );
+                    }
+                    if app.sessions[ix].stopping {
+                        app.sessions[ix].stopping = false;
+                        if !app.sessions[ix].storage_failed() {
+                            app.store_error = Some(
+                                "Engine stopped. Archive this session or continue work.".into(),
+                            );
+                        }
+                    }
+                    cx.notify();
+                }
+            })
+            .ok();
         }));
     }
 
@@ -310,14 +581,31 @@ impl FlintApp {
         decision: ApprovalDecision,
         cx: &mut Context<Self>,
     ) {
+        // The broad action needs its own explicit confirmation, including
+        // when invoked via the A shortcut.
+        if decision == ApprovalDecision::ApproveAlways
+            && self.approval_confirm.as_deref() != Some(&call_id)
+        {
+            self.approval_confirm = Some(call_id);
+            cx.notify();
+            return;
+        }
+        self.approval_confirm = None;
+        self.approval_preview = None;
         let session = &mut self.sessions[self.active];
-        let change = session.view.resolve_approval(&call_id, decision);
+        if decision == ApprovalDecision::ApproveAlways
+            && session.agent == flint_agent::AgentKind::Flint
+        {
+            session.native_allow_all = true;
+        }
+        let change = session.view.resolve_approval_scoped(
+            &call_id,
+            decision,
+            session.agent == flint_agent::AgentKind::Flint,
+        );
         session.apply(change);
         if let Some(ops) = &session.ops {
             ops.try_send(Op::Approval { call_id, decision }).ok();
-        }
-        if decision == ApprovalDecision::ApproveAlways {
-            self.approval = ApprovalMode::Auto;
         }
         cx.notify();
     }

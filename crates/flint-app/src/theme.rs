@@ -44,7 +44,6 @@ pub struct Palette {
     pub diff_del_fg: Hsla,
     pub diff_hunk_fg: Hsla,
 }
-
 fn hex(value: u32) -> Hsla {
     rgb(value).into()
 }
@@ -67,7 +66,8 @@ pub static PALETTE: LazyLock<Palette> = LazyLock::new(|| Palette {
     border_strong: hex(0x2f2f37),
     text: hex(0xe7e7ea),
     text_muted: hex(0x9a9aa4),
-    text_subtle: hex(0x63636d),
+    // >= 4.5:1 even against the raised and message-bubble surfaces.
+    text_subtle: hex(0x8a8a95),
     accent: hex(0xff8a3d),
     accent_soft: hexa(0xff8a3d, 0.14),
     on_accent: hex(0x1a0d04),

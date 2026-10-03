@@ -7,11 +7,15 @@ with the measured value in `detail`), writes
 `report-<script>-<tag>.json`), and exits non-zero if any check failed.
 Raw evidence (screenshots, logs, state dumps, frame logs) goes under
 `blueprint-out/`, which is gitignored.
+Set `FLINT_BP_OUTPUT_DIR` to a fresh directory to keep an existing run's
+reports and screenshots untouched.
 
 Run the scripts **one after another, never in parallel** (they drive real
 windows and measure CPU). They never steal keyboard focus
 (`FLINT_BP_NO_ACTIVATE`) and never touch your real `~/.flint`
 (each launch gets a fresh `FLINT_HOME` under `blueprint-out/home/`).
+Standard launches seed an existing Ask configuration and use a disposable
+workspace when one is not supplied. First-run tests use genuinely empty homes.
 
 ```sh
 python3 tools/blueprint/sweep.py      # UI states: launch, size, pixels, memory, CPU
@@ -19,6 +23,9 @@ python3 tools/blueprint/interact.py   # headless UI tests, one check per test
 python3 tools/blueprint/live.py       # real turns against your configured model endpoint
 python3 tools/blueprint/perf.py       # cold start, memory, CPU, frame cost, size, TTFT
 ```
+
+For an offline usability pass, skip `live.py` and run `perf.py --no-live`.
+Never run provider-backed scripts with real credentials without permission.
 
 Common flags: `--bin PATH` tests an existing binary instead of building the
 release binary; `--tag before|after` labels the run (screenshots are
@@ -31,8 +38,8 @@ release binary; `--tag before|after` labels the run (screenshots are
 Launches each state through CLI flags: empty, running, done, expanded,
 changes, palette, approval, settings, @-mention picker, /-command menu, and
 1100×800, 1000×700 and 1920×1200 windows. Per state it checks: window within
-3 s of launch; the requested size (or, if larger than the display, clamped to
-it); a non-blank screenshot at the display's native scale (2x on Retina, 1x on
+3 s of launch; the requested size within one point of macOS rounding (or, if
+larger than the main display's usable area, clamped to it); a non-blank screenshot at the display's native scale (2x on Retina, 1x on
 1080p displays); the expected UI is showing (from the automation state dump);
 settled memory; CPU over 3 s (idle states must not repaint, animating states
 are measured while the demo animates, states with a background session only
@@ -43,6 +50,12 @@ pay for its spinner); and no panic on stderr. `winid.swift` is compiled into
 Runs `crates/flint-app/tests/blueprint_ui.rs` (gpui-kit `test-support`): the
 real `FlintApp` views in a headless window, driven by real key presses and
 clicks, with scripted engine events attached through `FlintApp::attach_engine`.
+Archive/undo tests also run the actual native engine against a loopback-only
+provider, with disposable workspaces, dummy credentials, shutdown acknowledgments,
+failed persistence, queued messages, restart recovery, and resumed history.
+Connection-test fixtures issue only `GET /models`. Keyboard tests cover Tab,
+Shift+Tab, full keydown/keyup activation, modal containment and focus restoration.
+These headless checks are not a physical-keyboard or VoiceOver compliance check.
 Each test is one promise (Enter sends, Shift+Tab cycles approval, ⌘K/⌘J/⌘N,
 Stop sends Interrupt, approval buttons and Y/A/N keys send the right `Op`,
 "Worked for" expands, Review opens the file, background sessions keep running,

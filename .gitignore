@@ -3,3 +3,6 @@ target/
 blueprint-out/
 __pycache__/
 *.pyc
+*.log
+STATE.md
+GATES.md

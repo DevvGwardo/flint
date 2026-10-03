@@ -92,6 +92,40 @@ impl Provider {
         model_limits_from_listing(&listing, &self.model)
     }
 
+    /// Exact model ids advertised by the configured endpoint.
+    pub async fn list_models(&self, cancel: &CancellationToken) -> Result<Vec<String>, String> {
+        let request = self
+            .http
+            .get(&self.models_url)
+            .bearer_auth(&self.api_key)
+            .timeout(Duration::from_secs(10))
+            .send();
+        let response = tokio::select! {
+            result = request => result.map_err(|_| "Cannot fetch the endpoint's model list.".to_string())?,
+            () = cancel.cancelled() => return Err("Interrupted.".to_string()),
+        };
+        if !response.status().is_success() {
+            return Err(format!("Model listing returned {}.", response.status()));
+        }
+        let listing: Value = tokio::select! {
+            result = response.json() => result.map_err(|_| "Invalid model listing.".to_string())?,
+            () = cancel.cancelled() => return Err("Interrupted.".to_string()),
+        };
+        let entries = listing
+            .get("data")
+            .and_then(Value::as_array)
+            .ok_or("Model listing has no data array.")?;
+        let mut ids: Vec<String> = entries
+            .iter()
+            .filter_map(|entry| entry.get("id").and_then(Value::as_str))
+            .filter(|id| !id.trim().is_empty())
+            .map(str::to_string)
+            .collect();
+        ids.sort();
+        ids.dedup();
+        Ok(ids)
+    }
+
     /// False once the endpoint rejected `reasoning_effort` in this session.
     pub fn effort_supported(&self) -> bool {
         !self.effort_rejected.load(Ordering::Relaxed)

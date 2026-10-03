@@ -11,6 +11,8 @@ use flint_agent::AgentKind;
 pub enum AcpAgent {
     ClaudeCode,
     Codex,
+    /// Factory Droid speaks ACP directly; it does not need an adapter.
+    Droid,
     /// Any other ACP agent: `command args…`.
     Custom {
         name: String,
@@ -25,6 +27,7 @@ impl AcpAgent {
         match self {
             AcpAgent::ClaudeCode => "Claude Code",
             AcpAgent::Codex => "Codex",
+            AcpAgent::Droid => "Droid",
             AcpAgent::Custom { name, .. } => name,
         }
     }
@@ -34,6 +37,7 @@ impl AcpAgent {
         match self {
             AcpAgent::ClaudeCode => "claude".to_string(),
             AcpAgent::Codex => "codex".to_string(),
+            AcpAgent::Droid => "droid".to_string(),
             AcpAgent::Custom { name, .. } => name.to_lowercase(),
         }
     }
@@ -43,6 +47,7 @@ impl AcpAgent {
         match self {
             AcpAgent::ClaudeCode => "claude_code".to_string(),
             AcpAgent::Codex => "codex".to_string(),
+            AcpAgent::Droid => "droid".to_string(),
             AcpAgent::Custom { name, .. } => format!("custom:{name}"),
         }
     }
@@ -53,6 +58,7 @@ impl AcpAgent {
             AgentKind::Flint => None,
             AgentKind::ClaudeCode => Some(AcpAgent::ClaudeCode),
             AgentKind::Codex => Some(AcpAgent::Codex),
+            AgentKind::Droid => Some(AcpAgent::Droid),
         }
     }
 
@@ -63,12 +69,15 @@ impl AcpAgent {
                 Some(("claude-agent-acp", "@agentclientprotocol/claude-agent-acp"))
             }
             AcpAgent::Codex => Some(("codex-acp", "@agentclientprotocol/codex-acp")),
-            AcpAgent::Custom { .. } => None,
+            AcpAgent::Droid | AcpAgent::Custom { .. } => None,
         }
     }
 
     /// How to install the adapter.
     pub fn install_hint(&self) -> String {
+        if *self == AcpAgent::Droid {
+            return "Install Droid with `npm i -g droid` or `brew install --cask droid`, then retry.".to_string();
+        }
         match self.adapter() {
             Some((_, package)) => format!("Install it with `npm i -g {package}`, then retry."),
             None => "Check the command in your settings, then retry.".to_string(),
@@ -82,14 +91,32 @@ impl AcpAgent {
                 "Run `claude` once in a terminal to log in, then retry.".to_string()
             }
             AcpAgent::Codex => "Run `codex login` in a terminal, then retry.".to_string(),
+            AcpAgent::Droid => "Run `droid` once in a terminal to log in, then retry.".to_string(),
             AcpAgent::Custom { name, .. } => format!("Log in to {name}, then retry."),
         }
     }
 
     /// The command to spawn: the adapter on PATH or in `~/.local/bin`, else
-    /// `npx -y <package>`.
+    /// `npx -y <package>`. Droid runs its native ACP server directly.
     pub fn command(&self, search_path: &str) -> Result<(PathBuf, Vec<String>), String> {
         match self {
+            AcpAgent::Droid => find("droid", search_path)
+                .map(|program| {
+                    (
+                        program,
+                        vec![
+                            "exec".to_string(),
+                            "--output-format".to_string(),
+                            "acp".to_string(),
+                        ],
+                    )
+                })
+                .ok_or_else(|| {
+                    format!(
+                        "Droid (`droid`) isn't installed or isn't on PATH. {}",
+                        self.install_hint()
+                    )
+                }),
             AcpAgent::Custom { command, args, .. } => {
                 let program = find(command, search_path).unwrap_or_else(|| PathBuf::from(command));
                 Ok((program, args.clone()))
@@ -131,14 +158,14 @@ impl AcpAgent {
         let api_key = matches!(name, "ANTHROPIC_API_KEY" | "ANTHROPIC_AUTH_TOKEN");
         match self {
             AcpAgent::ClaudeCode => session_marker || (api_key && !keep_api_key),
-            AcpAgent::Codex | AcpAgent::Custom { .. } => session_marker,
+            AcpAgent::Codex | AcpAgent::Droid | AcpAgent::Custom { .. } => session_marker,
         }
     }
 }
 
 /// PATH for the adapter. A GUI app launched from Finder gets a minimal PATH,
 /// so the usual install locations are added; adapters spawn `claude` /
-/// `codex` / `node` themselves.
+/// `codex` / `node` themselves; Droid also commonly lives in `~/.local/bin`.
 pub fn search_path(home: Option<&Path>) -> String {
     let mut dirs: Vec<String> = std::env::var("PATH")
         .unwrap_or_default()
@@ -256,6 +283,43 @@ mod tests {
             missing.contains("npm i -g @agentclientprotocol/claude-agent-acp"),
             "{missing}"
         );
+    }
+
+    #[test]
+    fn droid_uses_its_native_acp_server_without_an_adapter_or_npx() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().display().to_string();
+        std::fs::write(dir.path().join("npx"), "").expect("npx");
+        let missing = AcpAgent::Droid.command(&path).expect_err("missing Droid");
+        assert!(missing.contains("npm i -g droid"));
+        assert!(missing.contains("isn't installed"));
+        std::fs::write(dir.path().join("droid"), "").expect("Droid");
+        assert_eq!(
+            AcpAgent::Droid.command(&path),
+            Ok((
+                dir.path().join("droid"),
+                vec![
+                    "exec".to_string(),
+                    "--output-format".to_string(),
+                    "acp".to_string()
+                ],
+            ))
+        );
+        assert_eq!(AcpAgent::for_kind(AgentKind::Droid), Some(AcpAgent::Droid));
+        assert_eq!(AcpAgent::Droid.id(), "droid");
+        assert_eq!(AcpAgent::Droid.label_prefix(), "droid");
+        assert_eq!(
+            describe(
+                &AcpAgent::Droid,
+                "Authentication required",
+                Some(-32000),
+                ""
+            ),
+            "Droid isn't logged in (Authentication required). Run `droid` once in a terminal to log in, then retry."
+        );
+        assert!(AcpAgent::Droid.drops_env("CLAUDECODE", false));
+        assert!(!AcpAgent::Droid.drops_env("FACTORY_API_KEY", false));
+        assert!(!AcpAgent::Droid.drops_env("ANTHROPIC_API_KEY", false));
     }
 
     #[test]

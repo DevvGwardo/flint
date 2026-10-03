@@ -232,6 +232,10 @@ fn tool(ix: usize, call: &ToolCall, now: Duration, cx: &mut Context<FlintApp>) -
             Some(d) => ("Edited", d.path.clone()),
             None => ("Editing", call.summary.clone()),
         },
+        ToolKind::Other if call.name == flint_agent::tools::SPAWN_AGENT => (
+            if running { "Delegating" } else { "Delegated" },
+            call.summary.clone(),
+        ),
         ToolKind::Other => ("Called", call.name.clone()),
     };
     let verb = if running && call.kind == ToolKind::Command {
@@ -378,21 +382,48 @@ fn tool(ix: usize, call: &ToolCall, now: Duration, cx: &mut Context<FlintApp>) -
         .when(!live_tail.is_empty(), |col| {
             col.child(tree_child(output_lines(&live_tail, p.text_subtle)))
         })
+        .when_some(call.subagent.as_ref(), |col, child| {
+            let activity = if child.view.running {
+                match child.view.activity() {
+                    crate::turns::Activity::Thinking => " · thinking".to_string(),
+                    crate::turns::Activity::Writing => " · writing".to_string(),
+                    crate::turns::Activity::Running(command) => format!(" · running {command}"),
+                    crate::turns::Activity::Editing(path) => format!(" · editing {path}"),
+                    crate::turns::Activity::Reading(path) => format!(" · reading {path}"),
+                    crate::turns::Activity::Searching => " · searching".to_string(),
+                    crate::turns::Activity::Working => " · working".to_string(),
+                }
+            } else {
+                String::new()
+            };
+            col.child(tree_child(
+                ui::label(
+                    format!("{} · {}{activity}", child.model, child.session_id),
+                    size::XS,
+                    p.text_subtle,
+                )
+                .truncate(),
+            ))
+        })
         .when(call.expanded, |col| {
-            let block = match (diff, call.kind) {
-                (Some(d), _) => diff::render(&d.unified, usize::MAX).0.into_any_element(),
-                _ => div()
-                    .px(px(16.))
-                    .py(px(12.))
-                    .child(output_lines(
-                        &output
-                            .iter()
-                            .take(MAX_OUTPUT_LINES)
-                            .copied()
-                            .collect::<Vec<_>>(),
-                        p.text_muted,
-                    ))
-                    .into_any_element(),
+            let block = if let Some(child) = &call.subagent {
+                subagent_details(ix, child).into_any_element()
+            } else {
+                match (diff, call.kind) {
+                    (Some(d), _) => diff::render(&d.unified, usize::MAX).0.into_any_element(),
+                    _ => div()
+                        .px(px(16.))
+                        .py(px(12.))
+                        .child(output_lines(
+                            &output
+                                .iter()
+                                .take(MAX_OUTPUT_LINES)
+                                .copied()
+                                .collect::<Vec<_>>(),
+                            p.text_muted,
+                        ))
+                        .into_any_element(),
+                }
             };
             col.child(
                 div()
@@ -407,6 +438,80 @@ fn tool(ix: usize, call: &ToolCall, now: Duration, cx: &mut Context<FlintApp>) -
                     .child(block),
             )
         })
+}
+
+/// Read-only child transcript; approvals remain pinned in the parent.
+fn subagent_details(ix: usize, child: &crate::view_model::SubagentView) -> Div {
+    let p = palette();
+    let first = child.view.items.len().saturating_sub(80);
+    div()
+        .p(px(16.))
+        .flex()
+        .flex_col()
+        .gap(px(10.))
+        .when(first > 0, |col| {
+            col.child(ui::label(
+                "Earlier child activity omitted",
+                size::XS,
+                p.text_subtle,
+            ))
+        })
+        .children(
+            child
+                .view
+                .items
+                .iter()
+                .enumerate()
+                .skip(first)
+                .filter_map(|(n, item)| {
+                    let element = match item {
+                        Item::User(text) => ui::label(
+                            flint_agent::tools::head_tail(text, 2_000),
+                            size::SM,
+                            p.text_subtle,
+                        )
+                        .into_any_element(),
+                        Item::Assistant { text, streaming } => {
+                            TextView::markdown(format!("subagent-{ix}-{n}"), text.clone())
+                                .selectable(true)
+                                .stream_fade(*streaming)
+                                .into_any_element()
+                        }
+                        Item::Tool(call) => {
+                            let status = match &call.result {
+                                None => "Running",
+                                Some(result) if result.success => "Done",
+                                Some(_) => "Failed",
+                            };
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap(px(4.))
+                                .child(ui::mono(
+                                    format!("{status} · {} · {}", call.name, call.summary),
+                                    size::SM,
+                                    p.text_muted,
+                                ))
+                                .when(!call.output.is_empty(), |col| {
+                                    col.child(ui::mono(
+                                        flint_agent::tools::head_tail(&call.output, 2_000),
+                                        size::XS,
+                                        p.text_subtle,
+                                    ))
+                                })
+                                .into_any_element()
+                        }
+                        Item::Error(error) => {
+                            ui::label(error.clone(), size::SM, p.danger).into_any_element()
+                        }
+                        Item::Nudge { message, .. } => {
+                            ui::label(message.clone(), size::XS, p.text_subtle).into_any_element()
+                        }
+                        _ => return None,
+                    };
+                    Some(element)
+                }),
+        )
 }
 
 /// A command card's two small actions: bring the command's terminal up, and

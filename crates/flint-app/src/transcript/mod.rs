@@ -58,10 +58,14 @@ pub fn render_main(
                 .flex_shrink_0()
                 .flex()
                 .justify_center()
-                .px(px(32.))
+                .px(px(if window.viewport_size().width < px(600.) {
+                    16.
+                } else {
+                    32.
+                }))
                 .pb(px(22.))
                 .pt(px(8.))
-                .child(crate::composer::render(app, cx)),
+                .child(crate::composer::render(app, window, cx)),
         )
         .into_any_element()
 }
@@ -121,7 +125,7 @@ impl FlintApp {
             .w_full()
             .flex()
             .justify_center()
-            .px(px(40.))
+            .px(px(20.))
             .pt(px(if ix == 0 { 32. } else { top }))
             .when(last, |row| row.pb(px(32.)))
             .child(div().w_full().max_w(px(COLUMN_WIDTH)).child(body))

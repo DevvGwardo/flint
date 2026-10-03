@@ -3,6 +3,8 @@
 
 use flint_agent::ApprovalDecision;
 use gpui_kit::*;
+use std::path::Path;
+use std::path::PathBuf;
 
 use crate::app::FlintApp;
 use crate::mention;
@@ -106,6 +108,123 @@ impl FlintApp {
     pub fn remove_attachment(&mut self, path: &str, cx: &mut Context<Self>) {
         self.attachments.retain(|p| p != path);
         cx.notify();
+    }
+
+    /// Attach up to four images from any folder. The bytes are checked again
+    /// when sending, so a changed or missing file cannot silently disappear.
+    pub fn open_image_picker(&mut self, cx: &mut Context<Self>) {
+        let paths = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: true,
+            prompt: Some("Attach images (PNG, JPEG, GIF, WebP)".into()),
+        });
+        cx.spawn(async move |this, cx| {
+            let Ok(Ok(Some(paths))) = paths.await else {
+                return;
+            };
+            this.update(cx, |app, cx| {
+                for path in paths {
+                    app.add_image_attachment(path);
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    pub fn add_image_attachment(&mut self, path: PathBuf) {
+        if self.image_attachments.contains(&path) {
+            return;
+        }
+        if self.image_attachments.len() + self.pending_image_pastes
+            >= crate::image_attach::MAX_IMAGES
+        {
+            self.store_error = Some("Attach up to four images per message.".into());
+        } else if let Err(error) = crate::image_attach::load(&path) {
+            self.store_error = Some(error);
+        } else {
+            self.store_error = None;
+            self.image_attachments.push(path);
+        }
+    }
+
+    pub fn remove_image_attachment(&mut self, path: &Path, cx: &mut Context<Self>) {
+        self.image_attachments.retain(|p| p != path);
+        self.pasted_image_files.retain(|file| file.path() != path);
+        cx.notify();
+    }
+
+    /// Capture image paste before the textarea's text-only Paste action.
+    /// Returning false leaves text insertion and its undo/selection behavior intact.
+    pub(crate) fn paste_composer_image(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(clipboard) = cx.read_from_clipboard() else {
+            return false;
+        };
+        let mut handled = false;
+        for entry in clipboard.into_entries() {
+            match entry {
+                ClipboardEntry::Image(image) => {
+                    handled = true;
+                    if self.image_attachments.len() + self.pending_image_pastes
+                        >= crate::image_attach::MAX_IMAGES
+                    {
+                        self.store_error = Some("Attach up to four images per message.".into());
+                        continue;
+                    }
+                    self.pending_image_pastes += 1;
+                    let uid = self.session().uid;
+                    let workspace = self.session().workspace.clone();
+                    let prepare = cx
+                        .background_executor()
+                        .spawn(async move { crate::image_attach::clipboard_file(image) });
+                    cx.spawn(async move |this, cx| {
+                        let result = prepare.await;
+                        this.update(cx, |app, cx| {
+                            app.pending_image_pastes -= 1;
+                            // A delayed paste must not attach to a different session or workspace.
+                            if app.session().uid == uid && app.session().workspace == workspace {
+                                match result {
+                                    Ok(file) => {
+                                        let path = file.path().to_path_buf();
+                                        app.add_image_attachment(path.clone());
+                                        if app.image_attachments.contains(&path) {
+                                            app.pasted_image_files.push(file);
+                                        }
+                                    }
+                                    Err(error) => app.store_error = Some(error),
+                                }
+                            }
+                            cx.notify();
+                        })
+                        .ok();
+                    })
+                    .detach();
+                }
+                ClipboardEntry::ExternalPaths(paths)
+                    if !paths.paths().is_empty()
+                        && paths.paths().iter().all(|path| {
+                            path.extension().is_some_and(|ext| {
+                                matches!(
+                                    ext.to_string_lossy().to_ascii_lowercase().as_str(),
+                                    "png" | "jpg" | "jpeg" | "gif" | "webp"
+                                )
+                            })
+                        }) =>
+                {
+                    handled = true;
+                    for path in paths.paths() {
+                        self.add_image_attachment(path.clone());
+                    }
+                }
+                _ => {}
+            }
+        }
+        if handled {
+            cx.notify();
+        }
+        handled
     }
 
     pub fn run_slash(

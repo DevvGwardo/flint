@@ -9,6 +9,7 @@ use serde::ser::SerializeSeq;
 use serde_json::Value;
 
 use super::stream::RawToolCall;
+use crate::protocol::ImageAttachment;
 use crate::protocol::ReasoningEffort;
 
 /// One message of the conversation. Serializable so sessions can be saved.
@@ -17,6 +18,10 @@ use crate::protocol::ReasoningEffort;
 pub enum Message {
     System(String),
     User(String),
+    UserWithImages {
+        text: String,
+        images: Vec<ImageAttachment>,
+    },
     /// A harness nudge: sent as a user message, but not the start of a turn.
     Nudge(String),
     Assistant {
@@ -60,6 +65,18 @@ impl Serialize for WireMessage<'_> {
             Message::User(text) | Message::Nudge(text) => {
                 map.serialize_entry("role", "user")?;
                 map.serialize_entry("content", text)?;
+            }
+            Message::UserWithImages { text, images } => {
+                map.serialize_entry("role", "user")?;
+                let mut content = Vec::with_capacity(images.len() + 1);
+                content.push(serde_json::json!({"type": "text", "text": text}));
+                for image in images {
+                    content.push(serde_json::json!({
+                        "type": "image_url",
+                        "image_url": {"url": format!("data:{};base64,{}", image.mime_type, image.data)}
+                    }));
+                }
+                map.serialize_entry("content", &content)?;
             }
             Message::Assistant {
                 content,
@@ -154,6 +171,9 @@ impl ChatRequest<'_> {
                 .iter()
                 .map(|m| match m {
                     Message::System(t) | Message::User(t) | Message::Nudge(t) => t.len(),
+                    Message::UserWithImages { text, images } => {
+                        text.len() + images.iter().map(|i| i.data.len() + 100).sum::<usize>()
+                    }
                     Message::Assistant {
                         content,
                         reasoning,
@@ -168,4 +188,53 @@ impl ChatRequest<'_> {
 fn write_json<T: Serialize + ?Sized>(out: &mut Vec<u8>, value: &T) {
     // Serializing strings and maps into a Vec cannot fail.
     let _ = serde_json::to_writer(&mut *out, value);
+}
+
+#[cfg(test)]
+mod image_tests {
+    use super::*;
+
+    #[test]
+    fn serializes_user_images_as_multimodal_content() {
+        let image = ImageAttachment {
+            name: "shot.png".into(),
+            mime_type: "image/png".into(),
+            data: "aGVsbG8=".into(),
+        };
+        let message = Message::UserWithImages {
+            text: "What is this?".into(),
+            images: vec![image.clone()],
+        };
+        assert_eq!(
+            message.to_wire(false),
+            serde_json::json!({
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "What is this?"},
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,aGVsbG8="}}
+                ]
+            })
+        );
+        let body = ChatRequest {
+            messages: &[message],
+            replay_reasoning_from: 0,
+            tools_json: "",
+            effort: None,
+        }
+        .body("model");
+        let request: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            request["messages"][0]["content"][1]["image_url"]["url"],
+            "data:image/png;base64,aGVsbG8="
+        );
+        let restored: Message = serde_json::from_str(
+            &serde_json::to_string(&Message::UserWithImages {
+                text: "look".into(),
+                images: vec![image],
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(matches!(restored, Message::UserWithImages { images, .. } if images.len() == 1));
+    }
 }

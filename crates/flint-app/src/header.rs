@@ -14,19 +14,19 @@ use crate::ui;
 
 pub const HEADER_HEIGHT: f32 = 54.;
 
-pub fn render(
-    app: &FlintApp,
-    _window: &mut Window,
-    cx: &mut Context<FlintApp>,
-) -> impl IntoElement {
+pub fn render(app: &FlintApp, window: &mut Window, cx: &mut Context<FlintApp>) -> impl IntoElement {
     let p = palette();
     let session = app.session();
     let has_items = !session.view.items.is_empty();
     let changes = session.view.changes.len();
+    let compact = app.chat_width(f32::from(window.viewport_size().width)) < 640.;
 
     let icon_button = |id: &'static str, icon: IconName, tip: &'static str, active: bool| {
         div()
             .id(id)
+            .aria_label(tip)
+            .tab_index(0)
+            .focus_visible(|style| style.border_1().border_color(p.accent))
             .size(px(34.))
             .rounded(px(9.))
             .flex()
@@ -41,6 +41,10 @@ pub fn render(
                 17.,
                 if active { p.text } else { p.text_muted },
             ))
+            .test_support()
+            .when(id == "changes", |button| {
+                button.track_focus(&app.changes_focus)
+            })
     };
 
     // The title takes every pixel the actions leave and only then truncates;
@@ -66,12 +70,14 @@ pub fn render(
                     .test_support(),
             )
         })
-        .child(div().flex_shrink_0().child(ui::label(
-            folder_name(&session.workspace),
-            size::SM,
-            p.text_subtle,
-        )))
-        .when_some(app.branch(), |row, branch| {
+        .when(!compact, |row| {
+            row.child(div().flex_shrink_0().child(ui::label(
+                folder_name(&session.workspace),
+                size::SM,
+                p.text_subtle,
+            )))
+        })
+        .when_some((!compact).then(|| app.branch()).flatten(), |row, branch| {
             row.child(
                 div()
                     .flex_shrink_0()
@@ -87,19 +93,23 @@ pub fn render(
         .flex()
         .items_center()
         .gap(px(2.))
-        .child(
-            icon_button("reveal", IconName::FolderOpen, "Open in Finder  ⌘⇧R", false)
-                .on_click(cx.listener(|this, _, _, _| this.reveal_workspace())),
-        )
-        .child(
-            icon_button(
-                "terminal",
-                IconName::SquareTerminal,
-                "Terminal  ⌃`",
-                app.terminal.open,
+        .when(!compact, |actions| {
+            actions.child(
+                icon_button("reveal", IconName::FolderOpen, "Open in Finder  ⌘⇧R", false)
+                    .on_click(cx.listener(|this, _, _, _| this.reveal_workspace())),
             )
-            .on_click(cx.listener(|this, _, window, cx| this.toggle_terminal(window, cx))),
-        )
+        })
+        .when(!compact, |actions| {
+            actions.child(
+                icon_button(
+                    "header-terminal",
+                    IconName::SquareTerminal,
+                    "Terminal  ⌃`",
+                    app.terminal.open,
+                )
+                .on_click(cx.listener(|this, _, window, cx| this.toggle_terminal(window, cx))),
+            )
+        })
         .child(
             div()
                 .relative()
@@ -133,12 +143,34 @@ pub fn render(
         .h(px(HEADER_HEIGHT))
         .flex_shrink_0()
         .px(px(20.))
-        // Leave room for the traffic lights when the sidebar is hidden.
-        .when(!app.sidebar_visible, |bar| bar.pl(px(88.)))
         .flex()
         .items_center()
         .justify_between()
         .gap(px(12.))
+        .child(crate::docking::handle(crate::docking::Panel::Chat, cx))
+        .when(!app.sidebar_visible, |bar| {
+            bar.child(
+                div()
+                    .id("sessions-control")
+                    .aria_label("Open sessions")
+                    .tab_index(0)
+                    .focus_visible(|style| style.border_1().border_color(p.accent))
+                    .px(px(9.))
+                    .h(px(34.))
+                    .rounded(px(8.))
+                    .cursor_pointer()
+                    .flex()
+                    .items_center()
+                    .gap(px(5.))
+                    .hover(|style| style.bg(p.raised))
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.toggle_session_drawer(window, cx);
+                    }))
+                    .child(ui::icon(IconName::PanelLeft, 16., p.text_muted))
+                    .child(ui::label("Sessions", size::SM, p.text))
+                    .test_support(),
+            )
+        })
         .child(title)
         .child(actions);
     app.drag_region(bar, cx).test_support()

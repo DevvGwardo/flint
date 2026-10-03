@@ -171,6 +171,7 @@ impl SessionView {
     /// Replaces a file's stats with its combined diff (original -> current).
     pub fn set_combined(&mut self, path: &str, unified: String, added: usize, removed: usize) {
         if let Some(file) = self.changes.iter_mut().find(|f| f.path == path) {
+            self.changes_revision = self.changes_revision.wrapping_add(1);
             file.combined = Some(unified);
             file.added = added;
             file.removed = removed;
@@ -218,7 +219,10 @@ impl SessionView {
 
     /// Commands still running, oldest first (the composer's task tray).
     pub fn running_commands(&self) -> Vec<&ToolCall> {
-        self.items
+        let Some(turn) = self.current_turn.and_then(|ix| self.turns.get(ix)) else {
+            return Vec::new();
+        };
+        self.items[turn.first..]
             .iter()
             .filter_map(|item| match item {
                 Item::Tool(call) if call.kind == ToolKind::Command && call.result.is_none() => {

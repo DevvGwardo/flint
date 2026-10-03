@@ -26,6 +26,15 @@ static START: OnceLock<Instant> = OnceLock::new();
 static FRAMES: Mutex<Vec<(f64, f64)>> = Mutex::new(Vec::new());
 static FIRST_FRAME: OnceLock<()> = OnceLock::new();
 static STREAM_RATE: Mutex<f64> = Mutex::new(0.);
+static EVENT_BATCHES: Mutex<Vec<(usize, f64)>> = Mutex::new(Vec::new());
+
+pub fn record_event_batch(count: usize, started: Instant) {
+    if frames_enabled()
+        && let Ok(mut batches) = EVENT_BATCHES.lock()
+    {
+        batches.push((count, started.elapsed().as_secs_f64() * 1000.));
+    }
+}
 
 /// The delta rate a stream test actually achieved (written with the frames).
 pub fn note_stream_rate(per_second: f64) {
@@ -85,7 +94,11 @@ pub fn write_frames(label: &str) {
     };
     let frames = FRAMES.lock().map(|f| f.clone()).unwrap_or_default();
     let rate = STREAM_RATE.lock().map(|r| *r).unwrap_or_default();
-    let body = json!({ "label": label, "frames": frames, "deltas_per_second": rate });
+    let batches = EVENT_BATCHES.lock().map(|b| b.clone()).unwrap_or_default();
+    let body = json!({
+        "label": label, "frames": frames, "deltas_per_second": rate,
+        "event_batches": batches,
+    });
     std::fs::write(path, body.to_string()).ok();
 }
 

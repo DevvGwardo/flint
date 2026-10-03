@@ -84,6 +84,6 @@ async fn saver_writes_the_latest_snapshot() {
     for turn in 1..=50 {
         saver.save(snapshot(turn, &sample()));
     }
-    saver.flush().await;
+    saver.flush().await.expect("flush");
     assert_eq!(load(dir.path()).expect("load").map(|r| r.turn_id), Some(50));
 }

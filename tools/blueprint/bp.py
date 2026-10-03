@@ -19,7 +19,7 @@ import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
-OUT = ROOT / "blueprint-out"
+OUT = Path(os.environ.get("FLINT_BP_OUTPUT_DIR", ROOT / "blueprint-out"))
 DATA = OUT / "data"
 UI = OUT / "ui"
 LOGS = OUT / "logs"
@@ -104,8 +104,16 @@ class App:
         # Never steal keyboard focus from the person at the machine, and never
         # touch their real settings or saved sessions.
         full_env.setdefault("FLINT_BP_NO_ACTIVATE", "1")
-        full_env.setdefault("FLINT_HOME", str(fresh_dir(OUT / "home" / f"{time.time_ns()}")))
+        full_env["FLINT_HOME"] = str(fresh_dir(OUT / "home" / f"{time.time_ns()}"))
         full_env.update(env or {})
+        # Standard sweeps exercise an existing Ask installation. First-run
+        # behavior is tested separately with a genuinely empty isolated home.
+        config = Path(full_env["FLINT_HOME"]) / "config.toml"
+        if not config.exists():
+            config.parent.mkdir(parents=True, exist_ok=True)
+            config.write_text('approval = "ask"\npermission_choice_pending = false\n')
+        if "--workspace" not in args:
+            args = [*args, "--workspace", str(fresh_dir(OUT / "workspace" / f"{time.time_ns()}"))]
         self.launched = time.time()
         self.proc = subprocess.Popen(
             [str(binary), *args], stdout=subprocess.DEVNULL, stderr=self.log, env=full_env
@@ -173,12 +181,9 @@ class App:
 
 
 def main_screen() -> tuple[int, int]:
-    """Main display size in points."""
-    import re
-
-    out = subprocess.run(["system_profiler", "SPDisplaysDataType"], capture_output=True, text=True).stdout
-    match = re.search(r"UI Looks like: (\d+) x (\d+)", out)
-    return (int(match[1]), int(match[2])) if match else (1920, 1080)
+    """Usable size of the display on which centered windows open, in points."""
+    out = subprocess.run([str(winid_tool()), "--screen"], capture_output=True, text=True, check=True).stdout.split()
+    return int(out[2]), int(out[3])
 
 
 def parse_cpu_time(text: str) -> float:

@@ -1,5 +1,4 @@
-//! The empty state: the flint mark, a large two-line greeting, the composer
-//! centered on the page, and suggestion chips, over a faint ember glow.
+//! Project-first welcome workspace with a composer and suggested tasks.
 
 use gpui_kit::assets::IconName;
 use gpui_kit::prelude::FluentBuilder as _;
@@ -7,6 +6,7 @@ use gpui_kit::*;
 
 use crate::app::FlintApp;
 use crate::session::folder_name;
+use crate::settings::KeyStatus;
 use crate::theme::palette;
 use crate::theme::size;
 use crate::ui;
@@ -21,17 +21,49 @@ const SUGGESTIONS: &[(&str, IconName)] = &[
 pub fn render(app: &FlintApp, window: &mut Window, cx: &mut Context<FlintApp>) -> impl IntoElement {
     let p = palette();
     let workspace = folder_name(&app.session().workspace);
-    let composer = crate::composer::render(app, cx);
+    let readiness = {
+        let agent = app.session().agent;
+        let credential = if agent == flint_agent::AgentKind::Flint {
+            match app
+                .settings
+                .key_status(app.key_path.as_deref(), &app.key_sources)
+            {
+                KeyStatus::Found(source) => format!("Credential: available ({source})"),
+                KeyStatus::Missing(source) => {
+                    format!("Credential: missing; set {source} or open Settings")
+                }
+            }
+        } else {
+            "Credential: managed by the ACP agent; checked on start".to_string()
+        };
+        let permission = if agent == flint_agent::AgentKind::Flint {
+            match app.approval {
+                flint_agent::ApprovalMode::Auto => "Native auto-run: selected for new engines",
+                flint_agent::ApprovalMode::AskForChanges => {
+                    "Native permission: ask before commands and edits"
+                }
+            }
+        } else {
+            "Permission: controlled by the ACP agent's mode"
+        };
+        (credential, permission)
+    };
+    let composer = crate::composer::render(app, window, cx);
     let chips = SUGGESTIONS.iter().enumerate().map(|(ix, (text, icon))| {
         let text = *text;
         div()
             .id(("suggestion", ix))
+            .aria_label(text)
+            .tab_index(0)
+            .focus_visible(|style| style.border_color(p.accent))
+            .max_w_full()
+            .min_w_0()
             .h(px(40.))
             .px(px(16.))
             .flex()
             .items_center()
             .gap(px(9.))
-            .rounded_full()
+            .rounded(px(8.))
             .border_1()
             .border_color(p.border)
             .cursor_pointer()
@@ -43,7 +75,7 @@ pub fn render(app: &FlintApp, window: &mut Window, cx: &mut Context<FlintApp>) -
                 });
             }))
             .child(ui::icon(*icon, 15., p.text_subtle))
-            .child(ui::label(text, size::BASE - 1., p.text_muted))
+            .child(ui::label(text, size::BASE - 1., p.text_muted).truncate())
     });
 
     // The tip floats over the top-right corner, clear of the centered hero
@@ -53,8 +85,14 @@ pub fn render(app: &FlintApp, window: &mut Window, cx: &mut Context<FlintApp>) -
     let show_logo = window.viewport_size().height >= px(720.);
     let folder_chip = div()
         .id("welcome-folder")
+        .aria_label("Choose workspace")
+        .tab_index(0)
+        .focus_visible(|style| style.border_color(p.accent))
+        .max_w_full()
+        .min_w_0()
         .px(px(12.))
-        .rounded(px(12.))
+        .h(px(38.))
+        .rounded(px(8.))
         .flex()
         .items_center()
         .gap(px(6.))
@@ -63,9 +101,13 @@ pub fn render(app: &FlintApp, window: &mut Window, cx: &mut Context<FlintApp>) -
         .border_color(p.border_strong)
         .hover(|style| style.bg(p.surface))
         .on_click(cx.listener(|this, _, _, cx| this.toggle_project_menu(cx)))
-        .child(ui::icon(IconName::Folder, 22., p.accent))
-        .child(workspace.clone())
-        .child(ui::icon(IconName::ChevronDown, 18., p.text_subtle))
+        .child(ui::icon(IconName::Folder, 16., p.accent))
+        .child(
+            ui::label(workspace.clone(), size::BASE, p.text)
+                .min_w_0()
+                .truncate(),
+        )
+        .child(ui::icon(IconName::ChevronDown, 14., p.text_subtle))
         .test_support();
     let notice = (!app.settings.tip_dismissed && roomy).then(|| {
         div()
@@ -92,8 +134,8 @@ pub fn render(app: &FlintApp, window: &mut Window, cx: &mut Context<FlintApp>) -
                     .gap(px(6.))
                     .child(ui::label("flint checks its own work", size::BASE, p.text))
                     .child(ui::label(
-                        "Before it finishes, it re-runs your tests and stops itself from looping. \
-                         Model, endpoint and safety options live in Settings.",
+                        "Flint's native agent can nudge unverified edits. A check is only reported \
+                         when the agent actually runs it. Other agents use their own workflows.",
                         size::SM,
                         p.text_subtle,
                     ))
@@ -129,27 +171,35 @@ pub fn render(app: &FlintApp, window: &mut Window, cx: &mut Context<FlintApp>) -
     });
 
     div()
+        .id("welcome-content")
         .relative()
         .size_full()
-        .bg(linear_gradient(
-            180.,
-            linear_color_stop(hsla(22. / 360., 0.5, 0.12, 1.), 0.),
-            linear_color_stop(p.bg, 0.55),
-        ))
+        .min_h_0()
+        .overflow_y_scroll()
+        .bg(p.bg)
         .flex()
         .flex_col()
         .items_center()
-        .justify_center()
-        .px(px(32.))
-        .pb(px(60.))
+        .when(window.viewport_size().height >= px(700.), |col| {
+            col.justify_center()
+        })
+        .when(window.viewport_size().height < px(700.), |col| {
+            col.justify_start()
+        })
+        .px(px(if window.viewport_size().width < px(600.) {
+            16.
+        } else {
+            32.
+        }))
+        .py(px(24.))
         .child(
             div()
                 .w_full()
                 .max_w(px(760.))
                 .flex()
                 .flex_col()
-                .items_center()
-                .gap(px(32.))
+                .items_start()
+                .gap(px(16.))
                 .when(show_logo, |hero| {
                     hero.child(
                         div()
@@ -168,35 +218,52 @@ pub fn render(app: &FlintApp, window: &mut Window, cx: &mut Context<FlintApp>) -
                     div()
                         .flex()
                         .flex_col()
-                        .items_center()
-                        .gap(px(2.))
+                        .items_start()
+                        .w_full()
+                        .gap(px(12.))
                         .child(
                             div()
-                                .text_size(px(34.))
-                                .line_height(px(44.))
-                                .text_color(p.text_subtle)
-                                .child("Ready when you are."),
+                                .text_size(px(24.))
+                                .line_height(px(30.))
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(p.text)
+                                .child("New session"),
                         )
                         // The folder is a chip: click it to pick another project.
-                        .child(
-                            div()
-                                .flex()
-                                .items_center()
-                                .gap(px(10.))
-                                .text_size(px(34.))
-                                .line_height(px(44.))
-                                .font_weight(FontWeight::MEDIUM)
-                                .child("What should we build in")
-                                .child(folder_chip)
-                                .child("?"),
-                        ),
+                        .child(div().w_full().min_w_0().child(folder_chip)),
                 )
                 .child(composer)
                 .child(
                     div()
+                        .id("welcome-readiness")
+                        .flex()
+                        .flex_col()
+                        .w_full()
+                        .items_start()
+                        .gap(px(3.))
+                        .child(ui::label(
+                            format!(
+                                "Workspace: {} · Agent: {}",
+                                if app.session().workspace.is_dir() {
+                                    workspace.clone()
+                                } else {
+                                    "folder unavailable; choose a folder".into()
+                                },
+                                app.session().agent.label(),
+                            ),
+                            size::SM,
+                            p.text_muted,
+                        ))
+                        .child(ui::label(readiness.0, size::SM, p.text_muted))
+                        .child(ui::label(readiness.1, size::SM, p.text_muted))
+                        .test_support(),
+                )
+                .child(
+                    div()
                         .flex()
                         .flex_wrap()
-                        .justify_center()
+                        .w_full()
+                        .justify_start()
                         .gap(px(10.))
                         .children(chips),
                 ),

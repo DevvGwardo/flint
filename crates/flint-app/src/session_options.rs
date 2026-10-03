@@ -64,9 +64,18 @@ pub fn toggled_value(option: &SessionOption) -> Option<String> {
 /// them (they stay selectable from the menu).
 pub fn is_permissive(value: &str) -> bool {
     let value = value.to_lowercase();
-    ["bypass", "full-access", "full_access", "dontask", "yolo"]
-        .iter()
-        .any(|word| value.contains(word))
+    [
+        "bypass",
+        "full-access",
+        "full_access",
+        "dontask",
+        "yolo",
+        "auto-high",
+        "auto_high",
+        "skip-permissions",
+    ]
+    .iter()
+    .any(|word| value.contains(word))
 }
 
 /// The next mode for Shift+Tab, skipping permissive modes.
@@ -120,6 +129,9 @@ impl FlintApp {
             MenuTarget::More => 0,
         };
         self.option_menu = Some(OptionMenu { target, selected });
+        self.option_menu_scroll.set_offset(Point::default());
+        self.option_menu_scroll.scroll_to_item(selected);
+        self.option_menu_needs_scroll.set(true);
         self.agent_menu = false;
         self.slash = None;
         self.mention = None;
@@ -234,6 +246,9 @@ impl FlintApp {
             }
             "escape" => self.option_menu = None,
             _ => return false,
+        }
+        if let Some(menu) = &self.option_menu {
+            self.option_menu_scroll.scroll_to_item(menu.selected);
         }
         cx.notify();
         true

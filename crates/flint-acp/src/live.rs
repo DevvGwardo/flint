@@ -9,6 +9,7 @@ use std::sync::Arc;
 use agent_client_protocol::ConnectionTo;
 use agent_client_protocol::schema::v1::CancelNotification;
 use agent_client_protocol::schema::v1::ContentBlock;
+use agent_client_protocol::schema::v1::ImageContent;
 use agent_client_protocol::schema::v1::PromptRequest;
 use agent_client_protocol::schema::v1::SessionId;
 use agent_client_protocol::schema::v1::SetSessionConfigOptionRequest;
@@ -16,6 +17,7 @@ use agent_client_protocol::schema::v1::StopReason;
 use agent_client_protocol::schema::v1::TextContent;
 use async_channel::Receiver;
 use flint_agent::AgentEvent;
+use flint_agent::ImageAttachment;
 use flint_agent::Op;
 use flint_agent::TurnEndReason;
 
@@ -36,7 +38,7 @@ pub(crate) struct Live {
 
 /// What an op means for the loop.
 enum Next {
-    Prompt(String),
+    Prompt(String, Vec<ImageAttachment>),
     Continue,
     Stop,
 }
@@ -117,7 +119,8 @@ impl Live {
     /// Handles one op between turns.
     async fn idle_op(&mut self, op: Option<Op>) -> Next {
         match op {
-            Some(Op::UserMessage(text)) => Next::Prompt(text),
+            Some(Op::UserMessage(text)) => Next::Prompt(text, Vec::new()),
+            Some(Op::UserMessageWithImages { text, images }) => Next::Prompt(text, images),
             Some(Op::Approval { call_id, decision }) => {
                 self.shared.resolve(&call_id, decision);
                 Next::Continue
@@ -132,17 +135,17 @@ impl Live {
     }
 
     pub async fn run(mut self, ops: Receiver<Op>) {
-        let mut queue: VecDeque<String> = VecDeque::new();
+        let mut queue: VecDeque<(String, Vec<ImageAttachment>)> = VecDeque::new();
         loop {
-            let text = match queue.pop_front() {
-                Some(text) => text,
+            let (text, images) = match queue.pop_front() {
+                Some(prompt) => prompt,
                 None => match self.idle_op(ops.recv().await.ok()).await {
-                    Next::Prompt(text) => text,
+                    Next::Prompt(text, images) => (text, images),
                     Next::Continue => continue,
                     Next::Stop => return,
                 },
             };
-            if !self.turn(text, &ops, &mut queue).await {
+            if !self.turn(text, images, &ops, &mut queue).await {
                 return;
             }
         }
@@ -152,8 +155,9 @@ impl Live {
     async fn turn(
         &mut self,
         text: String,
+        images: Vec<ImageAttachment>,
         ops: &Receiver<Op>,
-        queue: &mut VecDeque<String>,
+        queue: &mut VecDeque<(String, Vec<ImageAttachment>)>,
     ) -> bool {
         let shared = Arc::clone(&self.shared);
         let opening = shared.with_mapper(Mapper::start_turn).unwrap_or_default();
@@ -162,11 +166,14 @@ impl Live {
         self.save();
 
         let cx = self.cx.clone();
+        let mut blocks = vec![ContentBlock::Text(TextContent::new(text))];
+        blocks.extend(
+            images
+                .into_iter()
+                .map(|image| ContentBlock::Image(ImageContent::new(image.data, image.mime_type))),
+        );
         let prompt = cx
-            .send_request(PromptRequest::new(
-                self.session_id.clone(),
-                vec![ContentBlock::Text(TextContent::new(text))],
-            ))
+            .send_request(PromptRequest::new(self.session_id.clone(), blocks))
             .block_task();
         futures::pin_mut!(prompt);
         let mut cancelled = false;
@@ -175,7 +182,8 @@ impl Live {
             tokio::select! {
                 result = &mut prompt => break result,
                 op = ops.recv() => match op {
-                    Ok(Op::UserMessage(text)) => queue.push_back(text),
+                    Ok(Op::UserMessage(text)) => queue.push_back((text, Vec::new())),
+                    Ok(Op::UserMessageWithImages { text, images }) => queue.push_back((text, images)),
                     Ok(Op::Approval { call_id, decision }) => shared.resolve(&call_id, decision),
                     Ok(Op::SetSessionOption { id, value }) => self.set_option(&id, &value).await,
                     Ok(Op::SetReasoningEffort(_)) => {}

@@ -26,6 +26,27 @@ fn file_name_matches_rank_first() {
 }
 
 #[test]
+fn limited_search_matches_full_ranking() {
+    let files: Vec<String> = (0..MAX_INDEXED_FILES)
+        .rev()
+        .map(|n| format!("src/module_{n:05}/main.rs"))
+        .collect();
+    for query in ["", "main", "module_1", "zzz"] {
+        let mut expected: Vec<_> = files
+            .iter()
+            .filter_map(|path| score(query, path).map(|score| (score, path)))
+            .collect();
+        expected.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(b.1)));
+        let expected: Vec<_> = expected
+            .into_iter()
+            .take(MAX_RESULTS)
+            .map(|(_, path)| path)
+            .collect();
+        assert_eq!(search(&files, query), expected);
+    }
+}
+
+#[test]
 fn active_query_needs_a_word_start() {
     assert_eq!(active_query("look at @src/ma"), Some("src/ma"));
     assert_eq!(active_query("@"), Some(""));

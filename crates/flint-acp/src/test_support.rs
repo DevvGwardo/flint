@@ -168,6 +168,14 @@ pub(crate) fn start(approval: ApprovalMode) -> (Harness, Fake) {
 
 /// Like [`start`], with a session directory (relative to the temp dir).
 pub(crate) fn start_with(approval: ApprovalMode, session_dir: Option<&str>) -> (Harness, Fake) {
+    start_agent(AcpAgent::ClaudeCode, approval, session_dir)
+}
+
+pub(crate) fn start_agent(
+    agent: AcpAgent,
+    approval: ApprovalMode,
+    session_dir: Option<&str>,
+) -> (Harness, Fake) {
     let dir = tempfile::tempdir().expect("tempdir");
     let workspace = dir.path().canonicalize().expect("canonical");
     let (client_side, agent_side) = tokio::io::duplex(1 << 20);
@@ -177,7 +185,7 @@ pub(crate) fn start_with(approval: ApprovalMode, session_dir: Option<&str>) -> (
     let (events_tx, events_rx) = async_channel::unbounded();
     let stderr = Arc::new(Mutex::new(String::new()));
     let context = RunContext {
-        agent: AcpAgent::ClaudeCode,
+        agent,
         workspace: workspace.clone(),
         session_dir: session_dir.map(|d| workspace.join(d)),
         approval,

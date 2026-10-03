@@ -54,7 +54,12 @@ fn item_row(id: impl Into<ElementId>, selected: bool) -> Stateful<Div> {
         .when(!selected, |row| row.hover(|s| s.bg(hsla(0., 0., 1., 0.04))))
 }
 
-pub fn render(app: &FlintApp, cx: &mut Context<FlintApp>) -> Option<AnyElement> {
+pub fn render(
+    app: &FlintApp,
+    max_height: f32,
+    window: &Window,
+    cx: &mut Context<FlintApp>,
+) -> Option<AnyElement> {
     let p = palette();
     if let Some(menu) = &app.mention {
         let rows = menu.results.iter().enumerate().map(|(n, path)| {
@@ -99,7 +104,7 @@ pub fn render(app: &FlintApp, cx: &mut Context<FlintApp>) -> Option<AnyElement> 
                 .into_any_element(),
         );
     }
-    if let Some(menu) = crate::option_chips::menu(app, cx) {
+    if let Some(menu) = crate::option_chips::menu(app, max_height, window, cx) {
         return Some(menu);
     }
     if app.agent_menu {
@@ -198,6 +203,7 @@ pub fn render(app: &FlintApp, cx: &mut Context<FlintApp>) -> Option<AnyElement> 
                 )
                 .child(line("⏎ / ⇧⏎", "Send / new line"))
                 .child(line("@", "Attach a workspace file"))
+                .child(line("+", "Attach an image from any folder"))
                 .child(line(
                     "/",
                     "Commands: new, clear, agent, model, effort, mode, approval, review",

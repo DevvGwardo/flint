@@ -6,6 +6,8 @@
 //! [`flint_agent::AgentEvent`]s without knowing which agent runs. The agent
 //! runs its own loop, so flint's harness nudges don't apply here.
 
+#[cfg(test)]
+mod droid_tests;
 mod files;
 mod launch;
 mod live;

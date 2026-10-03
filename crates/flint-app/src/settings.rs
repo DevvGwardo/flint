@@ -16,6 +16,8 @@ use serde::Serialize;
 #[serde(default)]
 pub struct Settings {
     pub model: String,
+    /// Empty inherits the parent model. Uses the same endpoint and key.
+    pub subagent_model: String,
     pub base_url: String,
     /// Name of an environment variable holding the API key. Empty falls back
     /// to `FLINT_API_KEY`, then `OPENAI_API_KEY`.
@@ -24,6 +26,8 @@ pub struct Settings {
     pub api_key_file: String,
     /// `auto` or `ask`.
     pub approval: String,
+    /// Missing on existing installations. Only a genuinely fresh home sets true.
+    pub permission_choice_pending: Option<bool>,
     /// `low`, `medium`, `high`, or empty for the provider default.
     pub effort: String,
     pub theme: String,
@@ -39,10 +43,14 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             model: DEFAULT_MODEL.to_string(),
+            subagent_model: String::new(),
             base_url: DEFAULT_BASE_URL.to_string(),
             api_key_env: String::new(),
             api_key_file: String::new(),
-            approval: "auto".to_string(),
+            // New installs start in ask mode. Existing config files retain
+            // their saved choice, including auto-run.
+            approval: "ask".to_string(),
+            permission_choice_pending: None,
             effort: "medium".to_string(),
             theme: "dark".to_string(),
             tip_dismissed: false,
@@ -73,10 +81,19 @@ impl Settings {
 
     /// Reads the settings file; a missing or unreadable file gives defaults.
     pub fn load(home: &Path, sources: &KeySources) -> Self {
-        let Ok(text) = std::fs::read_to_string(Self::path(home)) else {
-            return Self::legacy_defaults(sources).unwrap_or_default();
-        };
-        toml::from_str(&text).unwrap_or_default()
+        match std::fs::read_to_string(Self::path(home)) {
+            Ok(text) => toml::from_str(&text).unwrap_or_default(),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                Self::legacy_defaults(sources).unwrap_or_else(|| Self {
+                    permission_choice_pending: Some(
+                        home.join("permission-choice-pending").is_file()
+                            || (!home.join("sessions").exists() && !home.join("archive").exists()),
+                    ),
+                    ..Self::default()
+                })
+            }
+            Err(_) => Self::default(),
+        }
     }
 
     /// Backward compatibility for early installs that predate the provider
@@ -86,6 +103,9 @@ impl Settings {
         sources.legacy_key_file.as_ref()?.is_file().then(|| Self {
             model: LEGACY_MODEL.to_string(),
             base_url: LEGACY_BASE_URL.to_string(),
+            // Early installations used Auto before provider settings existed.
+            approval: "auto".into(),
+            permission_choice_pending: Some(false),
             ..Self::default()
         })
     }
@@ -95,14 +115,16 @@ impl Settings {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
         }
-        std::fs::write(&path, toml::to_string_pretty(self)?)?;
+        let temporary = home.join("config.toml.tmp");
+        std::fs::write(&temporary, toml::to_string_pretty(self)?)?;
+        std::fs::rename(temporary, &path)?;
         Ok(())
     }
 
     pub fn approval_mode(&self) -> ApprovalMode {
         match self.approval.as_str() {
-            "ask" => ApprovalMode::AskForChanges,
-            _ => ApprovalMode::Auto,
+            "auto" => ApprovalMode::Auto,
+            _ => ApprovalMode::AskForChanges,
         }
     }
 

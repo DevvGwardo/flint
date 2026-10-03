@@ -96,24 +96,32 @@ impl FlintApp {
             SessionFilter::Running => SessionFilter::Unread,
             SessionFilter::Unread => SessionFilter::All,
         };
+        self.sidebar_scroll.set_offset(Point::default());
+        self.session_menu = None;
         cx.notify();
     }
 
     /// Sessions the sidebar shows, after search and filter.
     pub fn visible_sessions(&self, cx: &App) -> Vec<usize> {
-        let query = self.search.read(cx).value().to_lowercase();
+        let query = self.search.read(cx).value().trim().to_lowercase();
         (0..self.sessions.len())
             .filter(|&ix| {
                 let session = &self.sessions[ix];
                 let status = session.status();
                 let keep = match self.filter {
                     SessionFilter::All => true,
-                    SessionFilter::Running => status == Status::Running,
+                    SessionFilter::Running => session.view.running,
                     SessionFilter::Unread => status == Status::Unread,
                 };
                 let listed = !session.view.items.is_empty() || ix == self.active;
                 keep && listed
-                    && (query.is_empty() || session.title().to_lowercase().contains(&query))
+                    && (query.is_empty()
+                        || session.title().to_lowercase().contains(&query)
+                        || session
+                            .workspace
+                            .to_string_lossy()
+                            .to_lowercase()
+                            .contains(&query))
             })
             .collect()
     }

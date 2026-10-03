@@ -3,6 +3,7 @@
 //! `session_options.rs`.
 
 use gpui_kit::assets::IconName;
+use gpui_kit::component::scroll::{Scrollbar, ScrollbarMode};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
@@ -142,9 +143,32 @@ pub fn chips(app: &FlintApp, cx: &mut Context<FlintApp>) -> Vec<AnyElement> {
 }
 
 /// The open option menu, as a panel above the composer.
-pub fn menu(app: &FlintApp, cx: &mut Context<FlintApp>) -> Option<AnyElement> {
+pub fn menu(
+    app: &FlintApp,
+    max_height: f32,
+    window: &Window,
+    cx: &mut Context<FlintApp>,
+) -> Option<AnyElement> {
     let p = palette();
     let menu = app.option_menu.as_ref()?;
+    if app.option_menu_needs_scroll.replace(false) {
+        let view = cx.entity().downgrade();
+        let target = menu.target.clone();
+        let uid = app.session().uid;
+        // GPUI initializes scroll bounds after the first scroll-to-item request.
+        window.on_next_frame(move |_, cx| {
+            view.update(cx, |app, cx| {
+                if app.session().uid == uid
+                    && let Some(menu) = &app.option_menu
+                    && menu.target == target
+                {
+                    app.option_menu_scroll.scroll_to_item(menu.selected);
+                    cx.notify();
+                }
+            })
+            .ok();
+        });
+    }
     let title = match &menu.target {
         MenuTarget::Option(id) => app
             .session()
@@ -164,6 +188,7 @@ pub fn menu(app: &FlintApp, cx: &mut Context<FlintApp>) -> Option<AnyElement> {
                     .mx(px(6.))
                     .px(px(10.))
                     .py(px(7.))
+                    .flex_shrink_0()
                     .rounded(px(8.))
                     .flex()
                     .items_center()
@@ -210,7 +235,25 @@ pub fn menu(app: &FlintApp, cx: &mut Context<FlintApp>) -> Option<AnyElement> {
                         p.text_subtle,
                     )),
             )
-            .children(rows)
+            .child(
+                div()
+                    .relative()
+                    .child(
+                        div()
+                            .id("option-menu-rows")
+                            .max_h(px((max_height - 44.).max(36.)))
+                            .overflow_y_scroll()
+                            .track_scroll(&app.option_menu_scroll)
+                            .pr(px(12.))
+                            .flex()
+                            .flex_col()
+                            .children(rows)
+                            .test_support(),
+                    )
+                    .child(
+                        Scrollbar::vertical(&app.option_menu_scroll).mode(ScrollbarMode::Always),
+                    ),
+            )
             .test_support()
             .into_any_element(),
     )

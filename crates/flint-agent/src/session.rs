@@ -4,14 +4,18 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use std::time::Instant;
 
 use async_channel::Receiver;
 use async_channel::Sender;
+use futures_util::StreamExt;
 use serde_json::Map;
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
+use crate::approvals::Approvals;
 use crate::context::ContextTracker;
 use crate::harness::Harness;
 use crate::harness::args::RepairedArgs;
@@ -26,6 +30,7 @@ use crate::protocol::AgentEvent;
 use crate::protocol::ApprovalDecision;
 use crate::protocol::ApprovalMode;
 use crate::protocol::FALLBACK_CONTEXT_WINDOW_TOKENS;
+use crate::protocol::ImageAttachment;
 use crate::protocol::NudgeReason;
 use crate::protocol::Op;
 use crate::protocol::ReasoningEffort;
@@ -39,6 +44,7 @@ use crate::provider::Provider;
 use crate::provider::ProviderError;
 use crate::provider::RawToolCall;
 use crate::provider::StreamDelta;
+use crate::subagents::Subagents;
 use crate::tools;
 
 /// Model calls allowed in one user turn: a cost backstop, not a working
@@ -53,22 +59,28 @@ pub const MAX_STEPS_PER_TURN: u32 = 600;
 pub(crate) async fn run(config: AgentConfig, ops: Receiver<Op>, events: Sender<AgentEvent>) {
     let current = Arc::new(Mutex::new(CancellationToken::new()));
     let effort = Arc::new(Mutex::new(config.reasoning_effort));
-    let (messages_tx, messages_rx) = async_channel::unbounded::<String>();
-    let (approvals_tx, approvals_rx) = async_channel::unbounded::<(String, ApprovalDecision)>();
+    let approvals = Arc::new(Approvals::default());
+    let stopping = Arc::new(AtomicBool::new(false));
+    let (messages_tx, messages_rx) = async_channel::unbounded::<(String, Vec<ImageAttachment>)>();
 
     // Ops are handled on their own task so Interrupt and Approval reach a
     // running turn, and user messages queue while one is in flight.
     let ops_current = Arc::clone(&current);
     let ops_effort = Arc::clone(&effort);
+    let ops_approvals = Arc::clone(&approvals);
+    let ops_stopping = Arc::clone(&stopping);
     tokio::spawn(async move {
         while let Ok(op) = ops.recv().await {
             match op {
                 Op::UserMessage(text) => {
-                    let _ = messages_tx.send(text).await;
+                    let _ = messages_tx.send((text, Vec::new())).await;
+                }
+                Op::UserMessageWithImages { text, images } => {
+                    let _ = messages_tx.send((text, images)).await;
                 }
                 Op::Interrupt => cancel_current(&ops_current),
                 Op::Approval { call_id, decision } => {
-                    let _ = approvals_tx.send((call_id, decision)).await;
+                    ops_approvals.respond(&call_id, decision);
                 }
                 Op::SetReasoningEffort(level) => {
                     if let Ok(mut slot) = ops_effort.lock() {
@@ -80,26 +92,46 @@ pub(crate) async fn run(config: AgentConfig, ops: Receiver<Op>, events: Sender<A
                 Op::Shutdown => break,
             }
         }
+        ops_stopping.store(true, Ordering::SeqCst);
         cancel_current(&ops_current);
         messages_tx.close();
     });
 
     let auto_budget = config.context_budget_tokens == 0;
-    let mut session = Session::new(config, events, approvals_rx, effort);
+    let mut session = Session::new(config, events, approvals, effort, false);
     if auto_budget {
         let limits = session.provider.model_limits().await;
         session.context.set_budget(budget_for_window(limits));
     }
-    while let Ok(text) = messages_rx.recv().await {
+    while let Ok((text, images)) = messages_rx.recv().await {
         let token = CancellationToken::new();
         if let Ok(mut slot) = current.lock() {
             *slot = token.clone();
+            if stopping.load(Ordering::SeqCst) {
+                break;
+            }
         }
-        session.run_turn(text, &token).await;
+        session.run_turn_with_images(text, images, &token).await;
     }
-    if let Some(saver) = session.saver.take() {
-        saver.flush().await;
+    let mut history_saved = true;
+    if let Some(saver) = session.saver.take()
+        && saver.flush().await.is_err()
+    {
+        history_saved = false;
+        session.emit(AgentEvent::Error(
+            "Couldn't save engine history. The session was kept; do not archive it.".into(),
+        ));
     }
+    if let Some(children) = session.subagents.take()
+        && children.flush().await.is_err()
+    {
+        history_saved = false;
+        session.emit(AgentEvent::Error(
+            "Couldn't save engine history. Subagent history could not be saved; do not archive it."
+                .into(),
+        ));
+    }
+    session.emit(AgentEvent::SessionStopped { history_saved });
 }
 
 /// Prompt budget for a model: its context window minus room for the reply.
@@ -123,32 +155,46 @@ fn cancel_current(current: &Mutex<CancellationToken>) {
     }
 }
 
-struct Session {
+pub(super) struct Session {
     workspace: PathBuf,
     approval: ApprovalMode,
-    approve_always: bool,
+    config: AgentConfig,
     provider: Provider,
     jev: Option<JevClient>,
-    history: Vec<Message>,
-    events: Sender<AgentEvent>,
-    approvals: Receiver<(String, ApprovalDecision)>,
+    pub(super) history: Vec<Message>,
+    pub(super) events: Sender<AgentEvent>,
+    approvals: Arc<Approvals>,
     turn_id: u64,
     /// Tool specs, serialized once.
     tools_json: String,
     effort: Arc<Mutex<Option<ReasoningEffort>>>,
     effort_notice_sent: bool,
     context: ContextTracker,
-    saver: Option<Saver>,
+    pub(super) saver: Option<Saver>,
+    subagents: Option<Subagents>,
+    pub(super) call_prefix: String,
+    tool_names: Vec<&'static str>,
+    pub(super) last_usage: Usage,
 }
 
 impl Session {
-    fn new(
+    pub(super) fn new(
         config: AgentConfig,
         events: Sender<AgentEvent>,
-        approvals: Receiver<(String, ApprovalDecision)>,
+        approvals: Arc<Approvals>,
         effort: Arc<Mutex<Option<ReasoningEffort>>>,
+        child: bool,
     ) -> Self {
-        let tools_json = serde_json::to_string(&tools::tool_specs()).unwrap_or_default();
+        let mut specs = tools::tool_specs();
+        if child {
+            specs.retain(|spec| spec["function"]["name"] != tools::SPAWN_AGENT);
+        }
+        let tool_names = tools::TOOL_NAMES
+            .iter()
+            .copied()
+            .filter(|name| !child || *name != tools::SPAWN_AGENT)
+            .collect();
+        let tools_json = serde_json::to_string(&specs).unwrap_or_default();
         let mut history = vec![Message::System(system_prompt(&config.workspace))];
         let mut turn_id = 0;
         if let Some(dir) = &config.session_dir {
@@ -166,6 +212,7 @@ impl Session {
             }
         }
         Self {
+            subagents: (!child).then(|| Subagents::new(config.clone())),
             provider: Provider::new(&config.base_url, &config.model, &config.api_key),
             jev: config.jev.clone().map(JevClient::new),
             context: ContextTracker::new(
@@ -178,15 +225,18 @@ impl Session {
             ),
             saver: config.session_dir.clone().map(Saver::new),
             history,
-            workspace: config.workspace,
+            workspace: config.workspace.clone(),
             approval: config.approval,
-            approve_always: false,
+            config,
             events,
             approvals,
             turn_id,
             tools_json,
             effort,
             effort_notice_sent: false,
+            call_prefix: String::new(),
+            tool_names,
+            last_usage: Usage::default(),
         }
     }
 
@@ -211,26 +261,55 @@ impl Session {
         let _ = self.events.try_send(event);
     }
 
-    async fn run_turn(&mut self, text: String, cancel: &CancellationToken) {
+    pub(super) async fn run_turn(
+        &mut self,
+        text: String,
+        cancel: &CancellationToken,
+    ) -> TurnEndReason {
+        self.run_turn_with_images(text, Vec::new(), cancel).await
+    }
+
+    async fn run_turn_with_images(
+        &mut self,
+        text: String,
+        images: Vec<ImageAttachment>,
+        cancel: &CancellationToken,
+    ) -> TurnEndReason {
         self.turn_id += 1;
         let turn_id = self.turn_id;
         self.emit(AgentEvent::TurnStarted { turn_id });
-        let reason = self.turn_loop(text, turn_id, cancel).await;
+        let reason = self.turn_loop(text, images, turn_id, cancel).await;
         self.save();
-        self.emit(AgentEvent::TurnFinished { turn_id, reason });
+        self.emit(AgentEvent::TurnFinished {
+            turn_id,
+            reason: reason.clone(),
+        });
+        reason
     }
 
     async fn turn_loop(
         &mut self,
         text: String,
+        images: Vec<ImageAttachment>,
         turn_id: u64,
         cancel: &CancellationToken,
     ) -> TurnEndReason {
-        self.history.push(Message::User(text.clone()));
+        self.history.push(if images.is_empty() {
+            Message::User(text.clone())
+        } else {
+            Message::UserWithImages {
+                text: text.clone(),
+                images,
+            }
+        });
         let mut harness = Harness::new(&text, self.jev.clone());
         let mut usage = Usage::default();
+        self.last_usage = usage;
 
         for step in 0..MAX_STEPS_PER_TURN {
+            if cancel.is_cancelled() {
+                return TurnEndReason::Interrupted;
+            }
             if let Some(nudge) = harness.before_step().await {
                 self.nudge(NudgeReason::Stuck, nudge);
             }
@@ -283,6 +362,7 @@ impl Session {
                 usage.output_tokens += call_usage.output_tokens;
                 usage.reasoning_tokens += call_usage.reasoning_tokens;
                 self.emit(AgentEvent::Usage(usage));
+                self.last_usage = usage;
             }
 
             let calls: Vec<PreparedCall> = completion
@@ -298,7 +378,7 @@ impl Session {
 
             if calls.is_empty() {
                 match harness
-                    .continuation(&completion.text, &tools::TOOL_NAMES)
+                    .continuation(&completion.text, &self.tool_names)
                     .await
                 {
                     Some((reason, message)) => {
@@ -310,12 +390,25 @@ impl Session {
                 }
             }
 
-            for (index, call) in calls.iter().enumerate() {
+            let mut index = 0;
+            while index < calls.len() {
+                let call = &calls[index];
                 if cancel.is_cancelled() {
                     self.skip_remaining(&calls[index..]);
                     return TurnEndReason::Interrupted;
                 }
-                self.run_call(call, &mut harness, cancel).await;
+                if call.name == tools::SPAWN_AGENT && self.subagents.is_some() {
+                    let end = calls[index..]
+                        .iter()
+                        .position(|call| call.name != tools::SPAWN_AGENT)
+                        .map_or(calls.len(), |offset| index + offset);
+                    self.run_subagents(&calls[index..end], &mut harness, &mut usage, cancel)
+                        .await;
+                    index = end;
+                } else {
+                    self.run_call(call, &mut harness, cancel).await;
+                    index += 1;
+                }
             }
             self.save();
             if cancel.is_cancelled() {
@@ -336,8 +429,8 @@ impl Session {
     /// Repairs the tool name and arguments of a raw call.
     fn prepare_call(&self, raw: &RawToolCall) -> PreparedCall {
         let mut name = raw.name.clone();
-        if !tools::TOOL_NAMES.contains(&name.as_str())
-            && let Some(found) = closest_tool_name(&name, &tools::TOOL_NAMES)
+        if !self.tool_names.contains(&name.as_str())
+            && let Some(found) = closest_tool_name(&name, &self.tool_names)
         {
             self.emit(AgentEvent::ToolRepaired {
                 tool: found.to_string(),
@@ -380,42 +473,60 @@ impl Session {
         harness: &mut Harness,
         cancel: &CancellationToken,
     ) {
+        let started = self.start_call(call, harness);
         let kind = tools::tool_kind(&call.name);
-        let args_value = Value::Object(call.args.clone());
-        let call_id = call.wire.id.clone();
+        let call_id = format!("{}{}", self.call_prefix, call.wire.id);
         let summary = tools::summary(&call.name, &call.args);
-        self.emit(AgentEvent::ToolCallStarted {
-            call_id: call_id.clone(),
-            name: call.name.clone(),
-            kind,
-            args: args_value.clone(),
-            summary: summary.clone(),
-        });
-        let path = tools::edit_path(&call.name, &call.args);
-        harness.record_tool_call(&call.name, kind, &args_value, path.as_deref());
-        let started = Instant::now();
-
         let outcome = if let Some(error) = &call.error {
-            tools::ToolOutcome {
-                output: format!(
-                    "Error: the arguments are not valid JSON ({error}). Send a JSON object."
-                ),
-                exit_code: None,
-                success: false,
-                diff: None,
-            }
+            tools::ToolOutcome::error(format!(
+                "the arguments are not valid JSON ({error}). Send a JSON object."
+            ))
         } else if !self.approved(&call_id, kind, &summary, cancel).await {
             let message = if cancel.is_cancelled() {
                 "Interrupted before this ran."
             } else {
                 "The user declined this action. Ask what they want instead, or try another approach."
             };
-            tools::ToolOutcome {
-                output: message.to_string(),
-                exit_code: None,
-                success: false,
-                diff: None,
+            tools::ToolOutcome::error(message)
+        } else if call.name == tools::LIST_MODELS {
+            match self.provider.list_models(cancel).await {
+                Ok(models) => {
+                    let offset = call
+                        .args
+                        .get("offset")
+                        .and_then(Value::as_u64)
+                        .map_or(0, |n| usize::try_from(n).unwrap_or(usize::MAX))
+                        .min(models.len());
+                    let mut bytes = 0;
+                    let shown: Vec<_> = models
+                        .iter()
+                        .skip(offset)
+                        .take(100)
+                        .take_while(|id| {
+                            bytes += serde_json::to_string(id).map_or(0, |id| id.len()) + 1;
+                            bytes <= 16_000
+                        })
+                        .collect();
+                    if shown.is_empty() && offset < models.len() {
+                        tools::ToolOutcome::error("A model id exceeds the listing output limit.")
+                    } else {
+                        let next = offset + shown.len();
+                        tools::ToolOutcome::ok(serde_json::json!({
+                            "models": shown,
+                            "total": models.len(),
+                            "next_offset": (next < models.len()).then_some(next),
+                            "parent_model": self.config.model,
+                            "subagent_model": self.config.subagent_model.as_ref().unwrap_or(&self.config.model),
+                        }).to_string())
+                    }
+                }
+                Err(error) => tools::ToolOutcome::error(error),
             }
+        } else if !self.tool_names.contains(&call.name.as_str()) {
+            tools::ToolOutcome::error(format!(
+                "Tool `{}` is unavailable in this session.",
+                call.name
+            ))
         } else {
             let events = self.events.clone();
             let output_id = call_id.clone();
@@ -427,7 +538,36 @@ impl Session {
             };
             tools::execute(&self.workspace, &call.name, &call.args, &on_output, cancel).await
         };
+        self.finish_call(call, outcome, harness, started);
+    }
 
+    fn start_call(&self, call: &PreparedCall, harness: &mut Harness) -> Instant {
+        let kind = tools::tool_kind(&call.name);
+        let args_value = Value::Object(call.args.clone());
+        let call_id = format!("{}{}", self.call_prefix, call.wire.id);
+        let summary = tools::summary(&call.name, &call.args);
+        self.emit(AgentEvent::ToolCallStarted {
+            call_id: call_id.clone(),
+            name: call.name.clone(),
+            kind,
+            args: args_value.clone(),
+            summary: summary.clone(),
+        });
+        let path = tools::edit_path(&call.name, &call.args);
+        harness.record_tool_call(&call.name, kind, &args_value, path.as_deref());
+        Instant::now()
+    }
+
+    fn finish_call(
+        &mut self,
+        call: &PreparedCall,
+        outcome: tools::ToolOutcome,
+        harness: &mut Harness,
+        started: Instant,
+    ) {
+        let kind = tools::tool_kind(&call.name);
+        let args_value = Value::Object(call.args.clone());
+        let call_id = format!("{}{}", self.call_prefix, call.wire.id);
         harness.record_tool_result(
             &call.name,
             kind,
@@ -437,7 +577,7 @@ impl Session {
             outcome.success,
         );
         self.history.push(Message::Tool {
-            call_id: call_id.clone(),
+            call_id: call.wire.id.clone(),
             content: outcome.output.clone(),
         });
         self.emit(AgentEvent::ToolCallFinished {
@@ -448,6 +588,116 @@ impl Session {
             diff: outcome.diff,
             duration_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
         });
+    }
+
+    async fn run_subagents(
+        &mut self,
+        calls: &[PreparedCall],
+        harness: &mut Harness,
+        usage: &mut Usage,
+        cancel: &CancellationToken,
+    ) {
+        let mut children = self.subagents.take().expect("parent has subagents");
+        let models = if calls
+            .iter()
+            .any(|call| call.args.get("model").is_some_and(|v| !v.is_null()))
+        {
+            Some(self.provider.list_models(cancel).await)
+        } else {
+            None
+        };
+        let effort = self.effort.lock().ok().and_then(|slot| *slot);
+        let mut jobs = Vec::new();
+        for call in calls {
+            let started = self.start_call(call, harness);
+            let prepared = if let Some(error) = &call.error {
+                Err(format!("Invalid arguments: {error}"))
+            } else if cancel.is_cancelled() {
+                Err("Interrupted before this ran.".to_string())
+            } else {
+                children.prepare(&call.args, models.as_ref(), self.approvals.clone(), effort)
+            };
+            match prepared {
+                Ok((child, message)) => {
+                    self.emit(AgentEvent::SubagentStarted {
+                        call_id: call.wire.id.clone(),
+                        session_id: child.id.clone(),
+                        model: child.model.clone(),
+                    });
+                    let events = self.events.clone();
+                    jobs.push(async move {
+                        let result = crate::subagents::run_child(
+                            child,
+                            message,
+                            &call.wire.id,
+                            events,
+                            cancel,
+                        )
+                        .await;
+                        (call, started, result)
+                    });
+                }
+                Err(error) => {
+                    self.finish_call(call, tools::ToolOutcome::error(error), harness, started)
+                }
+            }
+        }
+        let mut running = futures_util::stream::iter(jobs)
+            .buffer_unordered(crate::subagents::MAX_PARALLEL_SUBAGENTS);
+        while let Some((call, started, result)) = running.next().await {
+            // Child edits and verification count as work by the parent too.
+            let mut args = std::collections::HashMap::new();
+            for event in result.work {
+                match event {
+                    AgentEvent::ToolCallStarted {
+                        call_id,
+                        name,
+                        kind,
+                        args: value,
+                        ..
+                    } => {
+                        let path = value
+                            .as_object()
+                            .and_then(|args| tools::edit_path(&name, args));
+                        harness.record_tool_call(&name, kind, &value, path.as_deref());
+                        args.insert(call_id, (name, kind, value));
+                    }
+                    AgentEvent::ToolCallFinished {
+                        call_id,
+                        output,
+                        exit_code,
+                        success,
+                        ..
+                    } => {
+                        if let Some((name, kind, value)) = args.remove(&call_id) {
+                            harness.record_tool_result(
+                                &name, kind, &value, &output, exit_code, success,
+                            );
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            usage.input_tokens += result.child.session.last_usage.input_tokens;
+            usage.cached_input_tokens += result.child.session.last_usage.cached_input_tokens;
+            usage.output_tokens += result.child.session.last_usage.output_tokens;
+            usage.reasoning_tokens += result.child.session.last_usage.reasoning_tokens;
+            self.last_usage = *usage;
+            self.emit(AgentEvent::Usage(*usage));
+            self.finish_call(call, result.outcome, harness, started);
+            children.put(result.child);
+        }
+        self.subagents = Some(children);
+    }
+
+    pub(super) async fn initialize_child_budget(&mut self, cancel: &CancellationToken) {
+        if self.config.context_budget_tokens == 0 {
+            let limits = tokio::select! {
+                limits = self.provider.model_limits() => limits,
+                () = cancel.cancelled() => None,
+            };
+            self.context.set_budget(budget_for_window(limits));
+        }
     }
 
     /// Asks the front end when the mode requires it. False means don't run.
@@ -462,34 +712,29 @@ impl Session {
             ToolKind::Command | ToolKind::Edit => true,
             ToolKind::Read | ToolKind::Search | ToolKind::Other => false,
         };
-        if self.approval == ApprovalMode::Auto || self.approve_always || !needs_approval {
+        if self.approval == ApprovalMode::Auto
+            || self.approvals.always.load(Ordering::Relaxed)
+            || !needs_approval
+        {
             return true;
         }
+        let Some(answer) = self.approvals.register(call_id) else {
+            return true;
+        };
         self.emit(AgentEvent::ApprovalRequested {
             call_id: call_id.to_string(),
             kind,
             summary: summary.to_string(),
         });
-        loop {
-            let answer = tokio::select! {
-                answer = self.approvals.recv() => answer,
-                () = cancel.cancelled() => return false,
-            };
-            let Ok((id, decision)) = answer else {
-                return false;
-            };
-            if id != call_id {
-                continue;
-            }
-            return match decision {
-                ApprovalDecision::Approve => true,
-                ApprovalDecision::ApproveAlways => {
-                    self.approve_always = true;
-                    true
-                }
-                ApprovalDecision::Deny => false,
-            };
-        }
+        let decision = tokio::select! {
+            answer = answer => answer.ok(),
+            () = cancel.cancelled() => None,
+        };
+        self.approvals.remove(call_id);
+        matches!(
+            decision,
+            Some(ApprovalDecision::Approve | ApprovalDecision::ApproveAlways)
+        )
     }
 
     /// Keeps the history valid after an interrupt: every call gets a result.

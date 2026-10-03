@@ -67,7 +67,8 @@ fn live_creates_and_tests_add_py() {
             } => {
                 eprintln!("compacted {before_tokens} -> {after_tokens}");
             }
-            AgentEvent::SessionOptions(_) => {}
+            AgentEvent::SessionOptions(_) | AgentEvent::SessionStopped { .. } => {}
+            AgentEvent::SubagentStarted { .. } | AgentEvent::SubagentEvent { .. } => {}
             AgentEvent::TerminalStarted { .. }
             | AgentEvent::TerminalOutput { .. }
             | AgentEvent::TerminalExited { .. } => {}

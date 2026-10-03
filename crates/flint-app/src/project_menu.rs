@@ -24,6 +24,7 @@ pub enum ProjectItem {
     OpenFolder,
     Recent(PathBuf),
     AttachFile,
+    AttachImage,
 }
 
 impl FlintApp {
@@ -42,6 +43,7 @@ impl FlintApp {
         recent.truncate(RECENT_FOLDERS);
         std::iter::once(ProjectItem::OpenFolder)
             .chain(recent.into_iter().map(ProjectItem::Recent))
+            .chain(std::iter::once(ProjectItem::AttachImage))
             .chain(std::iter::once(ProjectItem::AttachFile))
             .collect()
     }
@@ -62,8 +64,13 @@ impl FlintApp {
         self.project_menu = None;
         match self.project_items().into_iter().nth(ix) {
             Some(ProjectItem::OpenFolder) => self.open_workspace(cx),
-            Some(ProjectItem::Recent(path)) => self.set_project_folder(path, cx),
+            Some(ProjectItem::Recent(path)) => {
+                self.set_project_folder(path, cx);
+                self.composer
+                    .update(cx, |state, cx| state.focus(window, cx));
+            }
             Some(ProjectItem::AttachFile) => self.open_mention_picker(window, cx),
+            Some(ProjectItem::AttachImage) => self.open_image_picker(cx),
             None => {}
         }
         cx.notify();
@@ -135,6 +142,11 @@ fn item_label(item: &ProjectItem) -> (IconName, String, Option<String>) {
             "Attach file…".to_string(),
             Some("@".to_string()),
         ),
+        ProjectItem::AttachImage => (
+            IconName::Paperclip,
+            "Attach image…".to_string(),
+            Some("PNG · JPEG · GIF · WebP".to_string()),
+        ),
     }
 }
 
@@ -194,7 +206,8 @@ pub fn render(app: &FlintApp, cx: &mut Context<FlintApp>) -> Option<AnyElement> 
     Some(
         div()
             .id("project-menu")
-            .w(px(380.))
+            .w_full()
+            .max_w(px(380.))
             .rounded(px(14.))
             .border_1()
             .border_color(p.border_strong)

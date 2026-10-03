@@ -1,6 +1,7 @@
 //! Command palette (⌘K): a centered overlay over the gpui-component `Command`.
 
 use gpui_kit::assets::IconName;
+use gpui_kit::base::FocusTrapElement as _;
 use gpui_kit::component::Icon;
 use gpui_kit::component::command::Command;
 use gpui_kit::component::command::CommandGroup;
@@ -14,11 +15,13 @@ use crate::app::FocusComposer;
 use crate::app::Interrupt;
 use crate::app::NewClaudeSession;
 use crate::app::NewCodexSession;
+use crate::app::NewDroidSession;
 use crate::app::NewSession;
 use crate::app::OpenSettings;
 use crate::app::OpenTerminal;
 use crate::app::OpenWorkspace;
 use crate::app::RenameSession;
+use crate::app::ResetPanelLayout;
 use crate::app::ToggleApproval;
 use crate::app::ToggleChanges;
 use crate::app::ToggleSidebar;
@@ -32,7 +35,11 @@ fn item(label: &str, icon: IconName, action: Box<dyn Action>) -> CommandItem {
         .action(action)
 }
 
-pub fn render(state: &Entity<CommandState>, cx: &mut Context<FlintApp>) -> impl IntoElement {
+pub fn render(
+    state: &Entity<CommandState>,
+    focus: &FocusHandle,
+    cx: &mut Context<FlintApp>,
+) -> impl IntoElement {
     let p = palette();
     let this = cx.entity().downgrade();
     let on_confirm = this.clone();
@@ -58,6 +65,11 @@ pub fn render(state: &Entity<CommandState>, cx: &mut Context<FlintApp>) -> impl 
                     Box::new(NewCodexSession),
                 ))
                 .item(item(
+                    "New Droid session",
+                    IconName::Bot,
+                    Box::new(NewDroidSession),
+                ))
+                .item(item(
                     "Stop the running turn",
                     IconName::CircleStop,
                     Box::new(Interrupt),
@@ -68,8 +80,8 @@ pub fn render(state: &Entity<CommandState>, cx: &mut Context<FlintApp>) -> impl 
                     Box::new(RenameSession),
                 ))
                 .item(item(
-                    "Delete session",
-                    IconName::Trash,
+                    "Archive session (Undo this run; restore from Sessions after restart)",
+                    IconName::Archive,
                     Box::new(DeleteSession),
                 ))
                 .item(item(
@@ -111,7 +123,12 @@ pub fn render(state: &Entity<CommandState>, cx: &mut Context<FlintApp>) -> impl 
                     IconName::SquareTerminal,
                     Box::new(OpenTerminal),
                 ))
-                .item(item("Settings", IconName::Settings, Box::new(OpenSettings))),
+                .item(item("Settings", IconName::Settings, Box::new(OpenSettings)))
+                .item(item(
+                    "Reset panel layout",
+                    IconName::PanelLeft,
+                    Box::new(ResetPanelLayout),
+                )),
         )
         .on_confirm(move |_, window, cx| {
             on_confirm
@@ -147,7 +164,8 @@ pub fn render(state: &Entity<CommandState>, cx: &mut Context<FlintApp>) -> impl 
                     .shadow_lg()
                     .overflow_hidden()
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                    .child(command),
+                    .child(command)
+                    .focus_trap("palette-focus-trap", focus),
             ),
     )
     .with_priority(10)

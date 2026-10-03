@@ -16,6 +16,8 @@ pub struct AgentConfig {
     /// OpenAI-compatible base URL, e.g. `https://api.openai.com/v1`.
     pub base_url: String,
     pub model: String,
+    /// Default model for new subagents on this endpoint; `None` inherits the parent.
+    pub subagent_model: Option<String>,
     pub api_key: String,
     /// Directory the agent works in; tools resolve relative paths against it.
     pub workspace: PathBuf,
@@ -82,6 +84,7 @@ impl std::fmt::Debug for AgentConfig {
         f.debug_struct("AgentConfig")
             .field("base_url", &self.base_url)
             .field("model", &self.model)
+            .field("subagent_model", &self.subagent_model)
             .field("api_key", &"<redacted>")
             .field("workspace", &self.workspace)
             .field("approval", &self.approval)
@@ -108,6 +111,11 @@ impl std::fmt::Debug for JevConfig {
 pub enum Op {
     /// Start a turn with this user message (queued if a turn is running).
     UserMessage(String),
+    /// Start a turn with visual context, encoded once before leaving the UI.
+    UserMessageWithImages {
+        text: String,
+        images: Vec<ImageAttachment>,
+    },
     /// Stop the running turn as soon as possible.
     Interrupt,
     /// Answer an [`AgentEvent::ApprovalRequested`].
@@ -125,10 +133,19 @@ pub enum Op {
     Shutdown,
 }
 
+/// An image in a user prompt. `data` is base64 without a data-URL prefix.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImageAttachment {
+    pub name: String,
+    pub mime_type: String,
+    pub data: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ApprovalDecision {
     Approve,
-    /// Approve this and every later call in the session.
+    /// Approve this, all pending parent/child calls and future calls in the
+    /// shared native engine. ACP agents implement their own permissions.
     ApproveAlways,
     Deny,
 }
@@ -137,6 +154,10 @@ pub enum ApprovalDecision {
 /// `TurnStarted` and `TurnFinished` with the same `turn_id`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum AgentEvent {
+    /// Native engine shutdown, after parent and child history writers finish.
+    SessionStopped {
+        history_saved: bool,
+    },
     TurnStarted {
         turn_id: u64,
     },
@@ -171,6 +192,17 @@ pub enum AgentEvent {
         /// Present for file edits.
         diff: Option<FileDiff>,
         duration_ms: u64,
+    },
+    /// A child session attached to a `spawn_agent` call.
+    SubagentStarted {
+        call_id: String,
+        session_id: String,
+        model: String,
+    },
+    /// Child activity, kept separate from the parent's conversation.
+    SubagentEvent {
+        call_id: String,
+        event: Box<AgentEvent>,
     },
     ApprovalRequested {
         call_id: String,
@@ -305,6 +337,7 @@ pub enum AgentKind {
     Flint,
     ClaudeCode,
     Codex,
+    Droid,
 }
 
 impl AgentKind {
@@ -314,6 +347,7 @@ impl AgentKind {
             AgentKind::Flint => "flint",
             AgentKind::ClaudeCode => "Claude Code",
             AgentKind::Codex => "Codex",
+            AgentKind::Droid => "Droid",
         }
     }
 }

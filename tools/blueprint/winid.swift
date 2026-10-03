@@ -3,6 +3,14 @@
 // Usage: winid <pid>
 import CoreGraphics
 import Foundation
+import AppKit
+
+if CommandLine.arguments.dropFirst().first == "--screen" {
+    let screen = NSScreen.main!
+    print(Int(screen.frame.width), Int(screen.frame.height),
+          Int(screen.visibleFrame.width), Int(screen.visibleFrame.height))
+    exit(0)
+}
 
 let pid = Int32(CommandLine.arguments[1])!
 let list = CGWindowListCopyWindowInfo(.optionOnScreenOnly, kCGNullWindowID) as! [[String: Any]]

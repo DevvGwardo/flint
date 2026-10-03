@@ -1,9 +1,8 @@
-//! Root layout: a floating, inset sidebar over the blurred window backdrop,
-//! and the main column (header, transcript or empty state, composer) with the
-//! resizable changes panel.
+//! Window controls and shortcuts around the dockable workspace panels.
 
 use flint_agent::AgentKind;
-use gpui_kit::component::*;
+use gpui_kit::base::FocusTrapElement as _;
+use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
@@ -22,46 +21,27 @@ impl Render for FlintApp {
         // Narrow windows give the transcript the room: the sidebar steps
         // aside below 1000px, or below 1280px while the changes panel is open.
         let width = window.viewport_size().width;
-        let sidebar =
+        let mut sidebar =
             self.sidebar_open && width >= px(1000.) && !(self.changes_open && width < px(1280.));
         self.sidebar_visible = sidebar;
-        let main = div()
-            .id("main-column")
-            .size_full()
-            .flex()
-            .flex_col()
-            // Dragging the terminal dock's top edge.
-            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, window, cx| {
-                if event.pressed_button == Some(MouseButton::Left) {
-                    this.drag_terminal_edge(event.position.y, window, cx);
-                } else {
-                    this.end_terminal_resize();
-                }
-            }))
-            .on_mouse_up(
-                MouseButton::Left,
-                cx.listener(|this, _, _, _| this.end_terminal_resize()),
-            )
-            .child(crate::header::render(self, window, cx))
-            .child(
-                div()
-                    .flex_1()
-                    .min_h_0()
-                    .child(crate::transcript::render_main(self, window, cx)),
-            )
-            .children(crate::term_panel::render(self, cx));
-        let body = h_resizable("flint-body")
-            .child(resizable_panel().child(main))
-            .child(
-                resizable_panel()
-                    .size(px(460.))
-                    .size_range(px(340.)..px(820.))
-                    .visible(self.changes_open)
-                    .when(self.changes_open, |panel| {
-                        // Built only while visible: the diff can be large.
-                        panel.child(crate::changes_panel::render(self, cx))
-                    }),
-            );
+        if sidebar && self.chat_width(f32::from(width)) < 560. {
+            sidebar = false;
+            self.sidebar_visible = false;
+        }
+        if !sidebar && !self.session_drawer {
+            self.session_menu = None;
+            self.cancel_rename(window, cx);
+        }
+        let body = crate::docking::render(self, window, cx);
+        // Window controls stay in one safe strip regardless of panel placement.
+        let titlebar = self.drag_region(
+            div()
+                .id("workspace-titlebar")
+                .h(px(36.))
+                .w_full()
+                .flex_shrink_0(),
+            cx,
+        );
 
         let root = div()
             .id("flint")
@@ -74,6 +54,37 @@ impl Render for FlintApp {
             // Shift+Tab and Esc are claimed before the composer's own bindings.
             .capture_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 let key = event.keystroke.clone();
+                if (this.settings_form.is_some() || this.archive_confirm.is_some())
+                    && key.modifiers.platform
+                    && (matches!(key.key.as_str(), "n" | "k" | "l" | "j" | "b" | "o" | "," | ".")
+                        || (key.key == "a" && key.modifiers.shift))
+                {
+                    cx.stop_propagation();
+                    return;
+                }
+                if this.permission_choice_open {
+                    if key.key == "escape" {
+                        this.cancel_initial_permission(window, cx);
+                        cx.stop_propagation();
+                    } else if key.modifiers.platform && key.key != "q" {
+                        cx.stop_propagation();
+                    }
+                    return;
+                }
+                if this.archive_confirm.is_some() {
+                    if key.key == "escape" {
+                        this.cancel_archive(window, cx);
+                        cx.stop_propagation();
+                    }
+                    return;
+                }
+                if key.key == "escape" && this.docking.is_some() {
+                    this.docking = None;
+                    cx.stop_active_drag(window);
+                    cx.notify();
+                    cx.stop_propagation();
+                    return;
+                }
                 if this.settings_form.is_some() {
                     if key.key == "escape" {
                         this.close_settings(window, cx);
@@ -81,11 +92,31 @@ impl Render for FlintApp {
                     }
                     return;
                 }
+                if key.key == "escape" && this.approval_confirm.take().is_some() {
+                    cx.notify();
+                    cx.stop_propagation();
+                    return;
+                }
+                if key.key == "escape" && this.approval_preview.take().is_some() {
+                    cx.notify();
+                    cx.stop_propagation();
+                    return;
+                }
+                if key.key == "escape" && this.session_menu.take().is_some() {
+                    cx.notify();
+                    cx.stop_propagation();
+                    return;
+                }
                 if this.renaming.is_some() {
                     if key.key == "escape" {
                         this.cancel_rename(window, cx);
                         cx.stop_propagation();
                     }
+                    return;
+                }
+                if key.key == "escape" && this.session_drawer {
+                    this.close_session_drawer(window, cx);
+                    cx.stop_propagation();
                     return;
                 }
                 if this.palette.is_some() {
@@ -118,6 +149,9 @@ impl Render for FlintApp {
             .on_action(cx.listener(|this, _: &NewCodexSession, window, cx| {
                 this.new_agent_session(AgentKind::Codex, window, cx)
             }))
+            .on_action(cx.listener(|this, _: &NewDroidSession, window, cx| {
+                this.new_agent_session(AgentKind::Droid, window, cx)
+            }))
             .on_action(cx.listener(|this, _: &TogglePalette, window, cx| {
                 if this.palette.is_some() {
                     this.close_palette(window, cx);
@@ -129,8 +163,13 @@ impl Render for FlintApp {
                 this.changes_open = !this.changes_open;
                 cx.notify();
             }))
-            .on_action(cx.listener(|this, _: &ToggleSidebar, _, cx| {
+            .on_action(cx.listener(|this, _: &ToggleSidebar, window, cx| {
                 this.sidebar_open = !this.sidebar_open;
+                if !this.sidebar_open {
+                    this.session_menu = None;
+                    this.cancel_rename(window, cx);
+                    this.composer.update(cx, |state, cx| state.focus(window, cx));
+                }
                 cx.notify();
             }))
             // Shift+Tab: the agent's own modes when it has them, else auto-run.
@@ -166,45 +205,132 @@ impl Render for FlintApp {
                 this.delete_session(ix, window, cx);
             }))
             .on_action(cx.listener(|this, _: &Interrupt, _, cx| this.interrupt(cx)))
+            .on_action(cx.listener(|this, _: &ResetPanelLayout, _, cx| this.reset_panel_layout(cx)))
             .on_action(cx.listener(|this, _: &FocusComposer, window, cx| {
                 this.composer
                     .update(cx, |state, cx| state.focus(window, cx));
             }))
             .size_full()
+            .relative()
             .flex()
+            .flex_col()
             .bg(p.window_tint)
             .text_color(p.text)
             .text_size(px(size::BASE))
-            .when(sidebar, |root| {
-                root.child(
-                    div()
-                        .flex_shrink_0()
-                        .h_full()
-                        .p(px(SIDEBAR_INSET))
-                        .pr(px(0.))
-                        .child(crate::sidebar::render(self, cx)),
-                )
-            })
+            .child(titlebar)
             .child(
                 div()
                     .flex_1()
                     .min_w_0()
-                    .h_full()
-                    .when(sidebar, |main| {
-                        main.ml(px(SIDEBAR_INSET))
-                            .rounded_tl(px(12.))
-                            .rounded_bl(px(12.))
-                            .border_l_1()
-                            .border_color(p.border)
-                    })
-                    .bg(p.bg)
+                    .min_h_0()
+                    .w_full()
                     .overflow_hidden()
                     .child(body),
             )
-            .when_some(self.palette.clone(), |root, state| {
-                root.child(crate::palette::render(&state, cx))
+            .when(self.session_drawer && !sidebar, |root| {
+                root.child(
+                    div()
+                        .id("sessions-drawer-backdrop")
+                        .absolute()
+                        .inset_0()
+                        .bg(hsla(0., 0., 0., 0.6))
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.close_session_drawer(window, cx);
+                        }))
+                        .child(
+                            div()
+                                .id("sessions-drawer")
+                                .w(px(304.))
+                                .h_full()
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                .on_click(|_, _, cx| cx.stop_propagation())
+                                .child(div().h_full().child(crate::sidebar::render(self, cx))
+                                    .focus_trap("sessions-focus-trap", &self.drawer_focus))
+                                .test_support(),
+                        )
+                        .test_support(),
+                )
             })
-            .children(crate::settings_view::render(self, cx));
+            .when(
+                self.archived_session.is_some() || self.store_error.is_some(),
+                |root| {
+                    root.child(
+                        div()
+                            .id("archive-feedback")
+                            .absolute()
+                            .bottom(px(18.))
+                            .left(px(18.))
+                            .p(px(12.))
+                            .rounded(px(10.))
+                            .border_1()
+                            .border_color(p.border_strong)
+                            .bg(p.surface)
+                            .flex()
+                            .items_center()
+                            .gap(px(12.))
+                            .children(self.store_error.as_ref().map(|error| {
+                                crate::ui::label(
+                                    error.clone(),
+                                    size::SM,
+                                    if error.starts_with("Couldn't") {
+                                        p.danger
+                                    } else {
+                                        p.text_muted
+                                    },
+                                )
+                            }))
+                            .when(self.archived_session.is_some(), |toast| {
+                                toast
+                                    .child(crate::ui::label("Session archived", size::SM, p.text))
+                                    .child(
+                                        div()
+                                            .id("undo-archive")
+                                            .aria_label("Undo archive")
+                                            .tab_index(0)
+                                            .focus_visible(|style| {
+                                                style.border_1().border_color(p.accent)
+                                            })
+                                            .cursor_pointer()
+                                            .text_color(p.accent)
+                                            .on_click(cx.listener(|this, _, window, cx| {
+                                                this.undo_archive(window, cx)
+                                            }))
+                                            .child("Undo (this run)")
+                                            .test_support(),
+                                    )
+                            })
+                            .test_support(),
+                    )
+                },
+            )
+            .when_some(self.palette.clone(), |root, state| {
+                root.child(crate::palette::render(&state, &self.palette_focus, cx))
+            })
+            .when_some(self.archive_confirm, |root, uid| {
+                root.child(deferred(
+                    div().absolute().inset_0().bg(hsla(0., 0., 0., 0.6))
+                        .flex().items_center().justify_center()
+                        .child(div().id("archive-confirmation").w(px(460.)).p(px(20.))
+                            .bg(p.surface).rounded(px(14.)).border_1().border_color(p.border_strong)
+                            .flex().flex_col().gap(px(16.))
+                            .child("Stop running work before archiving?")
+                            .child(crate::ui::label("This stops pending work and approvals. History will not move until the engine has stopped and finished saving. Archive again once it stops.", size::SM, p.text_muted))
+                            .child(Button::new("archive-cancel").label("Cancel")
+                                .on_click(cx.listener(|this, _, window, cx| this.cancel_archive(window, cx))))
+                            .child(Button::new("archive-stop").primary().label("Stop work")
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    if let Some(ix) = this.session_index(uid) {
+                                        this.delete_session(ix, window, cx);
+                                    }
+                                    if let Some(focus) = this.archive_return_focus.take() {
+                                        focus.focus(window, cx);
+                                    }
+                                })))
+                            .focus_trap("archive-focus-trap", &self.archive_focus))
+                ).with_priority(30))
+            })
+            .children(crate::settings_view::render(self, window, cx))
+            .children(crate::permission_choice::render(self, cx));
         crate::automation::record_frame(frame_started);
         root
     }

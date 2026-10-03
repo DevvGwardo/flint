@@ -27,6 +27,7 @@ actions!(
         NewSession,
         NewClaudeSession,
         NewCodexSession,
+        NewDroidSession,
         TogglePalette,
         ToggleChanges,
         ToggleSidebar,
@@ -44,6 +45,7 @@ actions!(
         MenuAccept,
         MenuDismiss,
         DeleteSession,
+        ResetPanelLayout,
         Quit,
     ]
 );
@@ -63,6 +65,10 @@ pub struct Options {
     /// Poll terminals for output on a timer instead of being woken from
     /// the PTY thread (GPUI's deterministic test scheduler forbids that).
     pub terminal_poll: bool,
+    /// Poll real engine events in deterministic GPUI tests, avoiding cross-thread wakes.
+    pub engine_poll: bool,
+    /// Headless interaction fixtures can test existing-install behavior explicitly.
+    pub skip_permission_choice: bool,
     pub workspace: Option<PathBuf>,
     pub demo: bool,
     /// Demo: stop after this many scripted events (mid-stream screenshots).
@@ -85,8 +91,14 @@ pub struct Options {
     pub demo_long: Option<usize>,
     /// Automation: stream deltas at this rate per second, then quit.
     pub stream_test: Option<u32>,
+    /// Automation: persist the synthetic stream in the selected isolated home.
+    pub save_stream: bool,
+    /// Automation: stream mirrored terminal output at this many lines/second.
+    pub terminal_test: Option<u32>,
     /// Automation: scroll a long transcript, then quit.
     pub scroll_test: bool,
+    /// Automation: scroll a generated patch with this many changed lines.
+    pub diff_test: Option<usize>,
     pub open_settings: bool,
     pub open_mention: bool,
     pub open_slash: bool,
@@ -103,7 +115,12 @@ pub struct Options {
 impl Options {
     /// Automation and demo runs neither load nor save sessions.
     pub(crate) fn ephemeral(&self) -> bool {
-        self.demo || self.demo_long.is_some() || self.stream_test.is_some() || self.scroll_test
+        self.demo
+            || self.demo_long.is_some()
+            || self.stream_test.is_some()
+            || self.scroll_test
+            || self.diff_test.is_some()
+            || self.terminal_test.is_some()
     }
 }
 
@@ -134,17 +151,44 @@ pub struct FlintApp {
     pub sidebar_open: bool,
     /// Whether the sidebar is on screen this frame (it auto-collapses when narrow).
     pub sidebar_visible: bool,
+    pub session_drawer: bool,
+    /// Last archived session, retained for undo in this process.
+    pub archived_session: Option<(Session, usize)>,
+    pub archives: Vec<(PathBuf, crate::store::Meta)>,
+    pub archive_confirm: Option<u64>,
+    pub store_error: Option<String>,
     pub changes_open: bool,
     pub selected_change: Option<usize>,
+    pub change_diff_scroll: UniformListScrollHandle,
+    pub(crate) change_diff_cache: std::cell::RefCell<Option<crate::diff::CachedDiff>>,
+    pub dock_layout: crate::docking::Layout,
+    pub(crate) dock_revision: u64,
+    pub(crate) docking: Option<crate::docking::Panel>,
     pub palette: Option<Entity<CommandState>>,
     pub composer: Entity<TextareaState>,
     pub search: Entity<InputState>,
+    pub sidebar_scroll: ScrollHandle,
+    pub archive_scroll: ScrollHandle,
     pub filter: SessionFilter,
     pub mention: Option<crate::app_input::MentionMenu>,
     pub slash: Option<crate::app_input::SlashMenu>,
     /// Files attached with `@` for the next message.
     pub attachments: Vec<String>,
+    /// Images selected for the next prompt, including files outside the workspace.
+    pub image_attachments: Vec<PathBuf>,
+    pub pending_image_pastes: usize,
+    pub(crate) pasted_image_files: Vec<tempfile::NamedTempFile>,
+    pub option_menu_scroll: ScrollHandle,
+    pub(crate) option_menu_needs_scroll: std::cell::Cell<bool>,
+    pub popover_scroll: ScrollHandle,
     pub settings_form: Option<crate::settings_view::SettingsForm>,
+    pub permission_choice_open: bool,
+    pub permission_choice_error: Option<String>,
+    pub(crate) permission_focus: FocusHandle,
+    /// The request whose details are expanded above the composer.
+    pub approval_preview: Option<String>,
+    /// The native engine-wide approval is awaiting a second, explicit click.
+    pub approval_confirm: Option<String>,
     pub help_open: bool,
     /// The agent picker above the composer is open.
     pub agent_menu: bool,
@@ -160,8 +204,17 @@ pub struct FlintApp {
     pub session_menu: Option<usize>,
     /// Session being renamed, with its title input.
     pub renaming: Option<(usize, Entity<InputState>)>,
+    pub(crate) rename_subscription: Option<Subscription>,
+    pub(crate) rename_needs_scroll: std::cell::Cell<bool>,
     pub origin: Instant,
     pub(crate) focus: FocusHandle,
+    pub(crate) palette_focus: FocusHandle,
+    pub(crate) drawer_focus: FocusHandle,
+    pub(crate) archive_focus: FocusHandle,
+    pub(crate) changes_focus: FocusHandle,
+    pub(crate) palette_return_focus: Option<FocusHandle>,
+    pub(crate) drawer_return_focus: Option<FocusHandle>,
+    pub(crate) archive_return_focus: Option<FocusHandle>,
     /// Window drag from the header, armed on mouse down.
     pub(crate) drag_armed: bool,
     pub(crate) options: Options,
@@ -189,7 +242,15 @@ impl FlintApp {
         let key_path = options.key_path.clone();
         let key_sources = options.key_sources.clone().unwrap_or_default();
         let settings = Settings::load(&home, &key_sources);
+        let permission_choice_open = settings.permission_choice_pending == Some(true)
+            && !options.skip_permission_choice
+            && !options.ephemeral();
         let terminal_height = settings.terminal_height;
+        let dock_layout = if options.ephemeral() {
+            crate::docking::Layout::default()
+        } else {
+            crate::docking::Layout::load(&home, terminal_height)
+        };
         let composer = cx.new(|cx| {
             TextareaState::new(window, cx)
                 .auto_grow(1, 8)
@@ -207,7 +268,13 @@ impl FlintApp {
                     _ => {}
                 },
             ),
-            cx.subscribe(&search, |_, _, _: &InputEvent, cx| cx.notify()),
+            cx.subscribe(&search, |this, _, event: &InputEvent, cx| {
+                if matches!(event, InputEvent::Change) {
+                    this.sidebar_scroll.set_offset(Point::default());
+                    this.session_menu = None;
+                }
+                cx.notify();
+            }),
         ];
         let mut app = Self {
             sessions: Vec::new(),
@@ -223,16 +290,39 @@ impl FlintApp {
             settings,
             sidebar_open: true,
             sidebar_visible: true,
+            session_drawer: false,
+            archived_session: None,
+            archives: Vec::new(),
+            archive_confirm: None,
+            store_error: None,
             changes_open: options.open_changes,
             selected_change: None,
+            change_diff_scroll: UniformListScrollHandle::new(),
+            change_diff_cache: Default::default(),
+            dock_layout,
+            dock_revision: 0,
+            docking: None,
             palette: None,
             composer,
             search,
+            sidebar_scroll: ScrollHandle::new(),
+            archive_scroll: ScrollHandle::new(),
             filter: SessionFilter::All,
             mention: None,
             slash: None,
             attachments: Vec::new(),
+            image_attachments: Vec::new(),
+            pending_image_pastes: 0,
+            pasted_image_files: Vec::new(),
+            option_menu_scroll: ScrollHandle::new(),
+            option_menu_needs_scroll: std::cell::Cell::new(false),
+            popover_scroll: ScrollHandle::new(),
             settings_form: None,
+            permission_choice_open,
+            permission_choice_error: None,
+            permission_focus: cx.focus_handle(),
+            approval_preview: None,
+            approval_confirm: None,
             help_open: false,
             agent_menu: false,
             terminal: crate::term_panel::TermPanel::new(false, terminal_height),
@@ -241,8 +331,17 @@ impl FlintApp {
             copied: None,
             session_menu: None,
             renaming: None,
+            rename_subscription: None,
+            rename_needs_scroll: std::cell::Cell::new(false),
             origin: Instant::now(),
             focus: cx.focus_handle(),
+            palette_focus: cx.focus_handle(),
+            drawer_focus: cx.focus_handle(),
+            archive_focus: cx.focus_handle(),
+            changes_focus: cx.focus_handle().tab_stop(true),
+            palette_return_focus: None,
+            drawer_return_focus: None,
+            archive_return_focus: None,
             drag_armed: false,
             options: options.clone(),
             next_uid: 0,
@@ -253,10 +352,21 @@ impl FlintApp {
         };
         if !options.ephemeral() {
             app.restore_sessions(cx);
+            app.refresh_archives();
         }
         let fresh = app.new_session_value(workspace);
         app.sessions.insert(0, fresh);
         app.active = 0;
+        app.subscriptions.push(cx.on_app_quit(|app, _| {
+            // Drain synchronously before returning a future: GPUI gives quit
+            // futures only 100 ms, which is not a disk-write guarantee.
+            for session in &mut app.sessions {
+                if let Err(error) = session.flush_records() {
+                    eprintln!("flint: couldn't drain session events at quit: {error}");
+                }
+            }
+            async {}
+        }));
         if options.demo {
             app.start_demo(cx);
         }
@@ -266,8 +376,14 @@ impl FlintApp {
         if let Some(rate) = options.stream_test {
             app.start_stream_test(rate, cx);
         }
+        if let Some(rate) = options.terminal_test {
+            app.start_terminal_test(rate, cx);
+        }
         if options.scroll_test {
             app.start_scroll_test(cx);
+        }
+        if let Some(lines) = options.diff_test {
+            app.start_diff_test(lines, cx);
         }
         if let Some(prompt) = options.prompt.clone().filter(|_| !options.demo) {
             app.composer
@@ -319,6 +435,9 @@ impl FlintApp {
             ) {
                 view.read(cx).write(format!("{text}\r").into_bytes());
             }
+        }
+        if app.permission_choice_open && !crate::automation::background_launch() {
+            app.permission_focus.focus(window, cx);
         }
         app
     }
@@ -400,10 +519,24 @@ impl FlintApp {
 
     pub fn select_session(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
         if ix < self.sessions.len() {
+            self.discard_rename();
             self.active = ix;
             self.sessions[ix].unread = false;
             self.selected_change = None;
             self.session_menu = None;
+            self.session_drawer = false;
+            self.drawer_return_focus = None;
+            self.approval_preview = None;
+            self.approval_confirm = None;
+            self.archive_confirm = None;
+            if self.sessions[ix]
+                .view
+                .changes
+                .iter()
+                .any(|file| file.combined.is_none())
+            {
+                self.settle_changes_async(self.sessions[ix].uid, cx);
+            }
             self.composer
                 .update(cx, |state, cx| state.focus(window, cx));
             cx.notify();
@@ -417,6 +550,7 @@ impl FlintApp {
     }
 
     pub(crate) fn new_session(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.discard_rename();
         // Reuse an untouched session in this workspace instead of stacking empty ones.
         let reusable = self.sessions.iter().position(|s| {
             s.view.items.is_empty() && s.ops.is_none() && s.workspace == self.workspace
@@ -430,6 +564,12 @@ impl FlintApp {
             }
         }
         self.selected_change = None;
+        self.session_menu = None;
+        self.session_drawer = false;
+        self.drawer_return_focus = None;
+        self.filter = SessionFilter::All;
+        self.search
+            .update(cx, |state, cx| state.set_value("", window, cx));
         self.composer
             .update(cx, |state, cx| state.focus(window, cx));
         cx.notify();
@@ -441,6 +581,7 @@ impl FlintApp {
         if self.session().view.items.is_empty() {
             return;
         }
+        self.discard_rename();
         let workspace = self.session().workspace.clone();
         let session = self.new_session_value(workspace);
         self.sessions.push(session);
@@ -452,6 +593,9 @@ impl FlintApp {
     }
 
     pub fn open_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.cancel_rename(window, cx);
+        self.session_menu = None;
+        self.palette_return_focus = window.focused(cx);
         let state = cx.new(|cx| CommandState::new(window, cx));
         state.update(cx, |state, cx| state.focus(window, cx));
         self.palette = Some(state);
@@ -459,9 +603,49 @@ impl FlintApp {
     }
 
     pub fn close_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.palette = None;
-        self.composer
-            .update(cx, |state, cx| state.focus(window, cx));
+        if self.palette.take().is_none() {
+            return;
+        }
+        if self.settings_form.is_none() {
+            if let Some(focus) = self.palette_return_focus.take() {
+                focus.focus(window, cx);
+            } else {
+                self.composer
+                    .update(cx, |state, cx| state.focus(window, cx));
+            }
+        }
+        cx.notify();
+    }
+
+    pub fn toggle_session_drawer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.session_drawer {
+            self.close_session_drawer(window, cx);
+        } else {
+            self.drawer_return_focus = window.focused(cx);
+            self.session_drawer = true;
+            self.search.update(cx, |state, cx| state.focus(window, cx));
+            cx.notify();
+        }
+    }
+
+    pub fn close_session_drawer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.discard_rename();
+        self.session_drawer = false;
+        self.session_menu = None;
+        if let Some(focus) = self.drawer_return_focus.take() {
+            focus.focus(window, cx);
+        } else {
+            self.composer
+                .update(cx, |state, cx| state.focus(window, cx));
+        }
+        cx.notify();
+    }
+
+    pub fn cancel_archive(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.archive_confirm = None;
+        if let Some(focus) = self.archive_return_focus.take() {
+            focus.focus(window, cx);
+        }
         cx.notify();
     }
 

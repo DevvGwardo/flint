@@ -1,7 +1,6 @@
-//! The terminal dock at the bottom of the main column: tabs of terminals
-//! (new shells start in the session's workspace), toggled with ⌃`,
-//! resized by dragging its top edge. Height and open state are kept in
-//! settings.
+//! Tabs of terminals (new shells start in the session's workspace), toggled
+//! with ⌃`. The workspace docking layout controls placement and resizing.
+//! The open state is kept in settings.
 
 use std::path::PathBuf;
 
@@ -30,8 +29,6 @@ pub struct TermPanel {
     pub height: f32,
     pub tabs: Vec<Entity<TermView>>,
     pub active: usize,
-    /// Drag in progress on the top edge: (pointer y at start, height at start).
-    pub resizing: Option<(Pixels, f32)>,
 }
 
 impl TermPanel {
@@ -41,7 +38,6 @@ impl TermPanel {
             height: height.max(MIN_HEIGHT),
             tabs: Vec::new(),
             active: 0,
-            resizing: None,
         }
     }
 
@@ -303,26 +299,6 @@ impl FlintApp {
                 .any(|view| view.read(cx).focus.is_focused(window))
     }
 
-    pub fn start_terminal_resize(&mut self, y: Pixels) {
-        self.terminal.resizing = Some((y, self.terminal.height));
-    }
-
-    /// Mouse moved while dragging the dock's edge.
-    pub fn drag_terminal_edge(&mut self, y: Pixels, window: &Window, cx: &mut Context<Self>) {
-        let Some((start_y, start_height)) = self.terminal.resizing else {
-            return;
-        };
-        let max = (f32::from(window.viewport_size().height) - 240.).max(MIN_HEIGHT);
-        self.terminal.height = (start_height + f32::from(start_y - y)).clamp(MIN_HEIGHT, max);
-        cx.notify();
-    }
-
-    pub fn end_terminal_resize(&mut self) {
-        if self.terminal.resizing.take().is_some() {
-            self.save_terminal_settings();
-        }
-    }
-
     fn save_terminal_settings(&mut self) {
         self.settings.terminal_open = self.terminal.open;
         self.settings.terminal_height = self.terminal.height;
@@ -338,59 +314,65 @@ pub fn render(app: &FlintApp, cx: &mut Context<FlintApp>) -> Option<AnyElement> 
         return None;
     }
     let p = palette();
-    let tabs = app.terminal.tabs.iter().enumerate().map(|(n, view)| {
-        let active = n == app.terminal.active;
-        let read_only = view.read(cx).read_only;
-        div()
-            .id(("terminal-tab", n))
-            .h(px(26.))
-            .pl(px(10.))
-            .pr(px(4.))
-            .rounded(px(7.))
-            .flex()
-            .items_center()
-            .gap(px(6.))
-            .cursor_pointer()
-            .when(active, |tab| tab.bg(p.raised))
-            .when(!active, |tab| tab.hover(|s| s.bg(hsla(0., 0., 1., 0.04))))
-            .on_click(
-                cx.listener(move |this, _, window, cx| this.select_terminal_tab(n, window, cx)),
-            )
-            .child(ui::icon(
-                if read_only {
-                    IconName::Bot
-                } else {
-                    IconName::SquareTerminal
-                },
-                13.,
-                if active { p.text } else { p.text_subtle },
-            ))
-            .child(
-                div()
-                    .max_w(px(220.))
-                    .truncate()
-                    .text_size(px(size::SM))
-                    .text_color(if active { p.text } else { p.text_muted })
-                    .child(view.read(cx).label()),
-            )
-            .child(
-                div()
-                    .id(("terminal-close", n))
-                    .size(px(18.))
-                    .rounded(px(4.))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .hover(|s| s.bg(p.border_strong))
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        cx.stop_propagation();
-                        this.close_terminal_tab(n, window, cx);
-                    }))
-                    .child(ui::icon(IconName::X, 11., p.text_subtle))
-                    .test_support(),
-            )
-            .test_support()
-    });
+    let tabs: Vec<_> = app
+        .terminal
+        .tabs
+        .iter()
+        .enumerate()
+        .map(|(n, view)| {
+            let active = n == app.terminal.active;
+            let read_only = view.read(cx).read_only;
+            div()
+                .id(("terminal-tab", n))
+                .h(px(26.))
+                .pl(px(10.))
+                .pr(px(4.))
+                .rounded(px(7.))
+                .flex()
+                .items_center()
+                .gap(px(6.))
+                .cursor_pointer()
+                .when(active, |tab| tab.bg(p.raised))
+                .when(!active, |tab| tab.hover(|s| s.bg(hsla(0., 0., 1., 0.04))))
+                .on_click(
+                    cx.listener(move |this, _, window, cx| this.select_terminal_tab(n, window, cx)),
+                )
+                .child(ui::icon(
+                    if read_only {
+                        IconName::Bot
+                    } else {
+                        IconName::SquareTerminal
+                    },
+                    13.,
+                    if active { p.text } else { p.text_subtle },
+                ))
+                .child(
+                    div()
+                        .max_w(px(220.))
+                        .truncate()
+                        .text_size(px(size::SM))
+                        .text_color(if active { p.text } else { p.text_muted })
+                        .child(view.read(cx).label()),
+                )
+                .child(
+                    div()
+                        .id(("terminal-close", n))
+                        .size(px(18.))
+                        .rounded(px(4.))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .hover(|s| s.bg(p.border_strong))
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            cx.stop_propagation();
+                            this.close_terminal_tab(n, window, cx);
+                        }))
+                        .child(ui::icon(IconName::X, 11., p.text_subtle))
+                        .test_support(),
+                )
+                .test_support()
+        })
+        .collect();
     let small_button = |id: &'static str, icon: IconName| {
         div()
             .id(id)
@@ -412,6 +394,7 @@ pub fn render(app: &FlintApp, cx: &mut Context<FlintApp>) -> Option<AnyElement> 
         .gap(px(4.))
         .border_b_1()
         .border_color(p.border)
+        .child(crate::docking::handle(crate::docking::Panel::Terminal, cx))
         .child(
             div()
                 .flex()
@@ -449,33 +432,15 @@ pub fn render(app: &FlintApp, cx: &mut Context<FlintApp>) -> Option<AnyElement> 
                 .on_click(cx.listener(|this, _, window, cx| this.toggle_terminal(window, cx)))
                 .test_support(),
         );
-    // The top edge is the resize handle.
-    let edge = div()
-        .id("terminal-edge")
-        .h(px(5.))
-        .w_full()
-        .flex_shrink_0()
-        .cursor(CursorStyle::ResizeUpDown)
-        .hover(|s| s.bg(p.accent.opacity(0.4)))
-        .on_mouse_down(
-            MouseButton::Left,
-            cx.listener(|this, event: &MouseDownEvent, _, _| {
-                this.start_terminal_resize(event.position.y)
-            }),
-        )
-        .test_support();
     Some(
         div()
             .id("terminal-panel")
-            .h(px(app.terminal.height))
-            .w_full()
-            .flex_shrink_0()
+            .size_full()
             .flex()
             .flex_col()
             .border_t_1()
             .border_color(p.border_strong)
             .bg(p.bg)
-            .child(edge)
             .child(tab_bar)
             .child(
                 div()

@@ -8,7 +8,9 @@ use flint_agent::AgentKind;
 use flint_agent::ApprovalMode;
 use flint_agent::ReasoningEffort;
 use gpui_kit::assets::IconName;
+use gpui_kit::component::input::Paste;
 use gpui_kit::component::input::Textarea;
+use gpui_kit::component::scroll::{Scrollbar, ScrollbarMode};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
@@ -23,8 +25,9 @@ use crate::ui;
 const THINKING_VERBS: &[&str] = &["Thinking", "Reasoning", "Pondering", "Mulling"];
 const WORKING_VERBS: &[&str] = &["Working", "Forging", "Tempering", "Kindling"];
 
-pub fn render(app: &FlintApp, cx: &mut Context<FlintApp>) -> AnyElement {
+pub fn render(app: &FlintApp, window: &Window, cx: &mut Context<FlintApp>) -> AnyElement {
     let p = palette();
+    let height = f32::from(window.viewport_size().height);
     let view = &app.session().view;
     let running = view.running;
     let now = app.now();
@@ -80,8 +83,12 @@ pub fn render(app: &FlintApp, cx: &mut Context<FlintApp>) -> AnyElement {
             }))
     });
 
-    let chips = (!app.attachments.is_empty()).then(|| {
+    let chips = (!app.attachments.is_empty() || !app.image_attachments.is_empty()).then(|| {
         div()
+            .id("composer-attachments")
+            .test_support()
+            .max_h(px(96.))
+            .overflow_y_scroll()
             .px(px(14.))
             .pt(px(12.))
             .flex()
@@ -116,6 +123,40 @@ pub fn render(app: &FlintApp, cx: &mut Context<FlintApp>) -> AnyElement {
                             .child(ui::icon(IconName::X, 11., p.text_subtle)),
                     )
             }))
+            .children(app.image_attachments.iter().enumerate().map(|(n, path)| {
+                let path_owned = path.clone();
+                div()
+                    .h(px(28.))
+                    .max_w_full()
+                    .pl(px(10.))
+                    .pr(px(4.))
+                    .flex()
+                    .items_center()
+                    .gap(px(6.))
+                    .rounded(px(8.))
+                    .bg(p.raised)
+                    .child(ui::icon(IconName::Paperclip, 13., p.accent))
+                    .child(ui::mono(crate::image_attach::name(path), size::XS, p.text).truncate())
+                    .child(
+                        div()
+                            .id(("remove-image", n))
+                            .size(px(20.))
+                            .flex_shrink_0()
+                            .rounded(px(5.))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .cursor_pointer()
+                            .hover(|s| s.bg(p.border_strong))
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.remove_image_attachment(&path_owned, cx);
+                                this.composer
+                                    .update(cx, |state, cx| state.focus(window, cx));
+                            }))
+                            .child(ui::icon(IconName::X, 11., p.text_subtle))
+                            .test_support(),
+                    )
+            }))
     });
 
     let effort_label = match app.effort {
@@ -124,9 +165,18 @@ pub fn render(app: &FlintApp, cx: &mut Context<FlintApp>) -> AnyElement {
         Some(ReasoningEffort::High) => "High",
         None => "Default",
     };
-    let (mode_icon, mode_text, mode_color) = match app.approval {
-        ApprovalMode::Auto => (IconName::ChevronsRight, "auto-run on", p.text_muted),
-        ApprovalMode::AskForChanges => (IconName::Hand, "ask before changes", p.warning),
+    let session = app.session();
+    let mode = session.native_approval.unwrap_or(app.approval);
+    let (mode_icon, mode_text, mode_color) = match mode {
+        ApprovalMode::Auto => (IconName::ChevronsRight, "native · auto-run", p.text_muted),
+        ApprovalMode::AskForChanges => (IconName::Hand, "native · ask for changes", p.warning),
+    };
+    let mode_text = if session.native_allow_all {
+        "native · all allowed in this engine"
+    } else if session.agent != AgentKind::Flint {
+        "Flint default for new native sessions"
+    } else {
+        mode_text
     };
 
     let send: AnyElement = if running {
@@ -144,9 +194,11 @@ pub fn render(app: &FlintApp, cx: &mut Context<FlintApp>) -> AnyElement {
     };
 
     let toolbar = div()
-        .h(px(52.))
+        .id("composer-toolbar")
+        .min_h(px(52.))
         .pl(px(10.))
         .pr(px(10.))
+        .py(px(8.))
         .flex()
         .items_center()
         .gap(px(6.))
@@ -169,6 +221,23 @@ pub fn render(app: &FlintApp, cx: &mut Context<FlintApp>) -> AnyElement {
                 .child(ui::icon(IconName::ChevronDown, 12., p.text_subtle))
                 .test_support(),
         )
+        .child(div().flex_1())
+        .when(app.pending_image_pastes > 0, |bar| {
+            bar.child(ui::label("Preparing image...", size::XS, p.text_muted))
+        })
+        .child(send)
+        .test_support();
+
+    let options = div()
+        .id("composer-options")
+        .max_h(px(90.))
+        .overflow_y_scroll()
+        .px(px(10.))
+        .pb(px(8.))
+        .flex()
+        .flex_wrap()
+        .items_center()
+        .gap(px(6.))
         .children(crate::option_chips::chips(app, cx))
         // ACP agents choose their own reasoning depth; the chip is flint's.
         .when(
@@ -183,56 +252,94 @@ pub fn render(app: &FlintApp, cx: &mut Context<FlintApp>) -> AnyElement {
                 )
             },
         )
-        .child(div().flex_1())
         // When the agent has its own modes, its mode chip replaces auto-run.
-        .when(app.session_slots().mode.is_none(), |bar| {
+        .when(app.session().agent == AgentKind::Flint, |bar| {
             bar.child(
                 chip("approval-hint")
                     .on_click(cx.listener(|this, _, _, cx| this.toggle_approval(cx)))
+                    .tooltip(|window, cx| {
+                        gpui_kit::component::tooltip::Tooltip::new(
+                        "Changes apply to new native engines only; running engines keep their mode."
+                    ).build(window, cx)
+                    })
                     .child(ui::icon(mode_icon, 14., mode_color))
                     .child(ui::label(mode_text, size::SM, mode_color))
                     .child(ui::label("shift+tab", size::SM, p.text_subtle)),
             )
         })
-        .child(div().w(px(4.)))
-        .child(send);
+        .test_support();
 
     let card = div()
         .w_full()
+        .max_h(px((height * 0.55).max(140.)))
+        .flex()
+        .flex_col()
         .rounded(px(20.))
         .border_1()
         .border_color(p.border_strong)
         .bg(p.surface)
         .shadow_lg()
         .overflow_hidden()
-        .children(tray)
-        .children(chips)
         .child(
-            div().px(px(12.)).pt(px(12.)).min_h(px(44.)).child(
-                Textarea::new(&app.composer)
-                    .appearance(false)
-                    .bordered(false)
-                    .text_size(px(size::MD)),
-            ),
+            div()
+                .id("composer-body")
+                .min_h_0()
+                .overflow_y_scroll()
+                .children(tray)
+                .children(chips)
+                .key_context("Composer")
+                .capture_action(cx.listener(|this, _: &Paste, _, cx| {
+                    if this.paste_composer_image(cx) {
+                        cx.stop_propagation();
+                    } else {
+                        cx.propagate();
+                    }
+                }))
+                .child(
+                    div().px(px(12.)).pt(px(12.)).min_h(px(44.)).child(
+                        Textarea::new(&app.composer)
+                            .appearance(false)
+                            .bordered(false)
+                            .text_size(px(size::MD)),
+                    ),
+                ),
         )
         .child(toolbar);
+    let card = card.child(options);
 
     // Menus float over the page instead of taking room in the column, so
     // opening one never pushes the welcome screen's hero into the header.
     // On the welcome screen they open below the composer (over the
-    // suggestions); in a conversation, above it.
+    // suggestions), unless the window is short; then they open above it.
     let welcome = app.session().view.items.is_empty();
-    let popover = crate::menus::render(app, cx)
+    let below = welcome && height >= 700.;
+    let popover_height = (height * if below { 0.42 } else { 0.32 }).max(100.);
+    let popover = crate::menus::render(app, popover_height, window, cx)
         .or_else(|| crate::project_menu::render(app, cx))
         .map(|menu| {
             deferred(
                 div()
+                    .id("composer-popover")
                     .absolute()
                     .left_0()
                     .w_full()
-                    .when(welcome, |d| d.top_full().mt(px(8.)))
-                    .when(!welcome, |d| d.bottom_full().mb(px(8.)))
-                    .child(menu),
+                    .when(below, |d| d.top_full().mt(px(8.)))
+                    .when(!below, |d| d.bottom_full().mb(px(8.)))
+                    .child(
+                        div()
+                            .id("composer-popover-content")
+                            .max_h(px(popover_height))
+                            .overflow_y_scroll()
+                            .track_scroll(&app.popover_scroll)
+                            .child(menu)
+                            .test_support(),
+                    )
+                    .when(app.option_menu.is_none(), |popover| {
+                        popover.child(
+                            Scrollbar::vertical(&app.popover_scroll).mode(ScrollbarMode::Always),
+                        )
+                    })
+                    .test_support(),
             )
             .with_priority(1)
         });
@@ -242,7 +349,7 @@ pub fn render(app: &FlintApp, cx: &mut Context<FlintApp>) -> AnyElement {
         .view
         .pending_approval()
         .map(|(call_id, kind, summary)| {
-            crate::transcript::pinned_approval(&call_id, kind, &summary, cx)
+            crate::transcript::pinned_approval(app, &call_id, kind, &summary, cx)
         });
 
     div()
@@ -348,10 +455,13 @@ fn chip(id: &'static str) -> Stateful<Div> {
     div()
         .id(id)
         .h(px(34.))
+        .max_w_full()
+        .min_w_0()
         .px(px(11.))
         .rounded(px(17.))
         .flex()
         .items_center()
+        .overflow_hidden()
         .gap(px(7.))
         .cursor_pointer()
         .hover(|style| style.bg(hsla(0., 0., 1., 0.05)))

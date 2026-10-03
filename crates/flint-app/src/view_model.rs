@@ -74,9 +74,24 @@ pub struct ToolCall {
     /// The agent's own terminal for this command, when it reported one; it
     /// has a read-only tab in the terminal dock.
     pub terminal_id: Option<String>,
+    pub subagent: Option<SubagentView>,
     pub started: Duration,
     pub result: Option<ToolResult>,
     pub expanded: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SubagentView {
+    pub session_id: String,
+    pub model: String,
+    pub view: SessionView,
+}
+
+/// Details actually received for a request, never reconstructed from its
+/// shortened summary or from a different session's workspace.
+pub struct ApprovalPreview {
+    pub agent: Option<String>,
+    pub fields: Vec<(&'static str, String)>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -134,6 +149,7 @@ pub struct SessionView {
     /// Usage summed over every finished turn.
     pub session_usage: Usage,
     pub changes: Vec<ChangedFile>,
+    pub(crate) changes_revision: u64,
     pub pending_approvals: usize,
     /// Every turn so far; see `turns.rs`.
     pub turns: Vec<TurnInfo>,
@@ -143,6 +159,68 @@ pub struct SessionView {
 }
 
 impl SessionView {
+    pub fn approval_preview(
+        &self,
+        call_id: &str,
+        workspace: &std::path::Path,
+        native: bool,
+    ) -> ApprovalPreview {
+        let mut agent = None;
+        let call = self.items.iter().find_map(|item| match item {
+            Item::Tool(call) if call.call_id == call_id => Some(call.as_ref()),
+            Item::Tool(call) => call.subagent.as_ref().and_then(|child| {
+                let found = child.view.items.iter().find_map(|item| match item {
+                    Item::Tool(tool) if tool.call_id == call_id => Some(tool.as_ref()),
+                    _ => None,
+                });
+                if found.is_some() {
+                    agent = Some(child.session_id.clone());
+                }
+                found
+            }),
+            _ => None,
+        });
+        let mut fields = Vec::new();
+        if let Some(call) = call {
+            if call.kind == ToolKind::Command {
+                if let Some(command) = ["command", "cmd", "script"]
+                    .iter()
+                    .find_map(|key| call.args.get(*key).and_then(|v| v.as_str()))
+                    .or_else(|| call.args.as_str())
+                {
+                    fields.push(("Command", command.to_string()));
+                }
+                let cwd = ["cwd", "working_directory"]
+                    .iter()
+                    .find_map(|key| call.args.get(*key).and_then(|v| v.as_str()));
+                if let Some(cwd) = cwd {
+                    fields.push(("Working directory", cwd.to_string()));
+                } else if native && call.name == "run_command" {
+                    fields.push(("Working directory", workspace.display().to_string()));
+                }
+            } else if call.kind == ToolKind::Edit {
+                for (key, label) in [
+                    ("path", "Affected file"),
+                    ("old_string", "Existing text"),
+                    ("new_string", "Replacement text"),
+                    ("content", "Proposed content"),
+                    ("diff", "Proposed diff"),
+                ] {
+                    if let Some(text) = call.args.get(key).and_then(|v| v.as_str()) {
+                        fields.push((label, text.to_string()));
+                    }
+                }
+            }
+            if fields.is_empty()
+                && !call.args.is_null()
+                && let Ok(arguments) = serde_json::to_string_pretty(&call.args)
+            {
+                fields.push(("Agent-provided arguments", arguments));
+            }
+        }
+        ApprovalPreview { agent, fields }
+    }
+
     /// Records a message the user sent (the engine does not echo it).
     pub fn push_user(&mut self, text: String) -> Change {
         if self.title.is_none() {
@@ -184,6 +262,7 @@ impl SessionView {
                     args,
                     output: String::new(),
                     terminal_id: None,
+                    subagent: None,
                     started: now,
                     result: None,
                     expanded: false,
@@ -227,6 +306,45 @@ impl SessionView {
                 }
                 Change::updated(ix)
             }
+            AgentEvent::SubagentStarted {
+                call_id,
+                session_id,
+                model,
+            } => {
+                let Some(ix) = self.tool_index(&call_id) else {
+                    return Change::default();
+                };
+                if let Item::Tool(call) = &mut self.items[ix] {
+                    let mut view = SessionView::default();
+                    if let Some(message) = call.args["message"].as_str() {
+                        view.push_user(message.to_string());
+                    }
+                    call.subagent = Some(SubagentView {
+                        session_id,
+                        model,
+                        view,
+                    });
+                }
+                Change::updated(ix)
+            }
+            AgentEvent::SubagentEvent { call_id, event } => {
+                let Some(ix) = self.tool_index(&call_id) else {
+                    return Change::default();
+                };
+                if let AgentEvent::ToolCallFinished {
+                    diff: Some(diff), ..
+                } = event.as_ref()
+                {
+                    self.record_change(diff);
+                    self.note_turn_file(diff);
+                }
+                if let Item::Tool(call) = &mut self.items[ix]
+                    && let Some(child) = &mut call.subagent
+                {
+                    child.view.fold(*event, now);
+                }
+                Change::updated(ix)
+            }
             AgentEvent::ApprovalRequested {
                 call_id,
                 kind,
@@ -259,6 +377,29 @@ impl SessionView {
             }
             AgentEvent::TurnFinished { reason, .. } => {
                 let mut change = self.close_streams(now);
+                // Interrupted approvals must not remain actionable.
+                for (ix, item) in self.items.iter_mut().enumerate() {
+                    if let Item::Approval { decision, .. } = item
+                        && decision.is_none()
+                    {
+                        *decision = Some(ApprovalDecision::Deny);
+                        change.updated.push(ix);
+                    }
+                    if let Item::Tool(call) = item
+                        && let Some(child) = &mut call.subagent
+                        && child.view.running
+                    {
+                        child.view.fold(
+                            AgentEvent::TurnFinished {
+                                turn_id: child.view.turn_id,
+                                reason: TurnEndReason::Interrupted,
+                            },
+                            now,
+                        );
+                        change.updated.push(ix);
+                    }
+                }
+                self.pending_approvals = 0;
                 let duration = self
                     .turn_started
                     .map(|started| now.saturating_sub(started))
@@ -280,6 +421,7 @@ impl SessionView {
                 change
             }
             AgentEvent::Error(message) => self.push(Item::Error(message)),
+            AgentEvent::SessionStopped { .. } => Change::default(),
             AgentEvent::ContextCompacted {
                 before_tokens,
                 after_tokens,
@@ -315,6 +457,17 @@ impl SessionView {
 
     /// Marks an approval card answered; returns its row.
     pub fn resolve_approval(&mut self, call_id: &str, decision: ApprovalDecision) -> Change {
+        self.resolve_approval_scoped(call_id, decision, true)
+    }
+
+    /// ACP's broad choice does not release its other pending requests; its
+    /// permission protocol handles each request separately.
+    pub fn resolve_approval_scoped(
+        &mut self,
+        call_id: &str,
+        decision: ApprovalDecision,
+        release_pending: bool,
+    ) -> Change {
         let found = self.items.iter().position(|item| {
             matches!(item, Item::Approval { call_id: id, decision: None, .. } if id == call_id)
         });
@@ -325,7 +478,19 @@ impl SessionView {
             *slot = Some(decision);
         }
         self.pending_approvals = self.pending_approvals.saturating_sub(1);
-        Change::updated(ix)
+        let mut change = Change::updated(ix);
+        if decision == ApprovalDecision::ApproveAlways && release_pending {
+            for (other, item) in self.items.iter_mut().enumerate() {
+                if let Item::Approval { decision: slot, .. } = item
+                    && slot.is_none()
+                {
+                    *slot = Some(ApprovalDecision::Approve);
+                    change.updated.push(other);
+                }
+            }
+            self.pending_approvals = 0;
+        }
+        change
     }
 
     /// Flips a thinking block or tool card open/closed.
@@ -427,7 +592,9 @@ impl SessionView {
     }
 
     fn record_change(&mut self, diff: &FileDiff) {
+        self.changes_revision = self.changes_revision.wrapping_add(1);
         if let Some(file) = self.changes.iter_mut().find(|f| f.path == diff.path) {
+            file.combined = None;
             file.added += diff.added;
             file.removed += diff.removed;
             file.diffs.push(diff.unified.clone());

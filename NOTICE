@@ -15,11 +15,18 @@ GPUI and gpui-kit (Apache-2.0)
   The user interface is built on GPUI, the GPU-accelerated UI framework from
   the Zed editor, through the gpui-kit crate (which also bundles GPUI Component).
 
+Zed agent delegation design (GPL-3.0-or-later) - https://github.com/zed-industries/zed
+  Flint's subagent engine is an independent implementation of the observable
+  spawn_agent behavior, not a copy of Zed's agent source. Reference revision:
+  badfb8d31f2a03d0e3d996897bb93779003f4607, specifically
+  crates/agent/src/tools/spawn_agent_tool.rs and crates/agent/src/thread.rs.
+  No GPL-licensed source is bundled or linked into Flint's agent engine.
+
 Agent Client Protocol (Apache-2.0) - https://agentclientprotocol.com
   crates/flint-acp speaks the Agent Client Protocol (through the
   agent-client-protocol crate) to run Claude Code and Codex through the
-  claude-agent-acp and codex-acp adapters. Those adapters and the agents
-  themselves are separate programs with their own licenses; flint does not
-  bundle them.
+  claude-agent-acp and codex-acp adapters, and Droid through its native ACP
+  server. Those adapters and the agents themselves are separate programs
+  with their own licenses; flint does not bundle them.
 
 Third-party Rust crates are used under their own licenses; see Cargo.lock.

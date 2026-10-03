@@ -1,5 +1,5 @@
 //! Choosing who runs a session: flint's own engine or an ACP agent (Claude
-//! Code, Codex). The choice applies to a session before its first message;
+//! Code, Codex, Droid). The choice applies to a session before its first message;
 //! after that the session keeps its agent and a new one is opened instead.
 
 use flint_acp::AcpAgent;
@@ -10,14 +10,20 @@ use gpui_kit::*;
 use crate::app::FlintApp;
 
 /// Agents offered by the picker, in order.
-pub const AGENTS: [AgentKind; 3] = [AgentKind::Flint, AgentKind::ClaudeCode, AgentKind::Codex];
+pub const AGENTS: [AgentKind; 4] = [
+    AgentKind::Flint,
+    AgentKind::ClaudeCode,
+    AgentKind::Codex,
+    AgentKind::Droid,
+];
 
-/// `/agent claude|codex|flint` typed into the composer.
+/// `/agent claude|codex|droid|flint` typed into the composer.
 pub fn parse_command(text: &str) -> Option<AgentKind> {
     let name = text.trim().strip_prefix("/agent")?.trim().to_lowercase();
     match name.as_str() {
         "claude" | "claude-code" | "claude code" | "cc" => Some(AgentKind::ClaudeCode),
         "codex" => Some(AgentKind::Codex),
+        "droid" | "factory" | "factory-droid" => Some(AgentKind::Droid),
         "flint" => Some(AgentKind::Flint),
         _ => None,
     }
@@ -29,6 +35,7 @@ pub fn about(kind: AgentKind) -> &'static str {
         AgentKind::Flint => "flint's own agent and harness",
         AgentKind::ClaudeCode => "Anthropic's agent, on your Claude plan (ACP)",
         AgentKind::Codex => "OpenAI's agent, on your ChatGPT plan (ACP)",
+        AgentKind::Droid => "Factory's agent, on your Factory account (ACP)",
     }
 }
 
@@ -36,8 +43,14 @@ impl FlintApp {
     /// The composer chip text: the agent, plus the model for flint.
     pub fn agent_label(&self, kind: AgentKind) -> String {
         match kind {
-            AgentKind::Flint => format!("flint · {}", self.model),
-            AgentKind::ClaudeCode | AgentKind::Codex => kind.label().to_string(),
+            AgentKind::Flint => format!(
+                "flint · {}",
+                self.session()
+                    .native_model
+                    .as_deref()
+                    .unwrap_or(&self.model)
+            ),
+            AgentKind::ClaudeCode | AgentKind::Codex | AgentKind::Droid => kind.label().to_string(),
         }
     }
 
@@ -137,6 +150,12 @@ mod tests {
         assert_eq!(parse_command("/agent claude"), Some(AgentKind::ClaudeCode));
         assert_eq!(parse_command(" /agent Codex "), Some(AgentKind::Codex));
         assert_eq!(parse_command("/agent flint"), Some(AgentKind::Flint));
+        assert_eq!(parse_command("/agent droid"), Some(AgentKind::Droid));
+        assert_eq!(parse_command(" /agent Droid "), Some(AgentKind::Droid));
+        assert_eq!(
+            parse_command("/agent factory-droid"),
+            Some(AgentKind::Droid)
+        );
         assert_eq!(parse_command("/agent gpt"), None);
         assert_eq!(parse_command("/agents claude"), None);
         assert_eq!(parse_command("tell the agent claude"), None);

@@ -28,15 +28,19 @@ pub const WRITE_FILE: &str = "write_file";
 pub const EDIT_FILE: &str = "edit_file";
 pub const LIST_DIR: &str = "list_dir";
 pub const GREP: &str = "grep";
+pub const SPAWN_AGENT: &str = "spawn_agent";
+pub const LIST_MODELS: &str = "list_models";
 
 /// Names of every tool, in the order they are offered.
-pub const TOOL_NAMES: [&str; 6] = [
+pub const TOOL_NAMES: [&str; 8] = [
     RUN_COMMAND,
     READ_FILE,
     WRITE_FILE,
     EDIT_FILE,
     LIST_DIR,
     GREP,
+    SPAWN_AGENT,
+    LIST_MODELS,
 ];
 
 /// What a finished tool call produced.
@@ -50,7 +54,7 @@ pub struct ToolOutcome {
 }
 
 impl ToolOutcome {
-    fn ok(output: impl Into<String>) -> Self {
+    pub(crate) fn ok(output: impl Into<String>) -> Self {
         Self {
             output: output.into(),
             exit_code: None,
@@ -59,7 +63,7 @@ impl ToolOutcome {
         }
     }
 
-    fn error(message: impl Into<String>) -> Self {
+    pub(crate) fn error(message: impl Into<String>) -> Self {
         Self {
             output: format!("Error: {}", message.into()),
             exit_code: None,
@@ -105,6 +109,7 @@ pub fn summary(name: &str, args: &Map<String, Value>) -> String {
             (None, None) => path.to_string(),
         },
         GREP => format!("{} in {path}", str_arg(args, "pattern").unwrap_or_default()),
+        SPAWN_AGENT => str_arg(args, "label").unwrap_or("Subagent").to_string(),
         WRITE_FILE | EDIT_FILE | LIST_DIR => path.to_string(),
         _ => serde_json::to_string(args).unwrap_or_default(),
     };
@@ -194,6 +199,34 @@ pub fn tool_specs() -> Vec<Value> {
                 "glob": {"type": "string", "description": "Only search files matching this glob, e.g. *.rs."}
             }),
             &["pattern"],
+        ),
+        spec(
+            SPAWN_AGENT,
+            "Delegate a self-contained task to an isolated subagent in the same workspace. \
+             It does not see your conversation: include all needed context in message. \
+             Returns only its final answer and a session_id for follow-ups. Consecutive independent \
+             calls in one response run in parallel (up to four); use disjoint write sets for edits. \
+             Do not delegate a single file read or duplicate delegated work. Omit model to use \
+             the configured subagent model, otherwise the parent model. For an explicit override, \
+             call list_models first and pass an exact model id. Never silently substitute models. \
+             A resumed session retains its model: do not combine model and session_id.",
+            json!({
+                "label": {"type": "string", "description": "Short task label for the UI."},
+                "message": {"type": "string", "description": "Full task and context, or a short follow-up."},
+                "session_id": {"type": "string", "description": "Existing child session to resume. Omit for a new session."},
+                "model": {"type": "string", "description": "Optional exact model id from list_models, on the configured endpoint."}
+            }),
+            &["label", "message"],
+        ),
+        spec(
+            LIST_MODELS,
+            "List model ids available on the configured endpoint, plus the parent and default \
+             subagent model. Results are paginated; use next_offset to read another page. \
+             Use before selecting an explicit spawn_agent model.",
+            json!({
+                "offset": {"type": "integer", "description": "First model index to return (default 0)."}
+            }),
+            &[],
         ),
     ]
 }

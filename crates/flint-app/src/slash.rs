@@ -28,7 +28,7 @@ pub const COMMANDS: &[(SlashCommand, &str, &str)] = &[
     (
         SlashCommand::Agent,
         "/agent",
-        "Switch agent: /agent claude, codex or flint",
+        "Switch agent: /agent claude, codex, droid or flint",
     ),
     (SlashCommand::Effort, "/effort", "Reasoning effort"),
     (

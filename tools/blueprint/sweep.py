@@ -34,6 +34,8 @@ STATES = [
     ("slash", ["--slash"], (1440, 900), "idle", "slash_open"),
     ("size-1100x800", ["--demo", "--demo-instant", "--size", "1100x800"], (1100, 800), "background", None),
     ("size-1000x700", ["--size", "1000x700"], (1000, 700), "idle", None),
+    ("size-900x560", ["--size", "900x560"], (900, 560), "idle", None),
+    ("settings-900x560", ["--settings", "--size", "900x560"], (900, 560), "idle", "settings_open"),
     ("size-1920x1200", ["--demo", "--demo-instant", "--size", "1920x1200"], (1920, 1200), "background", None),
 ]
 
@@ -66,7 +68,10 @@ def main() -> None:
     args = bp.args_parser(__doc__).parse_args()
     binary = bp.resolve_bin(args.bin)
     report = bp.Report("sweep", args.tag)
-    workspace = bp.ROOT  # demo states only display it; the agent never runs here
+    workspace = bp.fresh_dir(bp.OUT / "workspace" / f"sweep-{args.tag}")
+    # The mention picker needs at least one file, but must never index the
+    # user's repository or depend on its changing contents.
+    (workspace / "fixture.rs").write_text("// Disposable blueprint fixture.\n")
     perf = {}
     screen = bp.main_screen()
     for name, flags, (w, h), mode, expect in STATES:
@@ -75,7 +80,7 @@ def main() -> None:
         dump.unlink(missing_ok=True)
         app = bp.App(
             binary,
-            [str(workspace), *flags],
+            ["--workspace", str(workspace), *flags],
             env={"FLINT_BP_STATE": str(dump), "FLINT_BP_DUMP_AFTER_MS": str(int(SETTLE_S * 1000))},
             log=bp.LOGS / f"sweep-{args.tag}-{name}.log",
         )
@@ -92,13 +97,16 @@ def main() -> None:
         app.refresh_window()
         _, _, _, aw, ah = app.window
         sw, sh = screen
-        if w <= sw and h <= sh - 40:
-            report.check(f"{name}: window is {w}x{h}", (aw, ah) == (w, h), f"{aw}x{ah}")
+        if w <= sw and h <= sh:
+            # CoreGraphics reports a one-point rounding difference on some
+            # macOS displays, even when the requested content size fits.
+            report.check(f"{name}: window is {w}x{h}", abs(aw - w) <= 1 and abs(ah - h) <= 1, f"{aw}x{ah}")
         else:
-            # Larger than this display: macOS must clamp it to the screen.
+            # macOS clamps oversized windows to the main display's usable
+            # area, not its full resolution or a secondary display.
             report.check(
-                f"{name}: oversized window is clamped to the {sw}x{sh} screen",
-                aw <= sw and ah <= sh and aw >= min(w, sw) - 1,
+                f"{name}: oversized window is clamped to the {sw}x{sh} usable screen",
+                aw <= sw and ah <= sh and aw >= min(w, sw) - 1 and ah >= min(h, sh) - 1,
                 f"{aw}x{ah} (requested {w}x{h})",
             )
         shot = bp.UI / f"{args.tag}-{name}.png"

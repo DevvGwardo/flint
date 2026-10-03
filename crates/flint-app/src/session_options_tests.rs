@@ -116,3 +116,23 @@ fn shift_tab_skips_permissive_modes() {
             && !is_permissive("plan")
     );
 }
+
+#[test]
+fn droid_shift_tab_does_not_silently_enable_high_autonomy() {
+    let droid = option(
+        "autonomy_level",
+        Some("mode"),
+        "auto-medium",
+        &["normal", "spec", "auto-low", "auto-medium", "auto-high"],
+    );
+    assert_eq!(next_mode(&droid), Some("normal".into()));
+    assert_eq!(
+        next_mode(&SessionOption {
+            current: "normal".into(),
+            ..droid
+        }),
+        Some("spec".into())
+    );
+    assert!(is_permissive("auto-high"));
+    assert!(!is_permissive("auto-low"));
+}

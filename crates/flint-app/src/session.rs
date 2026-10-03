@@ -2,13 +2,16 @@
 //! its link to the engine (or the demo player), and its saved copy on disk.
 //! Sessions run independently, so several can work at once in the background.
 
+use std::collections::VecDeque;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
 use std::time::SystemTime;
 
 use flint_agent::AgentEvent;
 use flint_agent::AgentKind;
+use flint_agent::ApprovalMode;
 use flint_agent::FileDiff;
 use flint_agent::Op;
 use gpui_kit::*;
@@ -34,6 +37,11 @@ pub struct Session {
     pub agent_ready: bool,
     /// The ACP agent failed before it was ready.
     pub agent_failed: bool,
+    /// Config captured when a native engine starts; settings edits cannot
+    /// reconfigure an already-running engine.
+    pub native_model: Option<String>,
+    pub native_approval: Option<ApprovalMode>,
+    pub native_allow_all: bool,
     pub workspace: PathBuf,
     pub created: SystemTime,
     /// Last activity, for ordering and the sidebar's relative time.
@@ -51,9 +59,18 @@ pub struct Session {
     /// Time from sending to the first answer text.
     pub first_text: Option<Duration>,
     /// The last message as shown and as sent (with attachments), for Retry.
-    pub last_message: Option<(String, String)>,
+    pub last_message: Option<(String, String, Vec<flint_agent::ImageAttachment>)>,
+    /// Failed UI writes are retained in order and retried before archiving.
+    pub(crate) pending_records: VecDeque<Logged>,
+    pub(crate) event_writer: Option<store::EventWriter>,
+    pub(crate) persistence_task: Option<Task<()>>,
+    /// Shutdown has been requested; submissions and retries must wait.
+    pub stopping: bool,
+    pub(crate) history_save_failed: bool,
+    pub(crate) engine_shutdown_verified: bool,
     /// Every edit this session, oldest first: (turn index, diff).
-    diff_log: Vec<(usize, FileDiff)>,
+    diff_log: Vec<(usize, Arc<FileDiff>)>,
+    pub(crate) changes_task: Option<Task<()>>,
 }
 
 /// The sidebar's live status glyph for a session.
@@ -79,6 +96,9 @@ impl Session {
             options: Vec::new(),
             agent_ready: false,
             agent_failed: false,
+            native_model: None,
+            native_approval: None,
+            native_allow_all: false,
             workspace,
             created: SystemTime::now(),
             touched: SystemTime::now(),
@@ -89,7 +109,14 @@ impl Session {
             first_token: None,
             first_text: None,
             last_message: None,
+            pending_records: VecDeque::new(),
+            event_writer: None,
+            persistence_task: None,
+            stopping: false,
+            history_save_failed: false,
+            engine_shutdown_verified: true,
             diff_log: Vec::new(),
+            changes_task: None,
         }
     }
 
@@ -133,16 +160,56 @@ impl Session {
         }
     }
 
-    /// Appends to the saved event log (no-op for unsaved sessions).
-    pub fn log(&self, record: Logged) {
+    /// Queues an ordered saved event (no-op for unsaved sessions). A flush
+    /// barrier is required when the caller needs disk acknowledgment.
+    pub fn log(&mut self, record: Logged) -> std::io::Result<()> {
         if let Some(dir) = &self.dir {
-            store::append(dir, &record).ok();
+            self.pending_records.push_back(record);
+            if self.event_writer.is_none() {
+                self.event_writer = Some(store::EventWriter::new(dir.clone())?);
+            }
+            self.enqueue_pending()?;
+            self.event_writer.as_ref().unwrap().check_error()?;
         }
+        Ok(())
     }
 
-    pub fn save_meta(&self) {
+    fn enqueue_pending(&mut self) -> std::io::Result<()> {
+        let writer = self.event_writer.as_ref().unwrap();
+        while let Some(record) = self.pending_records.pop_front() {
+            if let Err(record) = writer.enqueue(record) {
+                self.pending_records.push_front(*record);
+                return Err(std::io::Error::other("session writer stopped"));
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn storage_failed(&self) -> bool {
+        !self.pending_records.is_empty()
+            || self
+                .event_writer
+                .as_ref()
+                .is_some_and(store::EventWriter::has_error)
+    }
+
+    pub fn flush_records(&mut self) -> std::io::Result<()> {
+        if self.event_writer.is_some() {
+            self.enqueue_pending()?;
+            return self.event_writer.as_ref().unwrap().flush();
+        }
+        if let Some(dir) = &self.dir {
+            while let Some(record) = self.pending_records.front() {
+                store::append(dir, record)?;
+                self.pending_records.pop_front();
+            }
+        }
+        Ok(())
+    }
+
+    pub fn save_meta(&self) -> std::io::Result<()> {
         let Some(dir) = &self.dir else {
-            return;
+            return Ok(());
         };
         let id = dir
             .file_name()
@@ -159,7 +226,6 @@ impl Session {
                 agent: self.agent,
             },
         )
-        .ok();
     }
 
     /// Records time to first token / first text for the last message.
@@ -183,7 +249,20 @@ impl Session {
     /// Remembers an edit; stats are settled at the end of the turn.
     pub fn record_edit(&mut self, diff: FileDiff) {
         let turn = self.view.turns.len().saturating_sub(1);
-        self.diff_log.push((turn, diff));
+        self.diff_log.push((turn, Arc::new(diff)));
+    }
+
+    pub(crate) fn record_event_edit(&mut self, event: &AgentEvent) {
+        let event = match event {
+            AgentEvent::SubagentEvent { event, .. } => event.as_ref(),
+            event => event,
+        };
+        if let AgentEvent::ToolCallFinished {
+            diff: Some(diff), ..
+        } = event
+        {
+            self.record_edit(diff.clone());
+        }
     }
 
     /// At the end of a turn, when the files on disk are final for it, rebuilds
@@ -192,36 +271,157 @@ impl Session {
     /// summed per-edit stats with one combined diff per file. Reading during
     /// the turn would race the engine's next edit.
     pub fn settle_changes(&mut self) {
-        let Some(turn) = self.view.turns.len().checked_sub(1) else {
-            return;
-        };
-        let mut paths: Vec<String> = Vec::new();
+        if let Some(snapshot) = self.changes_snapshot() {
+            self.apply_settled_changes(snapshot.compute());
+        }
+    }
+
+    /// Cheap owned input for background work. Patch text is shared, not copied.
+    pub fn changes_snapshot(&self) -> Option<ChangesSnapshot> {
+        let turn = self.view.turns.len().checked_sub(1)?;
+        let mut paths = std::collections::HashSet::new();
         for (t, diff) in &self.diff_log {
-            if *t == turn && !paths.contains(&diff.path) {
-                paths.push(diff.path.clone());
+            if *t == turn {
+                paths.insert(diff.path.clone());
             }
         }
-        for path in paths {
-            let current = std::fs::read_to_string(self.workspace.join(&path)).unwrap_or_default();
-            let edits: Vec<&(usize, FileDiff)> = self
+        paths.extend(
+            self.view
+                .changes
+                .iter()
+                .filter(|file| file.combined.is_none())
+                .map(|file| file.path.clone()),
+        );
+        if paths.is_empty() {
+            return None;
+        }
+        Some(ChangesSnapshot {
+            uid: self.uid,
+            workspace: self.workspace.clone(),
+            turn,
+            revision: self.view.changes_revision,
+            turn_stats: self
                 .diff_log
                 .iter()
-                .filter(|(_, d)| d.path == path)
-                .collect();
-            let turn_edits: Vec<&FileDiff> = edits
+                .filter(|(t, diff)| {
+                    *t == turn
+                        || !self.view.turns[*t]
+                            .file_stats
+                            .iter()
+                            .any(|(path, _, _)| *path == diff.path)
+                })
+                .map(|(t, diff)| (*t, diff.path.clone()))
+                .collect(),
+            edits: self
+                .diff_log
                 .iter()
-                .filter(|(t, _)| *t == turn)
-                .map(|(_, d)| d)
-                .collect();
-            if let Some(before_turn) = rewind(&current, &turn_edits) {
-                let (_, added, removed) = combined(&before_turn, &current, &path);
-                self.view.set_turn_file_stats(turn, &path, added, removed);
+                .filter(|(_, d)| paths.contains(&d.path))
+                .cloned()
+                .collect(),
+        })
+    }
+
+    /// Results never overwrite newer edits, another turn, or another workspace.
+    pub fn apply_settled_changes(&mut self, settled: SettledChanges) -> bool {
+        if self.uid != settled.uid
+            || self.workspace != settled.workspace
+            || self.view.running
+            || self.view.turns.len().checked_sub(1) != Some(settled.turn)
+            || self.view.changes_revision != settled.revision
+        {
+            return false;
+        }
+        for file in settled.files {
+            for (turn, added, removed) in file.turn_stats {
+                self.view
+                    .set_turn_file_stats(turn, &file.path, added, removed);
+                if let Some(end) = self.view.turns[turn].end {
+                    self.list.remeasure_items(end..end + 1);
+                }
             }
-            let all: Vec<&FileDiff> = edits.iter().map(|(_, d)| d).collect();
-            if let Some(original) = rewind(&current, &all) {
-                let (unified, added, removed) = combined(&original, &current, &path);
-                self.view.set_combined(&path, unified, added, removed);
+            if let Some((unified, added, removed)) = file.combined {
+                self.view.set_combined(&file.path, unified, added, removed);
             }
+        }
+        true
+    }
+}
+
+pub struct ChangesSnapshot {
+    uid: u64,
+    workspace: PathBuf,
+    turn: usize,
+    revision: u64,
+    turn_stats: std::collections::HashSet<(usize, String)>,
+    edits: Vec<(usize, Arc<FileDiff>)>,
+}
+
+pub struct SettledChanges {
+    uid: u64,
+    workspace: PathBuf,
+    turn: usize,
+    revision: u64,
+    files: Vec<SettledFile>,
+}
+
+struct SettledFile {
+    path: String,
+    turn_stats: Vec<(usize, usize, usize)>,
+    combined: Option<(String, usize, usize)>,
+}
+
+impl ChangesSnapshot {
+    /// All filesystem access, patch reversal, and diff generation happens here.
+    pub fn compute(self) -> SettledChanges {
+        let mut by_path: std::collections::BTreeMap<&str, Vec<(usize, &FileDiff)>> =
+            std::collections::BTreeMap::new();
+        for (turn, diff) in &self.edits {
+            by_path
+                .entry(&diff.path)
+                .or_default()
+                .push((*turn, diff.as_ref()));
+        }
+        let mut files = Vec::new();
+        for (path, edits) in by_path {
+            let current = match std::fs::read_to_string(self.workspace.join(path)) {
+                Ok(current) => current,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => String::new(),
+                // An unreadable file is not evidence of a deletion.
+                Err(_) => continue,
+            };
+            let mut turn_stats = Vec::new();
+            let mut after = current.clone();
+            let mut end = edits.len();
+            // Walk turn boundaries backwards once, using each turn's contents
+            // rather than today's file for older summaries.
+            while end > 0 {
+                let turn = edits[end - 1].0;
+                let start = edits[..end].partition_point(|(t, _)| *t < turn);
+                let group: Vec<_> = edits[start..end].iter().map(|(_, diff)| *diff).collect();
+                let Some(before) = rewind(&after, &group) else {
+                    break;
+                };
+                if self.turn_stats.contains(&(turn, path.to_string())) {
+                    let (_, added, removed) = combined(&before, &after, path);
+                    turn_stats.push((turn, added, removed));
+                }
+                after = before;
+                end = start;
+            }
+            let all: Vec<&FileDiff> = edits.iter().map(|(_, diff)| *diff).collect();
+            let net = rewind(&current, &all).map(|original| combined(&original, &current, path));
+            files.push(SettledFile {
+                path: path.to_string(),
+                turn_stats,
+                combined: net,
+            });
+        }
+        SettledChanges {
+            uid: self.uid,
+            workspace: self.workspace,
+            turn: self.turn,
+            revision: self.revision,
+            files,
         }
     }
 }
@@ -277,3 +477,7 @@ pub fn folder_name(path: &std::path::Path) -> String {
         .map(|name| name.to_string_lossy().to_string())
         .unwrap_or_else(|| path.display().to_string())
 }
+
+#[cfg(test)]
+#[path = "session_tests.rs"]
+mod tests;

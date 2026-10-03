@@ -12,15 +12,19 @@ pub mod app_input;
 pub mod app_store;
 pub mod changes_panel;
 pub mod composer;
+pub mod connection_test;
 pub mod demo;
 pub mod diff;
+pub mod docking;
 pub mod engine;
 pub mod header;
+mod image_attach;
 pub mod layout;
 pub mod mention;
 pub mod menus;
 pub mod option_chips;
 pub mod palette;
+pub mod permission_choice;
 pub mod project_menu;
 pub mod session;
 pub mod session_options;
@@ -67,7 +71,10 @@ pub fn parse_options(args: impl IntoIterator<Item = String>) -> Options {
             "--exit-after-turn" => options.exit_after_turn = true,
             "--demo-long" => options.demo_long = args.next().and_then(|n| n.parse().ok()),
             "--stream-test" => options.stream_test = args.next().and_then(|n| n.parse().ok()),
+            "--save-stream" => options.save_stream = true,
+            "--terminal-test" => options.terminal_test = args.next().and_then(|n| n.parse().ok()),
             "--scroll-test" => options.scroll_test = true,
+            "--diff-test" => options.diff_test = args.next().and_then(|n| n.parse().ok()),
             "--settings" => options.open_settings = true,
             "--mention" => options.open_mention = true,
             "--slash" => options.open_slash = true,
@@ -119,8 +126,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("tab", MenuAccept, Some("menu > Input")),
         KeyBinding::new("escape", MenuDismiss, Some("menu > Input")),
         // Ahead of the input's own Shift+Tab (outdent) inside the composer.
-        KeyBinding::new("shift-tab", ToggleApproval, Some("FlintApp > Input")),
-        KeyBinding::new("shift-tab", ToggleApproval, Some("FlintApp")),
+        KeyBinding::new("shift-tab", ToggleApproval, Some("Composer > Input")),
     ]);
 }
 
@@ -135,7 +141,7 @@ pub fn window_options(cx: &App, width: f32, height: f32) -> WindowOptions {
         titlebar: Some(TitlebarOptions {
             title: None,
             appears_transparent: true,
-            // Inside the floating sidebar's top row.
+            // In the fixed window strip above the dockable panels.
             traffic_light_position: Some(point(px(20.), px(21.))),
         }),
         ..TitleBar::window_options()

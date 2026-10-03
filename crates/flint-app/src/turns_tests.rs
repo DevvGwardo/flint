@@ -154,3 +154,46 @@ fn running_commands_feed_the_task_tray() {
     );
     assert_eq!(view.activity(), Activity::Running("npm test".into()));
 }
+
+#[test]
+fn interrupted_commands_do_not_leak_into_the_next_turns_task_tray() {
+    let mut view = SessionView::default();
+    view.fold(AgentEvent::TurnStarted { turn_id: 1 }, secs(0));
+    view.fold(
+        AgentEvent::ToolCallStarted {
+            call_id: "old".into(),
+            name: "run_command".into(),
+            kind: ToolKind::Command,
+            args: json!({}),
+            summary: "old command".into(),
+        },
+        secs(1),
+    );
+    assert_eq!(view.running_commands().len(), 1);
+    view.fold(
+        AgentEvent::TurnFinished {
+            turn_id: 1,
+            reason: TurnEndReason::Interrupted,
+        },
+        secs(2),
+    );
+    assert!(view.running_commands().is_empty());
+    view.fold(AgentEvent::TurnStarted { turn_id: 2 }, secs(3));
+    view.fold(
+        AgentEvent::ToolCallStarted {
+            call_id: "new".into(),
+            name: "run_command".into(),
+            kind: ToolKind::Command,
+            args: json!({}),
+            summary: "new command".into(),
+        },
+        secs(4),
+    );
+    assert_eq!(
+        view.running_commands()
+            .iter()
+            .map(|call| call.call_id.as_str())
+            .collect::<Vec<_>>(),
+        ["new"]
+    );
+}

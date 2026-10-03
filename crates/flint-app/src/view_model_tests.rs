@@ -27,6 +27,69 @@ fn started(call_id: &str, kind: ToolKind, summary: &str) -> AgentEvent {
 }
 
 #[test]
+fn approval_preview_uses_full_arguments_not_a_truncated_summary() {
+    let mut view = SessionView::default();
+    view.fold(
+        AgentEvent::ToolCallStarted {
+            call_id: "c1".into(),
+            name: "run_command".into(),
+            kind: ToolKind::Command,
+            args: json!({"command": "printf 'first\\nsecond\\n'", "timeout_secs": 10}),
+            summary: "printf 'first".into(),
+        },
+        secs(0),
+    );
+    let preview = view.approval_preview("c1", std::path::Path::new("/tmp/work"), true);
+    assert_eq!(
+        preview.fields,
+        vec![
+            ("Command", "printf 'first\\nsecond\\n'".into()),
+            ("Working directory", "/tmp/work".into())
+        ]
+    );
+    let missing = view.approval_preview("unknown", std::path::Path::new("/tmp/work"), false);
+    assert!(missing.fields.is_empty());
+
+    view.fold(
+        AgentEvent::ToolCallStarted {
+            call_id: "e1".into(),
+            name: "edit_file".into(),
+            kind: ToolKind::Edit,
+            args: json!({"path": "src/a.rs", "old_string": "before", "new_string": "after"}),
+            summary: "src/a.rs".into(),
+        },
+        secs(1),
+    );
+    assert_eq!(
+        view.approval_preview("e1", std::path::Path::new("/tmp/work"), true)
+            .fields,
+        vec![
+            ("Affected file", "src/a.rs".into()),
+            ("Existing text", "before".into()),
+            ("Replacement text", "after".into())
+        ]
+    );
+}
+
+#[test]
+fn acp_broad_approval_keeps_other_requests_pending() {
+    let mut view = SessionView::default();
+    for id in ["a", "b"] {
+        view.fold(
+            AgentEvent::ApprovalRequested {
+                call_id: id.into(),
+                kind: ToolKind::Command,
+                summary: id.into(),
+            },
+            secs(0),
+        );
+    }
+    view.resolve_approval_scoped("a", ApprovalDecision::ApproveAlways, false);
+    assert_eq!(view.pending_approvals, 1);
+    assert_eq!(view.pending_approval().unwrap().0, "b");
+}
+
+#[test]
 fn streams_reasoning_then_text_into_separate_items() {
     let mut view = SessionView::default();
     view.fold(AgentEvent::TurnStarted { turn_id: 1 }, secs(0));
@@ -109,6 +172,7 @@ fn tool_output_streams_then_finishes_and_failed_commands_open() {
             args: json!({}),
             output: "FAIL src/a.test.ts".into(),
             terminal_id: None,
+            subagent: None,
             started: secs(1),
             result: Some(ToolResult {
                 exit_code: Some(1),
@@ -157,6 +221,37 @@ fn edits_accumulate_in_changes() {
             combined: None,
         }]
     );
+}
+
+#[test]
+fn a_new_edit_invalidates_the_previous_combined_diff() {
+    let mut view = SessionView::default();
+    for n in 0..2 {
+        let id = format!("e{n}");
+        view.fold(started(&id, ToolKind::Edit, "a.txt"), secs(0));
+        view.fold(
+            AgentEvent::ToolCallFinished {
+                call_id: id,
+                output: "ok".into(),
+                exit_code: None,
+                success: true,
+                diff: Some(FileDiff {
+                    path: "a.txt".into(),
+                    unified: format!("+edit {n}"),
+                    added: 1,
+                    removed: 0,
+                    created: false,
+                }),
+                duration_ms: 5,
+            },
+            secs(1),
+        );
+        assert_eq!(view.changes[0].combined, None);
+        let revision = view.changes_revision;
+        view.set_combined("a.txt", format!("+settled {n}"), n + 1, 0);
+        assert_ne!(view.changes_revision, revision);
+    }
+    assert_eq!(view.changes[0].diffs, ["+edit 0", "+edit 1"]);
 }
 
 #[test]
@@ -327,4 +422,109 @@ fn a_terminals_call_gets_the_terminals_id() {
         ),
         Change::default()
     );
+}
+
+#[test]
+fn child_events_stay_nested_but_edits_contribute_to_parent_changes() {
+    let mut view = SessionView::default();
+    view.fold(AgentEvent::TurnStarted { turn_id: 1 }, secs(0));
+    view.fold(started("delegate", ToolKind::Other, "Research"), secs(1));
+    view.fold(
+        AgentEvent::SubagentStarted {
+            call_id: "delegate".into(),
+            session_id: "agent-1".into(),
+            model: "child-model".into(),
+        },
+        secs(1),
+    );
+    for event in [
+        AgentEvent::TurnStarted { turn_id: 1 },
+        AgentEvent::StepStarted {
+            turn_id: 1,
+            step: 3,
+        },
+        AgentEvent::TextDelta("Child answer.".into()),
+        started("agent-1:edit", ToolKind::Edit, "a.txt"),
+        AgentEvent::ToolCallFinished {
+            call_id: "agent-1:edit".into(),
+            output: "Created.".into(),
+            exit_code: None,
+            success: true,
+            duration_ms: 2,
+            diff: Some(FileDiff {
+                path: "a.txt".into(),
+                unified: "+hi".into(),
+                added: 1,
+                removed: 0,
+                created: true,
+            }),
+        },
+        AgentEvent::TurnFinished {
+            turn_id: 1,
+            reason: TurnEndReason::Completed,
+        },
+    ] {
+        assert_eq!(
+            view.fold(
+                AgentEvent::SubagentEvent {
+                    call_id: "delegate".into(),
+                    event: Box::new(event),
+                },
+                secs(2)
+            ),
+            Change::updated(0)
+        );
+    }
+    assert!(view.running);
+    assert_eq!(view.step, 0);
+    assert_eq!(view.items.len(), 1);
+    assert_eq!(view.changes[0].path, "a.txt");
+    assert_eq!(view.turns[0].files, vec!["a.txt"]);
+    let Item::Tool(call) = &view.items[0] else {
+        panic!("tool")
+    };
+    let child = call.subagent.as_ref().expect("child");
+    assert_eq!(child.model, "child-model");
+    assert!(!child.view.running);
+    assert!(child.view.items.iter().any(|item| matches!(item,
+        Item::Assistant { text, .. } if text == "Child answer."
+    )));
+}
+
+#[test]
+fn approve_always_resolves_parallel_child_approvals_and_interrupt_expires_them() {
+    let mut view = SessionView::default();
+    view.fold(AgentEvent::TurnStarted { turn_id: 1 }, secs(0));
+    for call_id in ["agent-1:edit", "agent-2:edit"] {
+        view.fold(
+            AgentEvent::ApprovalRequested {
+                call_id: call_id.into(),
+                kind: ToolKind::Edit,
+                summary: "a.txt".into(),
+            },
+            secs(1),
+        );
+    }
+    assert_eq!(view.pending_approvals, 2);
+    let change = view.resolve_approval("agent-1:edit", ApprovalDecision::ApproveAlways);
+    assert_eq!(change.updated, vec![0, 1]);
+    assert_eq!(view.pending_approvals, 0);
+    assert!(view.pending_approval().is_none());
+    view.fold(
+        AgentEvent::ApprovalRequested {
+            call_id: "agent-3:edit".into(),
+            kind: ToolKind::Edit,
+            summary: "a.txt".into(),
+        },
+        secs(2),
+    );
+    view.fold(
+        AgentEvent::TurnFinished {
+            turn_id: 1,
+            reason: TurnEndReason::Interrupted,
+        },
+        secs(3),
+    );
+    assert_eq!(view.pending_approvals, 0);
+    assert!(view.pending_approval().is_none());
 }

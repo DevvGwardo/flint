@@ -88,7 +88,10 @@ fn repair(messages: Vec<Message>) -> Vec<Message> {
         match &message {
             Message::System(_) => continue,
             Message::Tool { call_id, .. } => pending.retain(|id| id != call_id),
-            Message::User(_) | Message::Nudge(_) | Message::Assistant { .. } => {
+            Message::User(_)
+            | Message::UserWithImages { .. }
+            | Message::Nudge(_)
+            | Message::Assistant { .. } => {
                 close_pending(&mut out, &mut pending);
             }
         }
@@ -113,21 +116,25 @@ fn close_pending(out: &mut Vec<Message>, pending: &mut Vec<String>) {
 /// Background writer for one session directory.
 pub struct Saver {
     tx: async_channel::Sender<Vec<u8>>,
-    done: tokio::task::JoinHandle<()>,
+    done: tokio::task::JoinHandle<std::io::Result<()>>,
 }
 
 impl Saver {
     pub fn new(dir: PathBuf) -> Self {
         let (tx, rx) = async_channel::unbounded::<Vec<u8>>();
         let done = tokio::spawn(async move {
+            let mut result = Ok(());
             while let Ok(mut latest) = rx.recv().await {
                 // Skip snapshots that a newer one already replaces.
                 while let Ok(newer) = rx.try_recv() {
                     latest = newer;
                 }
                 let dir = dir.clone();
-                let _ = tokio::task::spawn_blocking(move || write_atomic(&dir, &latest)).await;
+                result = tokio::task::spawn_blocking(move || write_atomic(&dir, &latest))
+                    .await
+                    .unwrap_or_else(|_| Err(std::io::Error::other("history writer stopped")));
             }
+            result
         });
         Self { tx, done }
     }
@@ -138,9 +145,11 @@ impl Saver {
     }
 
     /// Waits until every queued snapshot is on disk.
-    pub async fn flush(self) {
+    pub async fn flush(self) -> std::io::Result<()> {
         self.tx.close();
-        let _ = self.done.await;
+        self.done
+            .await
+            .unwrap_or_else(|_| Err(std::io::Error::other("history writer stopped")))
     }
 }
 

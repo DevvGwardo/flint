@@ -41,6 +41,7 @@ pub fn render(app: &FlintApp, cx: &mut Context<FlintApp>) -> impl IntoElement {
                 .flex()
                 .items_center()
                 .gap(px(8.))
+                .child(crate::docking::handle(crate::docking::Panel::Changes, cx))
                 .child(ui::icon(IconName::FileDiff, 15., p.text_muted))
                 .child(
                     div()
@@ -98,6 +99,10 @@ pub fn render(app: &FlintApp, cx: &mut Context<FlintApp>) -> impl IntoElement {
     // A file list only when there is something to choose between.
     let list = (changes.len() > 1).then(|| {
         div()
+            .id("changed-files")
+            .max_h(px(160.))
+            .flex_shrink_0()
+            .overflow_y_scroll()
             .py(px(6.))
             .flex()
             .flex_col()
@@ -109,9 +114,13 @@ pub fn render(app: &FlintApp, cx: &mut Context<FlintApp>) -> impl IntoElement {
                 let (dir, name) = file.path.rsplit_once('/').unwrap_or(("", &file.path));
                 div()
                     .id(("change", ix))
+                    .aria_label(format!("Review {}", file.path))
+                    .tab_index(0)
+                    .focus_visible(|style| style.border_1().border_color(p.accent))
                     .mx(px(8.))
                     .px(px(12.))
                     .h(px(38.))
+                    .flex_shrink_0()
                     .rounded(px(9.))
                     .flex()
                     .items_center()
@@ -121,27 +130,27 @@ pub fn render(app: &FlintApp, cx: &mut Context<FlintApp>) -> impl IntoElement {
                     .when(!is_selected, |row| row.hover(|style| style.bg(p.surface)))
                     .on_click(cx.listener(move |this, _, _, cx| this.select_change(ix, cx)))
                     .child(ui::icon(file_icon(&file.path), 15., p.text_muted))
-                    .child(ui::mono(name.to_string(), size::SM, p.text).flex_shrink_0())
                     .child(
                         div()
                             .flex_1()
                             .min_w_0()
-                            .truncate()
-                            .text_size(px(size::XS))
-                            .text_color(p.text_subtle)
-                            .child(dir.to_string()),
+                            .flex()
+                            .flex_col()
+                            .child(ui::mono(name.to_string(), size::SM, p.text).truncate())
+                            .when(!dir.is_empty(), |col| {
+                                col.child(
+                                    ui::label(dir.to_string(), size::XS, p.text_subtle).truncate(),
+                                )
+                            }),
                     )
                     .child(ui::mono(format!("+{}", file.added), size::XS, p.success))
                     .child(ui::mono(format!("−{}", file.removed), size::XS, p.danger))
                     .test_support()
             }))
+            .test_support()
     });
 
     let detail = selected.and_then(|ix| changes.get(ix)).map(|file| {
-        let unified = file
-            .combined
-            .clone()
-            .unwrap_or_else(|| file.diffs.join("\n"));
         let path = app.session().workspace.join(&file.path);
         div()
             .flex_1()
@@ -173,7 +182,8 @@ pub fn render(app: &FlintApp, cx: &mut Context<FlintApp>) -> impl IntoElement {
                             .child(
                                 Button::new("open-editor")
                                     .outline()
-                                    .label("Open in editor")
+                                    .icon(IconName::ExternalLink)
+                                    .tooltip("Open in editor")
                                     .on_click(move |_, _, _| open_in_editor(&path)),
                             )
                             .test_support(),
@@ -181,12 +191,9 @@ pub fn render(app: &FlintApp, cx: &mut Context<FlintApp>) -> impl IntoElement {
             )
             .child(
                 div()
-                    .id("change-diff")
                     .flex_1()
                     .min_h_0()
-                    .overflow_scroll()
-                    .child(diff::render_wide(&unified))
-                    .test_support(),
+                    .child(diff::render_virtual(app, file)),
             )
     });
 

@@ -2,6 +2,7 @@
 //! the harness (loop detection, verify-before-done, zero-edit watchdog,
 //! tool-call repair, optional JEV judge). No UI code lives here.
 
+mod approvals;
 #[cfg(test)]
 mod bench_tests;
 pub mod config;
@@ -12,6 +13,7 @@ pub mod prompt;
 pub mod protocol;
 pub mod provider;
 mod session;
+mod subagents;
 pub mod tools;
 
 pub use protocol::*;

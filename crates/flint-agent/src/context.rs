@@ -153,7 +153,7 @@ fn turn_starts(history: &[Message]) -> Vec<usize> {
     history
         .iter()
         .enumerate()
-        .filter(|(_, m)| matches!(m, Message::User(_)))
+        .filter(|(_, m)| matches!(m, Message::User(_) | Message::UserWithImages { .. }))
         .map(|(i, _)| i)
         .collect()
 }
@@ -200,7 +200,11 @@ fn compact_message(message: &mut Message) -> bool {
             }
             changed
         }
-        Message::System(_) | Message::User(_) | Message::Nudge(_) | Message::Tool { .. } => false,
+        Message::System(_)
+        | Message::User(_)
+        | Message::UserWithImages { .. }
+        | Message::Nudge(_)
+        | Message::Tool { .. } => false,
     }
 }
 
@@ -236,6 +240,8 @@ fn message_chars(message: &Message) -> usize {
     MESSAGE_OVERHEAD_CHARS
         + match message {
             Message::System(text) | Message::User(text) | Message::Nudge(text) => text.len(),
+            // Base64 bytes are not text tokens. Budget conservatively per image.
+            Message::UserWithImages { text, images } => text.len() + images.len() * 8_000,
             // Reasoning is replayed on tool-call messages (see session.rs).
             Message::Assistant {
                 content,
