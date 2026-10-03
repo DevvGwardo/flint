@@ -41,8 +41,13 @@ use crate::provider::RawToolCall;
 use crate::provider::StreamDelta;
 use crate::tools;
 
-/// Model calls allowed in one user turn.
-pub const MAX_STEPS_PER_TURN: u32 = 60;
+/// Model calls allowed in one user turn: a cost backstop, not a working
+/// budget. A turn that is still working runs as long as it needs — the
+/// harness guard, not this cap, is what stops a spinning turn (a loop
+/// detector, and the verify/watchdog nudges when the model stops early) —
+/// so only a turn that goes far past any real task ends as
+/// [`TurnEndReason::StepLimit`].
+pub const MAX_STEPS_PER_TURN: u32 = 600;
 
 /// Runs a session until `Shutdown` or until the front end drops its sender.
 pub(crate) async fn run(config: AgentConfig, ops: Receiver<Op>, events: Sender<AgentEvent>) {

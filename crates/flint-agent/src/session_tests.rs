@@ -250,6 +250,38 @@ async fn full_loop_writes_runs_and_finishes() {
 }
 
 #[tokio::test]
+async fn a_long_turn_runs_past_sixty_model_calls() {
+    // 60 model calls used to end a turn mid-task ("Hit the step limit").
+    // The cap is a cost backstop far past any real task, so a turn that
+    // keeps working keeps going.
+    let (_guard, ws) = temp_workspace();
+    let lines: String = (1..=100).map(|n| format!("line {n}\n")).collect();
+    std::fs::write(ws.join("src.txt"), lines).expect("write");
+    let steps = 61;
+    let mut responses: Vec<String> = (0..steps)
+        .map(|n| {
+            sse_tool_call(
+                &format!("c{n}"),
+                "read_file",
+                json!({"path": "src.txt", "offset": n + 1, "limit": 1}),
+            )
+        })
+        .collect();
+    responses.push(sse_text("It holds 100 numbered lines."));
+    let (url, requests) = mock_server(responses).await;
+    let events = run_one_turn(url, ws, "what does src.txt contain?").await;
+
+    assert_eq!(
+        events.last(),
+        Some(&AgentEvent::TurnFinished {
+            turn_id: 1,
+            reason: TurnEndReason::Completed
+        })
+    );
+    assert_eq!(requests.lock().expect("lock").len(), steps as usize + 1);
+}
+
+#[tokio::test]
 async fn verify_nudge_fires_when_no_command_follows_an_edit() {
     let (_guard, ws) = temp_workspace();
     let (url, requests) = mock_server(vec![
