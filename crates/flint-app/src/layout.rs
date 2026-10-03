@@ -304,7 +304,12 @@ impl Render for FlintApp {
                 },
             )
             .when_some(self.palette.clone(), |root, state| {
-                root.child(crate::palette::render(&state, &self.palette_focus, cx))
+                root.child(crate::palette::render(
+                    &state,
+                    &self.palette_focus,
+                    f32::from(window.viewport_size().height),
+                    cx,
+                ))
             })
             .when_some(self.archive_confirm, |root, uid| {
                 root.child(deferred(

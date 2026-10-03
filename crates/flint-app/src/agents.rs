@@ -56,6 +56,7 @@ impl FlintApp {
 
     pub fn toggle_agent_menu(&mut self, cx: &mut Context<Self>) {
         self.agent_menu = !self.agent_menu;
+        self.menu_scroll.set_offset(Point::default());
         self.slash = None;
         self.mention = None;
         cx.notify();

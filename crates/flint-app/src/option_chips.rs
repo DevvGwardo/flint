@@ -3,7 +3,6 @@
 //! `session_options.rs`.
 
 use gpui_kit::assets::IconName;
-use gpui_kit::component::scroll::{Scrollbar, ScrollbarMode};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
@@ -151,7 +150,7 @@ pub fn menu(
 ) -> Option<AnyElement> {
     let p = palette();
     let menu = app.option_menu.as_ref()?;
-    if app.option_menu_needs_scroll.replace(false) {
+    if app.menu_needs_scroll.replace(false) {
         let view = cx.entity().downgrade();
         let target = menu.target.clone();
         let uid = app.session().uid;
@@ -162,7 +161,7 @@ pub fn menu(
                     && let Some(menu) = &app.option_menu
                     && menu.target == target
                 {
-                    app.option_menu_scroll.scroll_to_item(menu.selected);
+                    app.menu_scroll.scroll_to_item(menu.selected);
                     cx.notify();
                 }
             })
@@ -235,25 +234,12 @@ pub fn menu(
                         p.text_subtle,
                     )),
             )
-            .child(
-                div()
-                    .relative()
-                    .child(
-                        div()
-                            .id("option-menu-rows")
-                            .max_h(px((max_height - 44.).max(36.)))
-                            .overflow_y_scroll()
-                            .track_scroll(&app.option_menu_scroll)
-                            .pr(px(12.))
-                            .flex()
-                            .flex_col()
-                            .children(rows)
-                            .test_support(),
-                    )
-                    .child(
-                        Scrollbar::vertical(&app.option_menu_scroll).mode(ScrollbarMode::Always),
-                    ),
-            )
+            .child(crate::menus::scroll_rows(
+                app,
+                "option-menu-rows",
+                max_height,
+                rows,
+            ))
             .test_support()
             .into_any_element(),
     )

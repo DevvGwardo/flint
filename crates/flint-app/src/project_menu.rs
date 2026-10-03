@@ -18,6 +18,8 @@ use crate::ui;
 
 /// Recent folders shown in the menu.
 const RECENT_FOLDERS: usize = 6;
+/// The row the recent folders start at, under their "Recent folders" label.
+const RECENT_START: usize = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProjectItem {
@@ -53,6 +55,7 @@ impl FlintApp {
             Some(_) => None,
             None => Some(0),
         };
+        self.menu_scroll.set_offset(Point::default());
         self.mention = None;
         self.slash = None;
         self.agent_menu = false;
@@ -93,6 +96,16 @@ impl FlintApp {
             "enter" | "tab" => self.pick_project_item(selected, window, cx),
             "escape" => self.project_menu = None,
             _ => return false,
+        }
+        if let Some(selected) = self.project_menu {
+            // The "Recent folders" label is a child of the scrolling column
+            // too, so rows from the first recent folder on sit one lower.
+            let has_recent = self
+                .project_items()
+                .iter()
+                .any(|i| matches!(i, ProjectItem::Recent(_)));
+            let child = selected + usize::from(has_recent && selected >= RECENT_START);
+            self.menu_scroll.scroll_to_item(child);
         }
         cx.notify();
         true
@@ -163,11 +176,10 @@ fn short_path(path: &Path) -> String {
 }
 
 /// The "+" menu panel, when open.
-pub fn render(app: &FlintApp, cx: &mut Context<FlintApp>) -> Option<AnyElement> {
+pub fn render(app: &FlintApp, max_height: f32, cx: &mut Context<FlintApp>) -> Option<AnyElement> {
     let p = palette();
     let selected = app.project_menu?;
     let items = app.project_items();
-    let recent_start = 1;
     let has_recent = items.iter().any(|i| matches!(i, ProjectItem::Recent(_)));
     let rows = items.iter().enumerate().map(|(n, item)| {
         let (icon, label, detail) = item_label(item);
@@ -176,6 +188,7 @@ pub fn render(app: &FlintApp, cx: &mut Context<FlintApp>) -> Option<AnyElement> 
             .mx(px(6.))
             .px(px(10.))
             .h(px(36.))
+            .flex_shrink_0()
             .rounded(px(8.))
             .flex()
             .items_center()
@@ -191,7 +204,7 @@ pub fn render(app: &FlintApp, cx: &mut Context<FlintApp>) -> Option<AnyElement> 
     });
     let mut column: Vec<AnyElement> = Vec::new();
     for (n, row) in rows.enumerate() {
-        if n == recent_start && has_recent {
+        if n == RECENT_START && has_recent {
             column.push(
                 div()
                     .px(px(16.))
@@ -216,7 +229,12 @@ pub fn render(app: &FlintApp, cx: &mut Context<FlintApp>) -> Option<AnyElement> 
             .py(px(8.))
             .flex()
             .flex_col()
-            .children(column)
+            .child(crate::menus::scroll_rows(
+                app,
+                "project-menu-rows",
+                max_height,
+                column,
+            ))
             .test_support()
             .into_any_element(),
     )

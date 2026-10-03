@@ -2,6 +2,7 @@
 //! command menu, and the help card.
 
 use gpui_kit::assets::IconName;
+use gpui_kit::component::scroll::{Scrollbar, ScrollbarMode};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
@@ -45,6 +46,7 @@ fn item_row(id: impl Into<ElementId>, selected: bool) -> Stateful<Div> {
         .mx(px(6.))
         .px(px(10.))
         .h(px(36.))
+        .flex_shrink_0()
         .rounded(px(8.))
         .flex()
         .items_center()
@@ -52,6 +54,36 @@ fn item_row(id: impl Into<ElementId>, selected: bool) -> Stateful<Div> {
         .cursor_pointer()
         .when(selected, |row| row.bg(p.raised))
         .when(!selected, |row| row.hover(|s| s.bg(hsla(0., 0., 1., 0.04))))
+}
+
+/// What a list menu's panel adds around its rows: padding, border and header.
+pub const MENU_CHROME: f32 = 44.;
+
+/// A list menu's rows in a viewport at most `max_height` tall (the whole
+/// popover, chrome included) that scrolls with an always-visible scrollbar.
+/// Every list menu shares `app.menu_scroll`; the rows are the viewport's
+/// direct children, so `menu_scroll.scroll_to_item(n)` reaches row `n`.
+pub fn scroll_rows<E: IntoElement>(
+    app: &FlintApp,
+    id: &'static str,
+    max_height: f32,
+    rows: impl IntoIterator<Item = E>,
+) -> Div {
+    div()
+        .relative()
+        .child(
+            div()
+                .id(id)
+                .max_h(px((max_height - MENU_CHROME).max(36.)))
+                .overflow_y_scroll()
+                .track_scroll(&app.menu_scroll)
+                .pr(px(12.))
+                .flex()
+                .flex_col()
+                .children(rows)
+                .test_support(),
+        )
+        .child(Scrollbar::vertical(&app.menu_scroll).mode(ScrollbarMode::Always))
 }
 
 pub fn render(
@@ -92,7 +124,7 @@ pub fn render(
             panel()
                 .id("mention-menu")
                 .child(header(&title, "↑↓ choose · ⏎ attach · esc close"))
-                .children(rows)
+                .child(scroll_rows(app, "mention-menu-rows", max_height, rows))
                 .when(empty, |panel| {
                     panel.child(div().px(px(16.)).py(px(8.)).child(ui::label(
                         "No files match. Keep typing or press esc.",
@@ -138,7 +170,7 @@ pub fn render(
             panel()
                 .id("agent-menu")
                 .child(header("Agent", hint))
-                .children(rows)
+                .child(scroll_rows(app, "agent-menu-rows", max_height, rows))
                 .test_support()
                 .into_any_element(),
         );
@@ -164,7 +196,7 @@ pub fn render(
             panel()
                 .id("slash-menu")
                 .child(header("Commands", "↑↓ choose · ⏎ run · esc close"))
-                .children(rows)
+                .child(scroll_rows(app, "slash-menu-rows", max_height, rows))
                 .test_support()
                 .into_any_element(),
         );

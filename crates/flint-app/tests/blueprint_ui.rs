@@ -4144,12 +4144,11 @@ fn long_option_dropdown_scrolls_to_current_and_keyboard_selected_rows(cx: &mut T
                 row.bottom() <= viewport.bottom() + px(1.),
                 "{row:?} below {viewport:?}"
             );
-            assert!(viewport.size.height <= px(560. * 0.32));
         });
     };
     visible(&ui, cx, 30usize);
-    assert!(ui.read(cx, |app, _| app.option_menu_scroll.max_offset().y
-        > px(500.)));
+    assert_popover_inside_chat(&ui, cx);
+    assert!(ui.read(cx, |app, _| app.menu_scroll.max_offset().y > px(500.)));
     for _ in 0..9 {
         ui.press(cx, "down");
     }
@@ -4165,10 +4164,7 @@ fn long_option_dropdown_scrolls_to_current_and_keyboard_selected_rows(cx: &mut T
         ui.press(cx, "up");
     }
     visible(&ui, cx, 0usize);
-    assert_eq!(
-        ui.read(cx, |app, _| app.option_menu_scroll.offset().y),
-        px(0.)
-    );
+    assert_eq!(ui.read(cx, |app, _| app.menu_scroll.offset().y), px(0.));
     ui.with(cx, |window, cx| {
         window.scroll(
             "option-menu-rows",
@@ -4176,7 +4172,7 @@ fn long_option_dropdown_scrolls_to_current_and_keyboard_selected_rows(cx: &mut T
             cx,
         );
     });
-    let wheel_offset = ui.read(cx, |app, _| app.option_menu_scroll.offset().y);
+    let wheel_offset = ui.read(cx, |app, _| app.menu_scroll.offset().y);
     assert!(wheel_offset < px(0.));
     ui.with(cx, |window, cx| {
         let viewport = window.find("option-menu-rows").bounds();
@@ -4186,7 +4182,7 @@ fn long_option_dropdown_scrolls_to_current_and_keyboard_selected_rows(cx: &mut T
             cx,
         );
     });
-    let track_offset = ui.read(cx, |app, _| app.option_menu_scroll.offset().y);
+    let track_offset = ui.read(cx, |app, _| app.menu_scroll.offset().y);
     assert!(
         track_offset < wheel_offset,
         "scrollbar track must scroll the menu"
@@ -4205,10 +4201,158 @@ fn long_option_dropdown_scrolls_to_current_and_keyboard_selected_rows(cx: &mut T
         window.render_frame(cx);
     });
     assert_eq!(
-        ui.read(cx, |app, _| app.option_menu_scroll.offset().y),
+        ui.read(cx, |app, _| app.menu_scroll.offset().y),
         track_offset,
         "redrawing must preserve manual scrolling"
     );
+}
+
+/// A Claude Code session whose model option has `count` choices.
+fn long_model_session(cx: &mut TestAppContext, options: Options, count: usize) -> (Ui, Engine) {
+    let ui = open_with(cx, options);
+    ui.app.update(cx, |app, _| {
+        app.sessions[0].agent = flint_agent::AgentKind::ClaudeCode
+    });
+    let engine = ui.engine(cx);
+    engine.send(
+        cx,
+        AgentEvent::SessionOptions(vec![flint_agent::SessionOption {
+            id: "model".into(),
+            name: "Model".into(),
+            category: Some("model".into()),
+            description: None,
+            current: "model-0".into(),
+            choices: (0..count)
+                .map(|n| flint_agent::OptionChoice {
+                    value: format!("model-{n}"),
+                    name: format!("Model {n}"),
+                    description: Some(format!("Description for model {n}")),
+                })
+                .collect(),
+        }]),
+    );
+    (ui, engine)
+}
+
+/// Asserts the open composer popover lies inside the chat panel, and that
+/// the panel also contains the composer it belongs to.
+fn assert_popover_inside_chat(ui: &Ui, cx: &mut TestAppContext) {
+    ui.with(cx, |window, cx| {
+        // The first frame measures the room; the second uses it.
+        window.render_frame(cx);
+        window.simulate_next_frame(cx);
+        window.render_frame(cx);
+        let panel = window.find("dock-panel-chat").bounds();
+        let popover = window.find("composer-popover").bounds();
+        assert!(
+            popover.origin.y >= panel.origin.y - px(1.),
+            "popover {popover:?} rises above the chat panel {panel:?}"
+        );
+        assert!(
+            popover.bottom() <= panel.bottom() + px(1.),
+            "popover {popover:?} runs past the bottom of the chat panel {panel:?}"
+        );
+        assert!(
+            popover.size.height >= px(80.),
+            "popover {popover:?} is too short to use"
+        );
+    });
+}
+
+#[gpui_kit::test]
+fn long_model_menu_fits_below_the_welcome_composer(cx: &mut TestAppContext) {
+    // A tall window opens welcome-screen menus below the composer.
+    let (ui, _engine) = long_model_session(cx, test_options(), 60);
+    ui.click(cx, "option-model");
+    assert_popover_inside_chat(&ui, cx);
+}
+
+#[gpui_kit::test]
+fn long_model_menu_fits_the_chat_panel_beside_a_terminal_dock(cx: &mut TestAppContext) {
+    let (_dir, options) = docking_options();
+    let (ui, _engine) = long_model_session(
+        cx,
+        Options {
+            open_terminal: true,
+            ..options
+        },
+        60,
+    );
+    ui.click(cx, "option-model");
+    assert_popover_inside_chat(&ui, cx);
+}
+
+#[gpui_kit::test]
+fn long_model_menu_fits_a_conversation_beside_a_terminal_dock(cx: &mut TestAppContext) {
+    let (_dir, options) = docking_options();
+    let (ui, _engine) = long_model_session(
+        cx,
+        Options {
+            open_terminal: true,
+            window_size: Some((1200., 640.)),
+            ..options
+        },
+        60,
+    );
+    ui.press(cx, "cmd-l");
+    ui.input(cx, "hello");
+    ui.press(cx, "enter");
+    assert!(ui.read(cx, |app, _| !app.session().view.items.is_empty()));
+    ui.click(cx, "option-model");
+    assert_popover_inside_chat(&ui, cx);
+}
+
+#[gpui_kit::test]
+fn keyboard_keeps_the_selected_slash_command_in_view(cx: &mut TestAppContext) {
+    let ui = open_with(
+        cx,
+        Options {
+            window_size: Some((900., 420.)),
+            ..test_options()
+        },
+    );
+    ui.press(cx, "cmd-l");
+    ui.input(cx, "/");
+    let last = flint_app::slash::COMMANDS.len() - 1;
+    for _ in 0..last {
+        ui.press(cx, "down");
+    }
+    ui.with(cx, |window, cx| {
+        window.render_frame(cx);
+        window.simulate_next_frame(cx);
+        window.render_frame(cx);
+        let rows = window.find("slash-menu-rows").bounds();
+        let row = window.find(("slash-item", last)).bounds();
+        assert!(
+            row.origin.y >= rows.origin.y - px(1.),
+            "{row:?} above {rows:?}"
+        );
+        assert!(
+            row.bottom() <= rows.bottom() + px(1.),
+            "{row:?} below {rows:?}"
+        );
+    });
+    assert_popover_inside_chat(&ui, cx);
+}
+
+#[gpui_kit::test]
+fn command_palette_fits_a_short_window(cx: &mut TestAppContext) {
+    let ui = open_with(
+        cx,
+        Options {
+            window_size: Some((900., 420.)),
+            open_palette: true,
+            ..test_options()
+        },
+    );
+    ui.with(cx, |window, cx| {
+        window.render_frame(cx);
+        let palette = window.find("palette-focus-trap").bounds();
+        assert!(
+            palette.bottom() <= px(420.),
+            "palette {palette:?} runs past the bottom of a 420 px window"
+        );
+    });
 }
 
 #[gpui_kit::test]

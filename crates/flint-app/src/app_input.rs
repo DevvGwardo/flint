@@ -35,8 +35,12 @@ impl FlintApp {
         match slash::active_query(&text) {
             Some(query) => {
                 let count = slash::matches(query).len();
+                if self.slash.is_none() {
+                    self.menu_scroll.set_offset(Point::default());
+                }
                 let menu = self.slash.get_or_insert(SlashMenu { selected: 0 });
                 menu.selected = menu.selected.min(count.saturating_sub(1));
+                self.menu_scroll.scroll_to_item(menu.selected);
             }
             None => self.slash = None,
         }
@@ -66,6 +70,10 @@ impl FlintApp {
             .as_ref()
             .filter(|m| m.query == query)
             .map_or(0, |m| m.selected.min(results.len().saturating_sub(1)));
+        if self.mention.as_ref().is_none_or(|m| m.query != query) {
+            self.menu_scroll.set_offset(Point::default());
+        }
+        self.menu_scroll.scroll_to_item(selected);
         self.mention = Some(MentionMenu {
             query,
             results,
@@ -321,6 +329,9 @@ impl FlintApp {
                 "escape" => self.mention = None,
                 _ => return false,
             }
+            if let Some(menu) = &self.mention {
+                self.menu_scroll.scroll_to_item(menu.selected);
+            }
             cx.notify();
             return true;
         }
@@ -335,6 +346,9 @@ impl FlintApp {
                 }
                 "escape" => self.slash = None,
                 _ => return false,
+            }
+            if let Some(menu) = &self.slash {
+                self.menu_scroll.scroll_to_item(menu.selected);
             }
             cx.notify();
             return true;

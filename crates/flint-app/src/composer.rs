@@ -269,9 +269,12 @@ pub fn render(app: &FlintApp, window: &Window, cx: &mut Context<FlintApp>) -> An
         })
         .test_support();
 
+    // The chat panel can be one pane of a split, so cap the card by the
+    // panel's height once it has been measured, not the window's.
+    let panel_height = app.popover_room.area_height().unwrap_or(height);
     let card = div()
         .w_full()
-        .max_h(px((height * 0.55).max(140.)))
+        .max_h(px((panel_height * 0.55).max(140.)))
         .flex()
         .flex_col()
         .rounded(px(20.))
@@ -309,13 +312,23 @@ pub fn render(app: &FlintApp, window: &Window, cx: &mut Context<FlintApp>) -> An
 
     // Menus float over the page instead of taking room in the column, so
     // opening one never pushes the welcome screen's hero into the header.
-    // On the welcome screen they open below the composer (over the
-    // suggestions), unless the window is short; then they open above it.
+    // On the welcome screen they prefer to open below the composer (over the
+    // suggestions), elsewhere above it. Either way they take the side and
+    // height the chat panel has room for (see `popover::place`): they are
+    // deferred, so nothing clips them if they are taller than that.
     let welcome = app.session().view.items.is_empty();
-    let below = welcome && height >= 700.;
-    let popover_height = (height * if below { 0.42 } else { 0.32 }).max(100.);
+    let placement = app.popover_room.placement(welcome, height);
+    let below = placement.below;
+    let popover_height = placement.max_height;
+    // List menus scroll their own rows under a fixed header; only the help
+    // card scrolls as a whole.
+    let list_menu = app.mention.is_some()
+        || app.option_menu.is_some()
+        || app.agent_menu
+        || app.slash.is_some()
+        || app.project_menu.is_some();
     let popover = crate::menus::render(app, popover_height, window, cx)
-        .or_else(|| crate::project_menu::render(app, cx))
+        .or_else(|| crate::project_menu::render(app, popover_height, cx))
         .map(|menu| {
             deferred(
                 div()
@@ -323,8 +336,8 @@ pub fn render(app: &FlintApp, window: &Window, cx: &mut Context<FlintApp>) -> An
                     .absolute()
                     .left_0()
                     .w_full()
-                    .when(below, |d| d.top_full().mt(px(8.)))
-                    .when(!below, |d| d.bottom_full().mb(px(8.)))
+                    .when(below, |d| d.top_full().mt(px(crate::popover::GAP)))
+                    .when(!below, |d| d.bottom_full().mb(px(crate::popover::GAP)))
                     .child(
                         div()
                             .id("composer-popover-content")
@@ -334,7 +347,7 @@ pub fn render(app: &FlintApp, window: &Window, cx: &mut Context<FlintApp>) -> An
                             .child(menu)
                             .test_support(),
                     )
-                    .when(app.option_menu.is_none(), |popover| {
+                    .when(!list_menu, |popover| {
                         popover.child(
                             Scrollbar::vertical(&app.popover_scroll).mode(ScrollbarMode::Always),
                         )
@@ -366,7 +379,16 @@ pub fn render(app: &FlintApp, window: &Window, cx: &mut Context<FlintApp>) -> An
             |col| col.child(status_line(app)),
         )
         .children(pinned)
-        .child(div().relative().w_full().child(card).children(popover))
+        .child(
+            div()
+                .relative()
+                .w_full()
+                .child(card)
+                .child(crate::popover::probe(&app.popover_room, |room| {
+                    &room.anchor
+                }))
+                .children(popover),
+        )
         .into_any_element()
 }
 

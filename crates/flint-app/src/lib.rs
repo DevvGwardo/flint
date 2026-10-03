@@ -25,6 +25,7 @@ pub mod menus;
 pub mod option_chips;
 pub mod palette;
 pub mod permission_choice;
+pub mod popover;
 pub mod project_menu;
 pub mod session;
 pub mod session_options;

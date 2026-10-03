@@ -553,9 +553,12 @@ fn render_node(
                     .child(crate::header::render(app, window, cx))
                     .child(
                         div()
+                            .relative()
                             .flex_1()
                             .min_h_0()
-                            .child(crate::transcript::render_main(app, window, cx)),
+                            .child(crate::transcript::render_main(app, window, cx))
+                            // The room composer popovers must stay inside.
+                            .child(crate::popover::probe(&app.popover_room, |room| &room.area)),
                     )
                     .into_any_element(),
                 Panel::Changes => crate::changes_panel::render(app, cx).into_any_element(),

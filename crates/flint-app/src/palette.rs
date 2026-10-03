@@ -35,17 +35,27 @@ fn item(label: &str, icon: IconName, action: Box<dyn Action>) -> CommandItem {
         .action(action)
 }
 
+/// Room the palette's search field takes above its list.
+const INPUT_HEIGHT: f32 = 52.;
+/// Space kept under the palette.
+const BOTTOM_MARGIN: f32 = 24.;
+
 pub fn render(
     state: &Entity<CommandState>,
     focus: &FocusHandle,
+    window_height: f32,
     cx: &mut Context<FlintApp>,
 ) -> impl IntoElement {
     let p = palette();
+    // 120 px down and 380 px of list on a tall window; on a short one both
+    // shrink so the list ends above the window's bottom edge.
+    let top = (window_height * 0.15).min(120.);
+    let list_height = (window_height - top - INPUT_HEIGHT - BOTTOM_MARGIN).clamp(120., 380.);
     let this = cx.entity().downgrade();
     let on_confirm = this.clone();
     let command = Command::new(state)
         .placeholder("Type a command…")
-        .max_h(px(380.))
+        .max_h(px(list_height))
         .group(
             CommandGroup::new()
                 .label("Session")
@@ -148,7 +158,7 @@ pub fn render(
             .flex()
             .items_start()
             .justify_center()
-            .pt(px(120.))
+            .pt(px(top))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _, window, cx| this.close_palette(window, cx)),
@@ -165,7 +175,8 @@ pub fn render(
                     .overflow_hidden()
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .child(command)
-                    .focus_trap("palette-focus-trap", focus),
+                    .focus_trap("palette-focus-trap", focus)
+                    .test_support(),
             ),
     )
     .with_priority(10)
