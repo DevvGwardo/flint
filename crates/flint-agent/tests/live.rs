@@ -68,6 +68,9 @@ fn live_creates_and_tests_add_py() {
                 eprintln!("compacted {before_tokens} -> {after_tokens}");
             }
             AgentEvent::SessionOptions(_) => {}
+            AgentEvent::TerminalStarted { .. }
+            | AgentEvent::TerminalOutput { .. }
+            | AgentEvent::TerminalExited { .. } => {}
             AgentEvent::TurnFinished { reason, .. } => {
                 eprintln!("finished {reason:?}");
                 finished = Some(reason.clone());

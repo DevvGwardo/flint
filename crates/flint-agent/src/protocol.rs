@@ -205,6 +205,24 @@ pub enum AgentEvent {
     /// when the session is ready and whenever they change. An ACP session
     /// always sends this once it is ready, even if the list is empty.
     SessionOptions(Vec<SessionOption>),
+    /// The agent ran a command whose output can be shown as a read-only
+    /// terminal tab. `call_id` links it to its tool call.
+    TerminalStarted {
+        terminal_id: String,
+        call_id: Option<String>,
+        label: String,
+        cwd: Option<PathBuf>,
+    },
+    /// Output for a terminal: appended, or the whole output when `replace`.
+    TerminalOutput {
+        terminal_id: String,
+        data: String,
+        replace: bool,
+    },
+    TerminalExited {
+        terminal_id: String,
+        exit_code: Option<i32>,
+    },
 }
 
 /// One setting the agent exposes, e.g. its model or permission mode.

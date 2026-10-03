@@ -29,6 +29,10 @@ pub struct Settings {
     pub theme: String,
     /// The welcome tip about the guard was dismissed.
     pub tip_dismissed: bool,
+    /// The terminal dock was open when flint last closed.
+    pub terminal_open: bool,
+    /// The terminal dock's height in pixels.
+    pub terminal_height: f32,
 }
 
 impl Default for Settings {
@@ -42,6 +46,8 @@ impl Default for Settings {
             effort: "medium".to_string(),
             theme: "dark".to_string(),
             tip_dismissed: false,
+            terminal_open: false,
+            terminal_height: crate::term_panel::DEFAULT_HEIGHT,
         }
     }
 }

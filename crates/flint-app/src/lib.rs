@@ -37,6 +37,9 @@ pub mod view_model;
 
 pub mod automation;
 pub mod synthetic;
+pub mod term_paint;
+pub mod term_panel;
+pub mod term_view;
 
 use gpui_kit::component::TitleBar;
 use gpui_kit::*;
@@ -53,6 +56,8 @@ pub fn parse_options(args: impl IntoIterator<Item = String>) -> Options {
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--demo" => options.demo = true,
+            "--open-terminal" => options.open_terminal = true,
+            "--terminal-input" => options.terminal_input = args.next(),
             "--demo-instant" => options.demo_instant = true,
             "--demo-stop" => options.demo_stop = args.next().and_then(|n| n.parse().ok()),
             "--demo-approval" => options.demo_approval = true,
@@ -99,6 +104,14 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("cmd-,", OpenSettings, None),
         KeyBinding::new("cmd-shift-r", RevealWorkspace, None),
         KeyBinding::new("cmd-shift-t", OpenTerminal, None),
+        KeyBinding::new("ctrl-`", ToggleTerminal, None),
+        // In a terminal, Shift+Tab goes to the shell (back-tab), not to the
+        // approval toggle.
+        KeyBinding::new(
+            "shift-tab",
+            crate::term_view::TerminalShiftTab,
+            Some("Terminal"),
+        ),
         // While a composer menu is open, these keys drive it instead of the input.
         KeyBinding::new("up", MenuUp, Some("menu > Input")),
         KeyBinding::new("down", MenuDown, Some("menu > Input")),

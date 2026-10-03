@@ -23,6 +23,9 @@ ignore = "0.4.33"
 toml = "1.1.6"
 diffy = "0.5.2"
 serde = { workspace = true, features = ["derive"] }
+flint-term.workspace = true
+unicode-width = "0.2.2"
+regex = "1.13.1"
 
 [dev-dependencies]
 pretty_assertions = "1"

@@ -26,16 +26,30 @@ impl Render for FlintApp {
             self.sidebar_open && width >= px(1000.) && !(self.changes_open && width < px(1280.));
         self.sidebar_visible = sidebar;
         let main = div()
+            .id("main-column")
             .size_full()
             .flex()
             .flex_col()
+            // Dragging the terminal dock's top edge.
+            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, window, cx| {
+                if event.pressed_button == Some(MouseButton::Left) {
+                    this.drag_terminal_edge(event.position.y, window, cx);
+                } else {
+                    this.end_terminal_resize();
+                }
+            }))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _, _, _| this.end_terminal_resize()),
+            )
             .child(crate::header::render(self, window, cx))
             .child(
                 div()
                     .flex_1()
                     .min_h_0()
                     .child(crate::transcript::render_main(self, window, cx)),
-            );
+            )
+            .children(crate::term_panel::render(self, cx));
         let body = h_resizable("flint-body")
             .child(resizable_panel().child(main))
             .child(
@@ -77,6 +91,10 @@ impl Render for FlintApp {
                 if this.palette.is_some() {
                     return;
                 }
+                // Keys typed in a terminal belong to the shell (Esc, Tab, …).
+                if this.terminal_focused(window, cx) {
+                    return;
+                }
                 if this.handle_menu_key(&key, window, cx) {
                     cx.stop_propagation();
                 } else if key.key == "escape" && this.help_open {
@@ -89,6 +107,11 @@ impl Render for FlintApp {
                 }
             }))
             .on_action(cx.listener(|this, _: &NewSession, window, cx| this.new_session(window, cx)))
+            .on_action(
+                cx.listener(|this, _: &ToggleTerminal, window, cx| {
+                    this.toggle_terminal(window, cx)
+                }),
+            )
             .on_action(cx.listener(|this, _: &NewClaudeSession, window, cx| {
                 this.new_agent_session(AgentKind::ClaudeCode, window, cx)
             }))

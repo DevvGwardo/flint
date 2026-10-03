@@ -284,7 +284,11 @@ impl SessionView {
                 after_tokens,
             }),
             // Kept on the session (composer chips), not in the transcript.
-            AgentEvent::SessionOptions(_) => Change::default(),
+            // Kept on the session or in terminal tabs, not in the transcript.
+            AgentEvent::SessionOptions(_)
+            | AgentEvent::TerminalStarted { .. }
+            | AgentEvent::TerminalOutput { .. }
+            | AgentEvent::TerminalExited { .. } => Change::default(),
         }
     }
 

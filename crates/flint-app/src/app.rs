@@ -37,6 +37,7 @@ actions!(
         FocusComposer,
         RevealWorkspace,
         OpenTerminal,
+        ToggleTerminal,
         RenameSession,
         MenuUp,
         MenuDown,
@@ -53,6 +54,15 @@ pub struct Options {
     /// Start an ACP agent as soon as it is picked, so its options (model,
     /// mode, …) are ready before the first message. Off in tests.
     pub start_agents_early: bool,
+    /// Open the terminal dock on launch (automation).
+    pub open_terminal: bool,
+    /// Typed into the first terminal on launch, followed by Enter.
+    pub terminal_input: Option<String>,
+    /// Shell for new terminals instead of `$SHELL -l` (tests).
+    pub terminal_command: Option<(String, Vec<String>)>,
+    /// Poll terminals for output on a timer instead of being woken from
+    /// the PTY thread (GPUI's deterministic test scheduler forbids that).
+    pub terminal_poll: bool,
     pub workspace: Option<PathBuf>,
     pub demo: bool,
     /// Demo: stop after this many scripted events (mid-stream screenshots).
@@ -138,6 +148,8 @@ pub struct FlintApp {
     pub help_open: bool,
     /// The agent picker above the composer is open.
     pub agent_menu: bool,
+    /// The terminal dock.
+    pub terminal: crate::term_panel::TermPanel,
     /// An agent-option menu (model, reasoning, mode, more) is open.
     pub option_menu: Option<crate::session_options::OptionMenu>,
     /// The "+" menu (project folder, recent folders, attach) and its selection.
@@ -177,6 +189,7 @@ impl FlintApp {
         let key_path = options.key_path.clone();
         let key_sources = options.key_sources.clone().unwrap_or_default();
         let settings = Settings::load(&home, &key_sources);
+        let terminal_height = settings.terminal_height;
         let composer = cx.new(|cx| {
             TextareaState::new(window, cx)
                 .auto_grow(1, 8)
@@ -222,6 +235,7 @@ impl FlintApp {
             settings_form: None,
             help_open: false,
             agent_menu: false,
+            terminal: crate::term_panel::TermPanel::new(false, terminal_height),
             option_menu: None,
             project_menu: None,
             copied: None,
@@ -295,6 +309,16 @@ impl FlintApp {
             app.composer
                 .update(cx, |state, cx| state.set_value("/", window, cx));
             app.composer_changed(window, cx);
+        }
+        // Reopen the terminal dock if it was open last time.
+        if (app.settings.terminal_open && !app.options.ephemeral()) || app.options.open_terminal {
+            app.toggle_terminal(window, cx);
+            if let (Some(text), Some(view)) = (
+                app.options.terminal_input.clone(),
+                app.terminal.active_view(),
+            ) {
+                view.read(cx).write(format!("{text}\r").into_bytes());
+            }
         }
         app
     }

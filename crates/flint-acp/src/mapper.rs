@@ -23,6 +23,8 @@ use flint_agent::tools::file_diff;
 use flint_agent::tools::head_tail;
 use serde_json::Value;
 
+use crate::terminal_meta::TermMeta;
+
 /// Characters of tool output kept for a row.
 const OUTPUT_CHARS: usize = 8_000;
 
@@ -36,6 +38,8 @@ struct Call {
     /// The diff came from our own fs write; the agent's copy is ignored.
     diff_from_write: bool,
     finished: bool,
+    /// Exit code reported through the terminal extension.
+    exit_code: Option<i32>,
 }
 
 /// Mapping state for one session.
@@ -49,6 +53,10 @@ pub struct Mapper {
     calls: HashMap<String, Call>,
     order: Vec<String>,
     writes: u32,
+    /// Prefix for terminal tab labels ("claude: npm test").
+    label_prefix: String,
+    /// Terminals already announced, by id.
+    terminals: HashMap<String, String>,
 }
 
 impl Mapper {
@@ -61,7 +69,15 @@ impl Mapper {
             calls: HashMap::new(),
             order: Vec::new(),
             writes: 0,
+            label_prefix: "agent".to_string(),
+            terminals: HashMap::new(),
         }
+    }
+
+    /// Terminal tabs are labelled `"{prefix}: {command}"`.
+    pub fn with_label_prefix(mut self, prefix: &str) -> Self {
+        self.label_prefix = prefix.to_string();
+        self
     }
 
     pub fn turn_id(&self) -> u64 {
@@ -121,10 +137,20 @@ impl Mapper {
                     .content(call.content)
                     .raw_input(call.raw_input)
                     .raw_output(call.raw_output);
-                self.tool(call.tool_call_id.to_string(), fields, &mut out);
+                self.tool(
+                    call.tool_call_id.to_string(),
+                    fields,
+                    call.meta.as_ref(),
+                    &mut out,
+                );
             }
             SessionUpdate::ToolCallUpdate(update) => {
-                self.tool(update.tool_call_id.to_string(), update.fields, &mut out);
+                self.tool(
+                    update.tool_call_id.to_string(),
+                    update.fields,
+                    update.meta.as_ref(),
+                    &mut out,
+                );
             }
             SessionUpdate::UsageUpdate(_)
             | SessionUpdate::UserMessageChunk(_)
@@ -140,7 +166,13 @@ impl Mapper {
     }
 
     /// Starts a call the first time it is seen; finishes it on a terminal status.
-    fn tool(&mut self, id: String, fields: ToolCallUpdateFields, out: &mut Vec<AgentEvent>) {
+    fn tool(
+        &mut self,
+        id: String,
+        fields: ToolCallUpdateFields,
+        meta: Option<&serde_json::Map<String, Value>>,
+        out: &mut Vec<AgentEvent>,
+    ) {
         self.after_tool = true;
         if !self.calls.contains_key(&id) {
             let kind = fields.kind.map_or(ToolKind::Other, map_kind);
@@ -165,6 +197,7 @@ impl Mapper {
                     diff: None,
                     diff_from_write: false,
                     finished: false,
+                    exit_code: None,
                 },
             );
             self.order.push(id.clone());
@@ -203,6 +236,12 @@ impl Mapper {
         {
             call.output = raw_output_text(raw);
         }
+        if let Some(meta) = meta {
+            self.terminal_meta(&id, meta, out);
+        }
+        let Some(call) = self.calls.get_mut(&id) else {
+            return;
+        };
         let done = match fields.status {
             Some(ToolCallStatus::Completed) => Some(true),
             Some(ToolCallStatus::Failed) => Some(false),
@@ -214,6 +253,68 @@ impl Mapper {
         {
             call.finished = true;
             out.push(finished_event(&id, call, success));
+        }
+    }
+
+    /// Applies the terminal extension's `_meta` for a tool call: announces
+    /// the terminal, forwards its output (also kept as the call's output)
+    /// and its exit code.
+    fn terminal_meta(
+        &mut self,
+        call_id: &str,
+        meta: &serde_json::Map<String, Value>,
+        out: &mut Vec<AgentEvent>,
+    ) {
+        for item in crate::terminal_meta::parse(meta) {
+            let (TermMeta::Info { terminal_id, .. }
+            | TermMeta::Output { terminal_id, .. }
+            | TermMeta::Exit { terminal_id, .. }) = &item;
+            let terminal_id = terminal_id.clone();
+            if !self.terminals.contains_key(&terminal_id) {
+                let cwd = match &item {
+                    TermMeta::Info { cwd, .. } => cwd.clone(),
+                    TermMeta::Output { .. } | TermMeta::Exit { .. } => None,
+                };
+                let title = self
+                    .calls
+                    .get(call_id)
+                    .map(|c| c.title.clone())
+                    .unwrap_or_default();
+                self.terminals
+                    .insert(terminal_id.clone(), call_id.to_string());
+                out.push(AgentEvent::TerminalStarted {
+                    terminal_id: terminal_id.clone(),
+                    call_id: Some(call_id.to_string()),
+                    label: format!("{}: {title}", self.label_prefix),
+                    cwd,
+                });
+            }
+            match item {
+                TermMeta::Info { .. } => {}
+                TermMeta::Output { data, replace, .. } => {
+                    if let Some(call) = self.calls.get_mut(call_id) {
+                        if replace {
+                            call.output = data.clone();
+                        } else {
+                            call.output.push_str(&data);
+                        }
+                    }
+                    out.push(AgentEvent::TerminalOutput {
+                        terminal_id,
+                        data,
+                        replace,
+                    });
+                }
+                TermMeta::Exit { exit_code, .. } => {
+                    if let Some(call) = self.calls.get_mut(call_id) {
+                        call.exit_code = exit_code;
+                    }
+                    out.push(AgentEvent::TerminalExited {
+                        terminal_id,
+                        exit_code,
+                    });
+                }
+            }
         }
     }
 
@@ -264,7 +365,7 @@ impl Mapper {
     /// A permission prompt: makes sure its call has a row first.
     pub fn approval(&mut self, id: &str, fields: ToolCallUpdateFields) -> Vec<AgentEvent> {
         let mut out = Vec::new();
-        self.tool(id.to_string(), fields, &mut out);
+        self.tool(id.to_string(), fields, None, &mut out);
         let (kind, summary) = self
             .calls
             .get(id)
@@ -311,7 +412,7 @@ fn finished_event(id: &str, call: &Call, success: bool) -> AgentEvent {
     AgentEvent::ToolCallFinished {
         call_id: id.to_string(),
         output: head_tail(&call.output, OUTPUT_CHARS),
-        exit_code: None,
+        exit_code: call.exit_code,
         success,
         diff: call.diff.clone(),
         duration_ms: u64::try_from(call.started.elapsed().as_millis()).unwrap_or(u64::MAX),

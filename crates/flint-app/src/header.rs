@@ -95,10 +95,10 @@ pub fn render(
             icon_button(
                 "terminal",
                 IconName::SquareTerminal,
-                "Open in Terminal  ⌘⇧T",
-                false,
+                "Terminal  ⌃`",
+                app.terminal.open,
             )
-            .on_click(cx.listener(|this, _, _, _| this.open_terminal())),
+            .on_click(cx.listener(|this, _, window, cx| this.toggle_terminal(window, cx))),
         )
         .child(
             div()

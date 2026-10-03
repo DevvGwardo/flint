@@ -1429,3 +1429,97 @@ fn slash_model_and_mode_open_the_agents_menus(cx: &mut TestAppContext) {
         Some(MenuTarget::Option("mode".into()))
     );
 }
+
+fn terminal_options() -> Options {
+    Options {
+        terminal_command: Some(("/bin/sh".into(), Vec::new())),
+        terminal_poll: true,
+        ..test_options()
+    }
+}
+
+/// Waits (real time) until the active terminal shows a line satisfying `pred`.
+fn wait_for_terminal(ui: &Ui, cx: &mut TestAppContext, pred: impl Fn(&str) -> bool) -> Vec<String> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        settle(cx);
+        let lines = ui.read(cx, |app, cx| {
+            app.terminal
+                .active_view()
+                .map(|v| v.read(cx).terminal.snapshot().text_lines())
+                .unwrap_or_default()
+        });
+        if lines.iter().any(|l| pred(l)) || std::time::Instant::now() > deadline {
+            return lines;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(30));
+    }
+}
+
+#[gpui_kit::test]
+fn ctrl_backtick_toggles_a_terminal_in_the_workspace(cx: &mut TestAppContext) {
+    let ui = open_with(cx, terminal_options());
+    assert!(!has(&ui, cx, "terminal-panel"));
+    ui.press(cx, "ctrl-`");
+    let (open, tabs, cwd, workspace) = ui.read(cx, |app, cx| {
+        (
+            app.terminal.open,
+            app.terminal.tabs.len(),
+            app.terminal.active_view().map(|v| v.read(cx).cwd.clone()),
+            app.session().workspace.clone(),
+        )
+    });
+    assert_eq!((open, tabs, cwd), (true, 1, Some(workspace)));
+    assert!(has(&ui, cx, "terminal-panel"));
+    ui.click(cx, "terminal-new");
+    assert_eq!(ui.read(cx, |app, _| app.terminal.tabs.len()), 2);
+    ui.press(cx, "ctrl-`");
+    assert!(!has(&ui, cx, "terminal-panel"));
+}
+
+#[gpui_kit::test]
+fn typing_in_the_terminal_runs_commands(cx: &mut TestAppContext) {
+    let ui = open_with(cx, terminal_options());
+    ui.press(cx, "ctrl-`");
+    settle(cx);
+    ui.input(cx, "echo hi-$((40+2))");
+    ui.press(cx, "enter");
+    let lines = wait_for_terminal(&ui, cx, |l| l == "hi-42");
+    assert!(lines.iter().any(|l| l == "hi-42"), "{lines:?}");
+    // Escape and Shift+Tab go to the shell, not to flint.
+    let approval = ui.read(cx, |app, _| app.approval);
+    ui.press(cx, "shift-tab");
+    assert_eq!(ui.read(cx, |app, _| app.approval), approval);
+}
+
+#[gpui_kit::test]
+fn terminal_copy_and_paste(cx: &mut TestAppContext) {
+    let ui = open_with(cx, terminal_options());
+    ui.press(cx, "ctrl-`");
+    settle(cx);
+    ui.input(cx, "echo copy-me");
+    ui.press(cx, "enter");
+    let lines = wait_for_terminal(&ui, cx, |l| l == "copy-me");
+    let row = lines
+        .iter()
+        .position(|l| l == "copy-me")
+        .expect("output row");
+    ui.read(cx, |app, cx| {
+        let view = app.terminal.active_view().expect("tab").read(cx);
+        view.terminal.start_selection(row, 0, false, 1);
+        view.terminal.update_selection(row, 6, true);
+    });
+    ui.press(cx, "cmd-c");
+    let copied = cx.read(|cx| cx.read_from_clipboard().and_then(|item| item.text()));
+    assert_eq!(copied.as_deref(), Some("copy-me"));
+
+    cx.update(|cx| {
+        cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(
+            "echo pasted-$((1+1))".into(),
+        ))
+    });
+    ui.press(cx, "cmd-v");
+    ui.press(cx, "enter");
+    let lines = wait_for_terminal(&ui, cx, |l| l == "pasted-2");
+    assert!(lines.iter().any(|l| l == "pasted-2"), "{lines:?}");
+}

@@ -69,6 +69,8 @@ fn main() -> anyhow::Result<()> {
                 format!("⇣ context compacted {before_tokens} -> {after_tokens} tokens")
             }
             AgentEvent::SessionOptions(options) => format!("options: {}", options.len()),
+            AgentEvent::TerminalStarted { label, .. } => format!("terminal: {label}"),
+            AgentEvent::TerminalOutput { .. } | AgentEvent::TerminalExited { .. } => continue,
         };
         if in_text {
             writeln!(out)?;

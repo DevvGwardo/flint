@@ -16,6 +16,7 @@ mod saved;
 #[cfg(test)]
 #[path = "session_options_tests.rs"]
 mod session_options_tests;
+mod terminal_meta;
 #[cfg(test)]
 mod test_support;
 

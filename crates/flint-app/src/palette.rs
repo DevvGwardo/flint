@@ -22,6 +22,7 @@ use crate::app::RenameSession;
 use crate::app::ToggleApproval;
 use crate::app::ToggleChanges;
 use crate::app::ToggleSidebar;
+use crate::app::ToggleTerminal;
 use crate::theme::palette;
 
 fn item(label: &str, icon: IconName, action: Box<dyn Action>) -> CommandItem {
@@ -101,7 +102,12 @@ pub fn render(state: &Entity<CommandState>, cx: &mut Context<FlintApp>) -> impl 
                     Box::new(ToggleApproval),
                 ))
                 .item(item(
-                    "Open in Terminal",
+                    "Toggle terminal panel",
+                    IconName::SquareTerminal,
+                    Box::new(ToggleTerminal),
+                ))
+                .item(item(
+                    "Open in Terminal.app",
                     IconName::SquareTerminal,
                     Box::new(OpenTerminal),
                 ))
