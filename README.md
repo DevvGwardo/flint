@@ -89,7 +89,30 @@ Flint couples high-frame-rate native macOS rendering (Metal via GPUI) with an as
 </p>
 
 ```mermaid
+%%{init: {
+  'theme': 'base',
+  'themeVariables': {
+    'darkMode': true,
+    'primaryColor': '#1b1b20',
+    'primaryTextColor': '#e7e7ea',
+    'primaryBorderColor': '#ff8a3d',
+    'lineColor': '#ff8a3d',
+    'secondaryColor': '#141418',
+    'tertiaryColor': '#0e0e10',
+    'mainBkg': '#141418',
+    'nodeBorder': '#ff8a3d',
+    'clusterBkg': '#141418',
+    'clusterBorder': '#222228',
+    'defaultLinkColor': '#ff8a3d',
+    'titleColor': '#e7e7ea',
+    'edgeLabelBackground': '#1b1b20'
+  }
+}}%%
 graph TD
+    classDef default fill:#141418,stroke:#222228,stroke-width:1.5px,color:#e7e7ea;
+    classDef ember fill:#1b1b20,stroke:#ff8a3d,stroke-width:2px,color:#e7e7ea;
+    classDef cyan fill:#141418,stroke:#00e5ff,stroke-width:2px,color:#e7e7ea;
+
     subgraph UI ["Desktop UI (crates/flint-app & crates/flint-term)"]
         GPUI["GPUI Metal Window"] --> Panels["Dockable Panels Layout"]
         Panels --> Composer["Composer & Palette"]
@@ -122,6 +145,9 @@ graph TD
     Engine <--> Endpoints
     Bridge <--> ExternalAgents
     Guard -.-> JEV
+
+    class GPUI,Engine,Guard,Bridge,Subagents ember;
+    class ExternalAgents,Endpoints cyan;
 ```
 
 > [!NOTE]
@@ -191,6 +217,28 @@ follow-ups, including after a saved session is reopened. Children cannot spawn
 more children. Interrupting a turn stops its children too.
 
 ```mermaid
+%%{init: {
+  'theme': 'base',
+  'themeVariables': {
+    'darkMode': true,
+    'actorBkg': '#1b1b20',
+    'actorBorder': '#ff8a3d',
+    'actorTextColor': '#e7e7ea',
+    'actorLineColor': '#ff8a3d',
+    'signalColor': '#ff8a3d',
+    'signalTextColor': '#e7e7ea',
+    'labelBoxBkgColor': '#1b1b20',
+    'labelBoxBorderColor': '#ff8a3d',
+    'labelTextColor': '#e7e7ea',
+    'loopTextColor': '#e7e7ea',
+    'noteBkgColor': '#141418',
+    'noteTextColor': '#e7e7ea',
+    'noteBorderColor': '#222228',
+    'activationBkgColor': '#222228',
+    'activationBorderColor': '#ff8a3d',
+    'sequenceNumberColor': '#0e0e10'
+  }
+}}%%
 sequenceDiagram
     autonumber
     participant Parent as Parent Agent
@@ -236,7 +284,30 @@ still use their own delegation implementations, not Flint's tool.
 </p>
 
 ```mermaid
+%%{init: {
+  'theme': 'base',
+  'themeVariables': {
+    'darkMode': true,
+    'primaryColor': '#1b1b20',
+    'primaryTextColor': '#e7e7ea',
+    'primaryBorderColor': '#ff8a3d',
+    'lineColor': '#ff8a3d',
+    'secondaryColor': '#141418',
+    'tertiaryColor': '#0e0e10',
+    'mainBkg': '#141418',
+    'nodeBorder': '#ff8a3d',
+    'clusterBkg': '#141418',
+    'clusterBorder': '#222228',
+    'defaultLinkColor': '#ff8a3d',
+    'titleColor': '#e7e7ea',
+    'edgeLabelBackground': '#1b1b20'
+  }
+}}%%
 flowchart LR
+    classDef default fill:#141418,stroke:#222228,stroke-width:1.5px,color:#e7e7ea;
+    classDef ember fill:#1b1b20,stroke:#ff8a3d,stroke-width:2px,color:#e7e7ea;
+    classDef cyan fill:#141418,stroke:#00e5ff,stroke-width:2px,color:#e7e7ea;
+
     subgraph FlintApp ["Flint Native Host (macOS)"]
         UI["GPUI Unified Window"]
         Client["crates/flint-acp Gateway"]
@@ -252,6 +323,9 @@ flowchart LR
     Client <==> Claude
     Client <==> Codex
     Client <==> Droid
+
+    class UI,Client ember;
+    class Claude,Codex,Droid cyan;
 ```
 
 For Claude Code and Codex, install the ACP adapters, then sign in once with
@@ -327,7 +401,32 @@ Flint equips models with autonomous **harness guard rules** that prevent runaway
 </p>
 
 ```mermaid
+%%{init: {
+  'theme': 'base',
+  'themeVariables': {
+    'darkMode': true,
+    'primaryColor': '#1b1b20',
+    'primaryTextColor': '#e7e7ea',
+    'primaryBorderColor': '#ff8a3d',
+    'lineColor': '#ff8a3d',
+    'secondaryColor': '#141418',
+    'tertiaryColor': '#0e0e10',
+    'mainBkg': '#141418',
+    'nodeBorder': '#ff8a3d',
+    'clusterBkg': '#141418',
+    'clusterBorder': '#222228',
+    'defaultLinkColor': '#ff8a3d',
+    'titleColor': '#e7e7ea',
+    'edgeLabelBackground': '#1b1b20'
+  }
+}}%%
 flowchart TD
+    classDef default fill:#141418,stroke:#222228,stroke-width:1.5px,color:#e7e7ea;
+    classDef ember fill:#1b1b20,stroke:#ff8a3d,stroke-width:2px,color:#e7e7ea;
+    classDef green fill:#141418,stroke:#4cc38a,stroke-width:2px,color:#e7e7ea;
+    classDef red fill:#141418,stroke:#f2555a,stroke-width:2px,color:#e7e7ea;
+    classDef cyan fill:#141418,stroke:#00e5ff,stroke-width:2px,color:#e7e7ea;
+
     In["Agent Action Proposal"] --> Guard{"Guard Rules Inspection"}
     Guard -->|Cyclic Loops| BreakLoop["Break Infinite Loop"]
     Guard -->|Malformed Syntax| Repair["Automatic Tool-Call Repair"]
@@ -340,6 +439,11 @@ flowchart TD
     Consult -->|Confirmed| Intervene["Intervene / Re-prompt Turn"]
     Consult -->|False Alarm| Execute
     JEV -->|No (Heuristic)| Intervene
+
+    class In,Guard,JEV ember;
+    class Execute green;
+    class BreakLoop,Warn,Intervene red;
+    class Repair,Consult cyan;
 ```
 
 ### Optional JEV judge

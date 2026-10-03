@@ -20,7 +20,30 @@ Flint divides responsibilities across four specialized crates:
 </p>
 
 ```mermaid
+%%{init: {
+  'theme': 'base',
+  'themeVariables': {
+    'darkMode': true,
+    'primaryColor': '#1b1b20',
+    'primaryTextColor': '#e7e7ea',
+    'primaryBorderColor': '#ff8a3d',
+    'lineColor': '#ff8a3d',
+    'secondaryColor': '#141418',
+    'tertiaryColor': '#0e0e10',
+    'mainBkg': '#141418',
+    'nodeBorder': '#ff8a3d',
+    'clusterBkg': '#141418',
+    'clusterBorder': '#222228',
+    'defaultLinkColor': '#ff8a3d',
+    'titleColor': '#e7e7ea',
+    'edgeLabelBackground': '#1b1b20'
+  }
+}}%%
 graph TD
+    classDef default fill:#141418,stroke:#222228,stroke-width:1.5px,color:#e7e7ea;
+    classDef ember fill:#1b1b20,stroke:#ff8a3d,stroke-width:2px,color:#e7e7ea;
+    classDef cyan fill:#141418,stroke:#00e5ff,stroke-width:2px,color:#e7e7ea;
+
     subgraph UI ["User Interface Layer (crates/flint-app)"]
         Window["GPUI Window & Metal Pipeline"]
         Composer["Composer (Input, Mentions, Slash Commands)"]
@@ -79,6 +102,9 @@ graph TD
 
     ContextMgr <--> OpenAI
     Guard -.-> JEV
+
+    class Window,SessionMgr,Guard,SubagentOrch,ACPClient ember;
+    class ClaudeCode,CodexCLI,DroidCLI,OpenAI cyan;
 ```
 
 ---
@@ -88,6 +114,28 @@ graph TD
 Every conversational turn in Flint's native engine passes through context window assembly, token budget trimming, model streaming, and the multi-stage **Harness Guard** pipeline.
 
 ```mermaid
+%%{init: {
+  'theme': 'base',
+  'themeVariables': {
+    'darkMode': true,
+    'actorBkg': '#1b1b20',
+    'actorBorder': '#ff8a3d',
+    'actorTextColor': '#e7e7ea',
+    'actorLineColor': '#ff8a3d',
+    'signalColor': '#ff8a3d',
+    'signalTextColor': '#e7e7ea',
+    'labelBoxBkgColor': '#1b1b20',
+    'labelBoxBorderColor': '#ff8a3d',
+    'labelTextColor': '#e7e7ea',
+    'loopTextColor': '#e7e7ea',
+    'noteBkgColor': '#141418',
+    'noteTextColor': '#e7e7ea',
+    'noteBorderColor': '#222228',
+    'activationBkgColor': '#222228',
+    'activationBorderColor': '#ff8a3d',
+    'sequenceNumberColor': '#0e0e10'
+  }
+}}%%
 sequenceDiagram
     autonumber
     actor User
@@ -138,7 +186,32 @@ sequenceDiagram
 </p>
 
 ```mermaid
+%%{init: {
+  'theme': 'base',
+  'themeVariables': {
+    'darkMode': true,
+    'primaryColor': '#1b1b20',
+    'primaryTextColor': '#e7e7ea',
+    'primaryBorderColor': '#ff8a3d',
+    'lineColor': '#ff8a3d',
+    'secondaryColor': '#141418',
+    'tertiaryColor': '#0e0e10',
+    'mainBkg': '#141418',
+    'nodeBorder': '#ff8a3d',
+    'clusterBkg': '#141418',
+    'clusterBorder': '#222228',
+    'defaultLinkColor': '#ff8a3d',
+    'titleColor': '#e7e7ea',
+    'edgeLabelBackground': '#1b1b20'
+  }
+}}%%
 flowchart TD
+    classDef default fill:#141418,stroke:#222228,stroke-width:1.5px,color:#e7e7ea;
+    classDef ember fill:#1b1b20,stroke:#ff8a3d,stroke-width:2px,color:#e7e7ea;
+    classDef green fill:#141418,stroke:#4cc38a,stroke-width:2px,color:#e7e7ea;
+    classDef red fill:#141418,stroke:#f2555a,stroke-width:2px,color:#e7e7ea;
+    classDef cyan fill:#141418,stroke:#00e5ff,stroke-width:2px,color:#e7e7ea;
+
     Start["Incoming Model Response"] --> CheckTool{"Contains Tool Calls?"}
     
     CheckTool -->|Yes| ArgCheck{"Malformed Tool Call Syntax?"}
@@ -167,6 +240,11 @@ flowchart TD
     VerifyTests -->|No| TestReminder["Guard: Enforce Test-Before-Done Reminder"]
     VerifyTests -->|Yes| Complete["Turn Concluded Successfully"]
     TestCheck -->|No| Complete
+
+    class Start,CheckTool,ArgCheck,LoopCheck,LoopAction,WatchdogCheck,JEVCheck,TestCheck,VerifyTests,ActionConfirm ember;
+    class ExecTool,Complete green;
+    class TriggerLoop,TriggerWatchdog,HaltTurn,TestReminder red;
+    class Repair,ConsultJEV cyan;
 ```
 
 ---
@@ -187,6 +265,28 @@ Flint allows the native agent to spin off up to four independent, concurrent chi
 - **Recursion Guard:** Child subagents are restricted from spawning grandchildren, preventing unbounded agent explosion.
 
 ```mermaid
+%%{init: {
+  'theme': 'base',
+  'themeVariables': {
+    'darkMode': true,
+    'actorBkg': '#1b1b20',
+    'actorBorder': '#ff8a3d',
+    'actorTextColor': '#e7e7ea',
+    'actorLineColor': '#ff8a3d',
+    'signalColor': '#ff8a3d',
+    'signalTextColor': '#e7e7ea',
+    'labelBoxBkgColor': '#1b1b20',
+    'labelBoxBorderColor': '#ff8a3d',
+    'labelTextColor': '#e7e7ea',
+    'loopTextColor': '#e7e7ea',
+    'noteBkgColor': '#141418',
+    'noteTextColor': '#e7e7ea',
+    'noteBorderColor': '#222228',
+    'activationBkgColor': '#222228',
+    'activationBorderColor': '#ff8a3d',
+    'sequenceNumberColor': '#0e0e10'
+  }
+}}%%
 sequenceDiagram
     autonumber
     participant Parent as Parent Agent Session
@@ -219,7 +319,31 @@ sequenceDiagram
 Flint acts as an ACP host, allowing Claude Code, Codex, and Droid to be launched and driven directly from the same native desktop UI without altering their native authentication or configuration workflows.
 
 ```mermaid
+%%{init: {
+  'theme': 'base',
+  'themeVariables': {
+    'darkMode': true,
+    'primaryColor': '#1b1b20',
+    'primaryTextColor': '#e7e7ea',
+    'primaryBorderColor': '#ff8a3d',
+    'lineColor': '#ff8a3d',
+    'secondaryColor': '#141418',
+    'tertiaryColor': '#0e0e10',
+    'mainBkg': '#141418',
+    'nodeBorder': '#ff8a3d',
+    'clusterBkg': '#141418',
+    'clusterBorder': '#222228',
+    'defaultLinkColor': '#ff8a3d',
+    'titleColor': '#e7e7ea',
+    'edgeLabelBackground': '#1b1b20'
+  }
+}}%%
 flowchart LR
+    classDef default fill:#141418,stroke:#222228,stroke-width:1.5px,color:#e7e7ea;
+    classDef ember fill:#1b1b20,stroke:#ff8a3d,stroke-width:2px,color:#e7e7ea;
+    classDef cyan fill:#141418,stroke:#00e5ff,stroke-width:2px,color:#e7e7ea;
+    classDef surface fill:#141418,stroke:#222228,stroke-width:1.5px,color:#9a9aa4;
+
     subgraph FlintHost ["Flint Host Application"]
         UI["GPUI View Model"]
         ACPDriver["crates/flint-acp Gateway"]
@@ -245,4 +369,8 @@ flowchart LR
     Claude --- ClaudeAuth
     Codex --- CodexAuth
     Droid --- DroidAuth
+
+    class UI,ACPDriver ember;
+    class Claude,Codex,Droid cyan;
+    class ClaudeAuth,CodexAuth,DroidAuth surface;
 ```
