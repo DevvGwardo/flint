@@ -1,11 +1,9 @@
-//! One ACP connection: `initialize`, a new or loaded session, then a prompt
-//! per user message, with `session/update`, permission and fs requests
-//! handled alongside. Generic over the byte streams so tests can drive it
-//! with an in-process fake agent.
+//! One ACP connection: `initialize`, a new or loaded session, then the
+//! session loop in [`crate::live`]. `session/update`, permission and fs
+//! requests are handled alongside. Generic over the byte streams so tests
+//! can drive it with an in-process fake agent.
 
 use std::collections::HashMap;
-use std::collections::VecDeque;
-use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -17,9 +15,7 @@ use agent_client_protocol::Client;
 use agent_client_protocol::ConnectionTo;
 use agent_client_protocol::Responder;
 use agent_client_protocol::schema::ProtocolVersion;
-use agent_client_protocol::schema::v1::CancelNotification;
 use agent_client_protocol::schema::v1::ClientCapabilities;
-use agent_client_protocol::schema::v1::ContentBlock;
 use agent_client_protocol::schema::v1::FileSystemCapabilities;
 use agent_client_protocol::schema::v1::Implementation;
 use agent_client_protocol::schema::v1::InitializeRequest;
@@ -27,17 +23,16 @@ use agent_client_protocol::schema::v1::LoadSessionRequest;
 use agent_client_protocol::schema::v1::NewSessionRequest;
 use agent_client_protocol::schema::v1::PermissionOption;
 use agent_client_protocol::schema::v1::PermissionOptionKind;
-use agent_client_protocol::schema::v1::PromptRequest;
 use agent_client_protocol::schema::v1::ReadTextFileRequest;
 use agent_client_protocol::schema::v1::ReadTextFileResponse;
 use agent_client_protocol::schema::v1::RequestPermissionOutcome;
 use agent_client_protocol::schema::v1::RequestPermissionRequest;
 use agent_client_protocol::schema::v1::RequestPermissionResponse;
 use agent_client_protocol::schema::v1::SelectedPermissionOutcome;
+use agent_client_protocol::schema::v1::SessionConfigOption;
 use agent_client_protocol::schema::v1::SessionId;
 use agent_client_protocol::schema::v1::SessionNotification;
-use agent_client_protocol::schema::v1::StopReason;
-use agent_client_protocol::schema::v1::TextContent;
+use agent_client_protocol::schema::v1::SessionUpdate;
 use agent_client_protocol::schema::v1::WriteTextFileRequest;
 use agent_client_protocol::schema::v1::WriteTextFileResponse;
 use async_channel::Receiver;
@@ -46,15 +41,19 @@ use flint_agent::AgentEvent;
 use flint_agent::ApprovalDecision;
 use flint_agent::ApprovalMode;
 use flint_agent::Op;
-use flint_agent::TurnEndReason;
 use futures::AsyncRead;
 use futures::AsyncWrite;
-use serde::Deserialize;
-use serde::Serialize;
 
+use crate::files::read_text;
+use crate::files::rpc_error;
+use crate::files::write_text;
 use crate::launch::AcpAgent;
-use crate::launch::looks_like_auth_error;
+use crate::launch::describe;
+use crate::live::Live;
 use crate::mapper::Mapper;
+use crate::options::Options;
+use crate::saved::Saved;
+use crate::saved::load_saved;
 
 /// What a runner needs besides the byte streams.
 pub(crate) struct RunContext {
@@ -68,41 +67,59 @@ pub(crate) struct RunContext {
     pub stderr: Arc<Mutex<String>>,
 }
 
-/// `session_dir/acp.json`.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-struct Saved {
-    agent: String,
-    session_id: String,
-    turn_id: u64,
-}
-
 type PendingPermission = (Responder<RequestPermissionResponse>, Vec<PermissionOption>);
 
-/// State shared by the connection's handlers and the turn loop.
-struct Shared {
-    agent: AcpAgent,
-    workspace: PathBuf,
-    events: Sender<AgentEvent>,
+/// State shared by the connection's handlers and the session loop.
+pub(crate) struct Shared {
+    pub agent: AcpAgent,
+    pub workspace: PathBuf,
+    pub events: Sender<AgentEvent>,
+    pub stderr: Arc<Mutex<String>>,
     mapper: Mutex<Mapper>,
     pending: Mutex<HashMap<String, PendingPermission>>,
     auto_approve: AtomicBool,
     /// `session/load` replays history as updates; the UI already has it.
     loading: AtomicBool,
+    options: Mutex<Options>,
 }
 
 impl Shared {
-    fn emit_all(&self, events: Vec<AgentEvent>) {
+    pub fn emit_all(&self, events: Vec<AgentEvent>) {
         for event in events {
             let _ = self.events.try_send(event);
         }
     }
 
-    fn with_mapper<T>(&self, f: impl FnOnce(&mut Mapper) -> T) -> Option<T> {
+    pub fn with_mapper<T>(&self, f: impl FnOnce(&mut Mapper) -> T) -> Option<T> {
         self.mapper.lock().ok().map(|mut mapper| f(&mut mapper))
     }
 
+    pub fn stderr_tail(&self) -> String {
+        self.stderr.lock().map(|s| s.clone()).unwrap_or_default()
+    }
+
+    pub fn options(&self) -> Options {
+        self.options.lock().map(|o| o.clone()).unwrap_or_default()
+    }
+
+    /// Stores the agent's options and tells the UI. When the agent has a
+    /// permission mode, that mode decides approvals: flint stops answering
+    /// permission requests on its own and shows each one.
+    pub fn set_options(&self, raw: &[SessionConfigOption]) {
+        let options = Options::from_acp(raw);
+        let first_mode = options.has_mode() && !self.options().has_mode();
+        if first_mode {
+            self.auto_approve.store(false, Ordering::Relaxed);
+        }
+        let list = options.list.clone();
+        if let Ok(mut slot) = self.options.lock() {
+            *slot = options;
+        }
+        self.emit_all(vec![AgentEvent::SessionOptions(list)]);
+    }
+
     /// Answers a pending permission with the option matching `decision`.
-    fn resolve(&self, call_id: &str, decision: ApprovalDecision) {
+    pub fn resolve(&self, call_id: &str, decision: ApprovalDecision) {
         let Some((responder, options)) =
             self.pending.lock().ok().and_then(|mut p| p.remove(call_id))
         else {
@@ -115,7 +132,7 @@ impl Shared {
     }
 
     /// Cancels every unanswered permission (the turn is being cancelled).
-    fn cancel_pending(&self) {
+    pub fn cancel_pending(&self) {
         let pending: Vec<PendingPermission> = self
             .pending
             .lock()
@@ -176,6 +193,7 @@ where
         agent: ctx.agent.clone(),
         workspace: ctx.workspace.clone(),
         events: ctx.events.clone(),
+        stderr: Arc::clone(&ctx.stderr),
         mapper: Mutex::new(Mapper::new(
             &ctx.workspace,
             saved.as_ref().map_or(0, |s| s.turn_id),
@@ -183,6 +201,7 @@ where
         pending: Mutex::new(HashMap::new()),
         auto_approve: AtomicBool::new(ctx.approval == ApprovalMode::Auto),
         loading: AtomicBool::new(false),
+        options: Mutex::new(Options::default()),
     });
 
     let on_update = Arc::clone(&shared);
@@ -190,16 +209,22 @@ where
     let on_read = Arc::clone(&shared);
     let on_write = Arc::clone(&shared);
     let main_shared = Arc::clone(&shared);
-    let stderr = Arc::clone(&ctx.stderr);
     let result = Client
         .builder()
         .name("flint")
         .on_receive_notification(
             async move |notification: SessionNotification, _cx| {
-                if !on_update.loading.load(Ordering::Relaxed)
-                    && let Some(events) = on_update.with_mapper(|m| m.update(notification.update))
-                {
-                    on_update.emit_all(events);
+                match notification.update {
+                    SessionUpdate::ConfigOptionUpdate(update) => {
+                        on_update.set_options(&update.config_options);
+                    }
+                    update => {
+                        if !on_update.loading.load(Ordering::Relaxed)
+                            && let Some(events) = on_update.with_mapper(|m| m.update(update))
+                        {
+                            on_update.emit_all(events);
+                        }
+                    }
                 }
                 Ok(())
             },
@@ -220,7 +245,7 @@ where
                     .with_mapper(|m| m.approval(&id, request.tool_call.fields))
                     .unwrap_or_default();
                 // Park the responder; the dispatch loop moves on while the
-                // user decides, and the turn loop answers it.
+                // user decides, and the session loop answers it.
                 if let Ok(mut pending) = on_permission.pending.lock() {
                     pending.insert(id, (responder, request.options));
                 }
@@ -260,14 +285,16 @@ where
             agent_client_protocol::on_receive_request!(),
         )
         .connect_with(ByteStreams::new(writer, reader), async move |cx| {
-            session_loop(cx, main_shared, ctx.ops, ctx.session_dir, saved, &stderr).await;
+            if let Some(live) = open_session(cx, main_shared, ctx.session_dir, saved).await {
+                live.run(ctx.ops).await;
+            }
             Ok(())
         })
         .await;
     if let Err(err) = result
         && !shared.events.is_closed()
     {
-        let tail = ctx.stderr.lock().map(|s| s.clone()).unwrap_or_default();
+        let tail = shared.stderr_tail();
         shared.emit_all(vec![AgentEvent::Error(describe(
             &shared.agent,
             &err.message,
@@ -277,17 +304,25 @@ where
     }
 }
 
-async fn session_loop(
+/// `initialize`, then `session/load` (when the agent can and there is a
+/// saved session) or `session/new`. Re-applies saved option choices when the
+/// conversation couldn't be reopened. `None` after reporting a failure.
+async fn open_session(
     cx: ConnectionTo<agent_client_protocol::Agent>,
     shared: Arc<Shared>,
-    ops: Receiver<Op>,
     session_dir: Option<PathBuf>,
     saved: Option<Saved>,
-    stderr: &Mutex<String>,
-) {
+) -> Option<Live> {
     let agent = shared.agent.clone();
-    let tail = || stderr.lock().map(|s| s.clone()).unwrap_or_default();
     let fail = |message: String| shared.emit_all(vec![AgentEvent::Error(message)]);
+    let error = |err: agent_client_protocol::Error| {
+        describe(
+            &agent,
+            &err.message,
+            Some(i32::from(err.code).into()),
+            &shared.stderr_tail(),
+        )
+    };
 
     let capabilities = ClientCapabilities::new().fs(FileSystemCapabilities::new()
         .read_text_file(true)
@@ -303,17 +338,11 @@ async fn session_loop(
     let init = match init {
         Ok(init) => init,
         Err(err) => {
-            fail(describe(
-                &agent,
-                &err.message,
-                Some(i32::from(err.code).into()),
-                &tail(),
-            ));
-            return;
+            fail(error(err));
+            return None;
         }
     };
 
-    // Reopen the saved conversation when the agent can; otherwise start over.
     let mut session_id: Option<SessionId> = None;
     if let Some(saved) = &saved {
         if init.agent_capabilities.load_session {
@@ -327,22 +356,27 @@ async fn session_loop(
                 .await;
             shared.loading.store(false, Ordering::Relaxed);
             match loaded {
-                Ok(_) => session_id = Some(SessionId::new(saved.session_id.clone())),
+                Ok(loaded) => {
+                    session_id = Some(SessionId::new(saved.session_id.clone()));
+                    shared.set_options(&loaded.config_options.unwrap_or_default());
+                }
                 Err(err) => fail(format!(
-                    "{} couldn't reopen its earlier conversation ({}), so this continues in a new {0} session. \
-                     Earlier messages stay visible, but the agent won't remember them.",
+                    "{} couldn't reopen its earlier conversation ({}), so this continues in a \
+                     new {0} session. Earlier messages stay visible, but the agent won't \
+                     remember them.",
                     agent.name(),
                     err.message
                 )),
             }
         } else {
             fail(format!(
-                "{} can't reopen earlier conversations, so this continues in a new {0} session. \
-                 Earlier messages stay visible, but the agent won't remember them.",
+                "{} can't reopen earlier conversations, so this continues in a new {0} \
+                 session. Earlier messages stay visible, but the agent won't remember them.",
                 agent.name()
             ));
         }
     }
+    let reopened = session_id.is_some();
     let session_id = match session_id {
         Some(id) => id,
         None => match cx
@@ -350,241 +384,26 @@ async fn session_loop(
             .block_task()
             .await
         {
-            Ok(created) => created.session_id,
+            Ok(created) => {
+                shared.set_options(&created.config_options.unwrap_or_default());
+                created.session_id
+            }
             Err(err) => {
-                fail(describe(
-                    &agent,
-                    &err.message,
-                    Some(i32::from(err.code).into()),
-                    &tail(),
-                ));
-                return;
+                fail(error(err));
+                return None;
             }
         },
     };
-    let save = |turn_id: u64| {
-        if let Some(dir) = &session_dir {
-            save_saved(
-                dir,
-                &Saved {
-                    agent: agent.id(),
-                    session_id: session_id.0.to_string(),
-                    turn_id,
-                },
-            );
-        }
-    };
-    save(shared.with_mapper(|m| m.turn_id()).unwrap_or(0));
-
-    let mut queue: VecDeque<String> = VecDeque::new();
-    let mut shutting_down = false;
-    while !shutting_down {
-        let text = match queue.pop_front() {
-            Some(text) => text,
-            None => match ops.recv().await {
-                Ok(Op::UserMessage(text)) => text,
-                Ok(Op::Approval { call_id, decision }) => {
-                    shared.resolve(&call_id, decision);
-                    continue;
-                }
-                Ok(Op::Interrupt | Op::SetReasoningEffort(_)) => continue,
-                Ok(Op::Shutdown) | Err(_) => break,
-            },
-        };
-        let opening = shared.with_mapper(Mapper::start_turn).unwrap_or_default();
-        let turn_id = shared.with_mapper(|m| m.turn_id()).unwrap_or(0);
-        shared.emit_all(opening);
-        save(turn_id);
-
-        let prompt = cx
-            .send_request(PromptRequest::new(
-                session_id.clone(),
-                vec![ContentBlock::Text(TextContent::new(text))],
-            ))
-            .block_task();
-        futures::pin_mut!(prompt);
-        let mut cancelled = false;
-        let result = loop {
-            tokio::select! {
-                result = &mut prompt => break result,
-                op = ops.recv() => match op {
-                    Ok(Op::UserMessage(text)) => queue.push_back(text),
-                    Ok(Op::Approval { call_id, decision }) => shared.resolve(&call_id, decision),
-                    Ok(Op::SetReasoningEffort(_)) => {}
-                    Ok(Op::Interrupt) => {
-                        cancelled = true;
-                        shared.cancel_pending();
-                        let _ = cx.send_notification(CancelNotification::new(session_id.clone()));
-                    }
-                    Ok(Op::Shutdown) | Err(_) => {
-                        shutting_down = true;
-                        shared.cancel_pending();
-                        let _ = cx.send_notification(CancelNotification::new(session_id.clone()));
-                        // Give the agent a moment to stop cleanly.
-                        match tokio::time::timeout(std::time::Duration::from_secs(2), &mut prompt).await {
-                            Ok(result) => break result,
-                            Err(_) => return,
-                        }
-                    }
-                },
-            }
-        };
-        let (reason, closing) = match result {
-            Ok(response) => {
-                let reason = match response.stop_reason {
-                    StopReason::EndTurn => TurnEndReason::Completed,
-                    StopReason::Cancelled => TurnEndReason::Interrupted,
-                    StopReason::MaxTurnRequests => TurnEndReason::StepLimit,
-                    StopReason::MaxTokens => {
-                        TurnEndReason::Failed("the agent hit its output token limit".to_string())
-                    }
-                    StopReason::Refusal => {
-                        TurnEndReason::Failed("the agent refused to continue".to_string())
-                    }
-                    _ => {
-                        TurnEndReason::Failed("the agent stopped for an unknown reason".to_string())
-                    }
-                };
-                let mut closing = shared
-                    .with_mapper(|m| m.close_open_calls(reason == TurnEndReason::Interrupted))
-                    .unwrap_or_default();
-                if let Some(usage) = &response.usage {
-                    closing.push(Mapper::usage(usage));
-                }
-                (reason, closing)
-            }
-            Err(err) => {
-                let message = describe(
-                    &agent,
-                    &err.message,
-                    Some(i32::from(err.code).into()),
-                    &tail(),
-                );
-                let mut closing = shared
-                    .with_mapper(|m| m.close_open_calls(true))
-                    .unwrap_or_default();
-                let reason = if cancelled {
-                    TurnEndReason::Interrupted
-                } else {
-                    closing.push(AgentEvent::Error(message.clone()));
-                    TurnEndReason::Failed(message)
-                };
-                (reason, closing)
-            }
-        };
-        shared.emit_all(closing);
-        shared.emit_all(vec![AgentEvent::TurnFinished { turn_id, reason }]);
-        save(turn_id);
+    let mut live = Live::new(
+        cx,
+        shared,
+        session_id,
+        session_dir,
+        saved.clone().unwrap_or_default().options,
+    );
+    if !reopened && let Some(saved) = saved {
+        live.reapply(&saved.options).await;
     }
-}
-
-/// A user-facing explanation with the fix, from an agent error and the
-/// adapter's recent stderr.
-pub(crate) fn describe(agent: &AcpAgent, message: &str, code: Option<i64>, stderr: &str) -> String {
-    let combined = format!("{message}\n{stderr}");
-    let detail = message.trim();
-    if looks_like_auth_error(code, &combined) {
-        return format!(
-            "{} isn't logged in ({detail}). {}",
-            agent.name(),
-            agent.login_hint()
-        );
-    }
-    let tail: String = {
-        let lines: Vec<&str> = stderr.lines().filter(|l| !l.trim().is_empty()).collect();
-        lines[lines.len().saturating_sub(4)..].join(" · ")
-    };
-    if tail.is_empty() {
-        format!("{} stopped responding: {detail}", agent.name())
-    } else {
-        format!(
-            "{} stopped responding: {detail}. Adapter output: {tail}",
-            agent.name()
-        )
-    }
-}
-
-fn rpc_error(message: String) -> agent_client_protocol::Error {
-    let mut error = agent_client_protocol::Error::invalid_params();
-    error.message = message;
-    error
-}
-
-/// Resolves an agent-supplied path, refusing anything outside the workspace.
-pub(crate) fn inside_workspace(workspace: &Path, path: &Path) -> Result<PathBuf, String> {
-    let joined = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        workspace.join(path)
-    };
-    let mut normalized = PathBuf::new();
-    for component in joined.components() {
-        match component {
-            std::path::Component::ParentDir => {
-                normalized.pop();
-            }
-            std::path::Component::CurDir => {}
-            other => normalized.push(other.as_os_str()),
-        }
-    }
-    if normalized.starts_with(workspace) {
-        Ok(normalized)
-    } else {
-        Err(format!(
-            "{} is outside the workspace {}",
-            path.display(),
-            workspace.display()
-        ))
-    }
-}
-
-fn read_text(workspace: &Path, request: &ReadTextFileRequest) -> Result<String, String> {
-    let path = inside_workspace(workspace, &request.path)?;
-    let text = std::fs::read_to_string(&path)
-        .map_err(|err| format!("cannot read {}: {err}", path.display()))?;
-    let start = request
-        .line
-        .map_or(0, |line| line.saturating_sub(1) as usize);
-    match (start, request.limit) {
-        (0, None) => Ok(text),
-        (start, limit) => {
-            let lines = text.lines().skip(start);
-            let picked: Vec<&str> = match limit {
-                Some(limit) => lines.take(limit as usize).collect(),
-                None => lines.collect(),
-            };
-            Ok(picked.join("\n"))
-        }
-    }
-}
-
-fn write_text(
-    workspace: &Path,
-    path: &Path,
-    content: &str,
-) -> Result<(PathBuf, Option<String>), String> {
-    let path = inside_workspace(workspace, path)?;
-    let old = std::fs::read_to_string(&path).ok();
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|err| format!("cannot create {}: {err}", parent.display()))?;
-    }
-    std::fs::write(&path, content)
-        .map_err(|err| format!("cannot write {}: {err}", path.display()))?;
-    Ok((path, old))
-}
-
-fn load_saved(dir: &Path) -> Option<Saved> {
-    serde_json::from_slice(&std::fs::read(dir.join("acp.json")).ok()?).ok()
-}
-
-fn save_saved(dir: &Path, saved: &Saved) {
-    if std::fs::create_dir_all(dir).is_ok()
-        && let Ok(bytes) = serde_json::to_vec_pretty(saved)
-    {
-        let tmp = dir.join("acp.json.tmp");
-        if std::fs::write(&tmp, bytes).is_ok() {
-            let _ = std::fs::rename(&tmp, dir.join("acp.json"));
-        }
-    }
+    live.save();
+    Some(live)
 }

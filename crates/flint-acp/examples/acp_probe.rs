@@ -32,9 +32,24 @@ fn main() {
         );
         let mut result = format!("{}: timed out after 150s", agent.name());
         while started.elapsed() < Duration::from_secs(150) {
-            if let Ok(AgentEvent::Error(message)) = handle.events.try_recv() {
-                result = format!("{}: ERROR {message}", agent.name());
-                break;
+            match handle.events.try_recv() {
+                Ok(AgentEvent::Error(message)) => {
+                    result = format!("{}: ERROR {message}", agent.name());
+                    break;
+                }
+                Ok(AgentEvent::SessionOptions(options)) => {
+                    for option in options {
+                        let choices: Vec<String> =
+                            option.choices.iter().map(|c| c.value.clone()).collect();
+                        println!(
+                            "  {} [{}] = {} of {choices:?}",
+                            option.id,
+                            option.category.as_deref().unwrap_or("-"),
+                            option.current
+                        );
+                    }
+                }
+                _ => {}
             }
             if let Ok(text) = std::fs::read_to_string(session_dir.join("acp.json")) {
                 let id = serde_json::from_str::<serde_json::Value>(&text)

@@ -68,6 +68,8 @@ pub(crate) async fn run(config: AgentConfig, ops: Receiver<Op>, events: Sender<A
                         *slot = level;
                     }
                 }
+                // flint's engine exposes no options beyond effort (its own op).
+                Op::SetSessionOption { .. } => {}
                 Op::Shutdown => break,
             }
         }

@@ -166,6 +166,7 @@ fn outline(events: &[AgentEvent]) -> Vec<String> {
             AgentEvent::TurnFinished { reason, .. } => Some(format!("finished {reason:?}")),
             AgentEvent::Error(message) => Some(format!("error {message}")),
             AgentEvent::ContextCompacted { .. } => Some("compacted".to_string()),
+            AgentEvent::SessionOptions(_) => None,
             AgentEvent::ReasoningDelta(_)
             | AgentEvent::TextDelta(_)
             | AgentEvent::ToolOutputDelta { .. }

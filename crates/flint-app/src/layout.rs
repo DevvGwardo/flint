@@ -110,7 +110,12 @@ impl Render for FlintApp {
                 this.sidebar_open = !this.sidebar_open;
                 cx.notify();
             }))
-            .on_action(cx.listener(|this, _: &ToggleApproval, _, cx| this.toggle_approval(cx)))
+            // Shift+Tab: the agent's own modes when it has them, else auto-run.
+            .on_action(cx.listener(|this, _: &ToggleApproval, _, cx| {
+                if !this.cycle_agent_mode(cx) {
+                    this.toggle_approval(cx);
+                }
+            }))
             .on_action(cx.listener(|this, _: &OpenWorkspace, _, cx| this.open_workspace(cx)))
             .on_action(cx.listener(|this, _: &RevealWorkspace, _, _| this.reveal_workspace()))
             .on_action(cx.listener(|this, _: &OpenTerminal, _, _| this.open_terminal()))

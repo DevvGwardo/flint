@@ -34,6 +34,9 @@ impl FlintApp {
                     Logged::User(text) => session.view.push_user(text),
                     Logged::Event(event) => {
                         clock += Duration::from_millis(50);
+                        if let AgentEvent::SessionOptions(options) = &event {
+                            session.options = options.clone();
+                        }
                         session.view.fold(event, clock)
                     }
                 };

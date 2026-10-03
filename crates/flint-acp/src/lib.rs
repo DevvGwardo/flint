@@ -6,9 +6,18 @@
 //! [`flint_agent::AgentEvent`]s without knowing which agent runs. The agent
 //! runs its own loop, so flint's harness nudges don't apply here.
 
+mod files;
 mod launch;
+mod live;
 mod mapper;
+mod options;
 mod runner;
+mod saved;
+#[cfg(test)]
+#[path = "session_options_tests.rs"]
+mod session_options_tests;
+#[cfg(test)]
+mod test_support;
 
 use std::path::PathBuf;
 use std::process::Stdio;

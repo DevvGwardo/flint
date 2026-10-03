@@ -99,6 +99,9 @@ pub fn render(app: &FlintApp, cx: &mut Context<FlintApp>) -> Option<AnyElement> 
                 .into_any_element(),
         );
     }
+    if let Some(menu) = crate::option_chips::menu(app, cx) {
+        return Some(menu);
+    }
     if app.agent_menu {
         let current = app.session().agent;
         let rows = crate::agents::AGENTS

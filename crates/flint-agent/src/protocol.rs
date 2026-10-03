@@ -110,6 +110,11 @@ pub enum Op {
     },
     /// Change the reasoning effort for later model calls (`None` = provider default).
     SetReasoningEffort(Option<ReasoningEffort>),
+    /// Set one of the agent's [`SessionOption`]s to one of its choices.
+    SetSessionOption {
+        id: String,
+        value: String,
+    },
     Shutdown,
 }
 
@@ -189,6 +194,37 @@ pub enum AgentEvent {
     },
     /// A non-fatal problem worth showing (provider error, bad config, ...).
     Error(String),
+    /// The agent's adjustable settings (model, reasoning, mode, …), sent
+    /// when the session is ready and whenever they change. An ACP session
+    /// always sends this once it is ready, even if the list is empty.
+    SessionOptions(Vec<SessionOption>),
+}
+
+/// One setting the agent exposes, e.g. its model or permission mode.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionOption {
+    pub id: String,
+    pub name: String,
+    pub description: Option<String>,
+    /// `mode`, `model`, `thought_level`, `model_config`, or agent-specific.
+    pub category: Option<String>,
+    /// The current choice's `value`.
+    pub current: String,
+    pub choices: Vec<OptionChoice>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OptionChoice {
+    pub value: String,
+    pub name: String,
+    pub description: Option<String>,
+}
+
+impl SessionOption {
+    /// The current choice, if it is one of the listed ones.
+    pub fn current_choice(&self) -> Option<&OptionChoice> {
+        self.choices.iter().find(|c| c.value == self.current)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

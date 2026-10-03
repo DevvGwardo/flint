@@ -1,10 +1,4 @@
-//! The runner against an in-process fake ACP agent that speaks raw
-//! JSON-RPC lines over a duplex pipe.
-
-use std::path::PathBuf;
-use std::sync::Arc;
-use std::sync::Mutex;
-use std::time::Duration;
+//! The runner against the fake agent in [`crate::test_support`].
 
 use flint_agent::AgentEvent;
 use flint_agent::ApprovalDecision;
@@ -13,209 +7,10 @@ use flint_agent::Op;
 use flint_agent::ToolKind;
 use flint_agent::TurnEndReason;
 use pretty_assertions::assert_eq;
-use serde_json::Value;
 use serde_json::json;
-use tokio::io::AsyncBufReadExt;
-use tokio::io::AsyncWriteExt;
-use tokio::io::BufReader;
-use tokio::io::DuplexStream;
-use tokio::io::ReadHalf;
-use tokio::io::WriteHalf;
-use tokio_util::compat::TokioAsyncReadCompatExt;
-use tokio_util::compat::TokioAsyncWriteCompatExt;
 
-use crate::launch::AcpAgent;
-use crate::runner::RunContext;
-
-/// The agent side of the pipe.
-struct Fake {
-    lines: tokio::io::Lines<BufReader<ReadHalf<DuplexStream>>>,
-    out: WriteHalf<DuplexStream>,
-}
-
-impl Fake {
-    async fn recv(&mut self) -> Value {
-        let line = tokio::time::timeout(Duration::from_secs(10), self.lines.next_line())
-            .await
-            .expect("client message in time")
-            .expect("read")
-            .expect("open pipe");
-        serde_json::from_str(&line).expect("json")
-    }
-
-    /// Next message with this method (skips others).
-    async fn expect(&mut self, method: &str) -> Value {
-        loop {
-            let message = self.recv().await;
-            if message["method"] == method {
-                return message;
-            }
-        }
-    }
-
-    async fn send(&mut self, value: Value) {
-        let mut line = value.to_string();
-        line.push('\n');
-        self.out.write_all(line.as_bytes()).await.expect("write");
-    }
-
-    async fn respond(&mut self, request: &Value, result: Value) {
-        self.send(json!({"jsonrpc": "2.0", "id": request["id"], "result": result}))
-            .await;
-    }
-
-    async fn update(&mut self, update: Value) {
-        self.send(json!({"jsonrpc": "2.0", "method": "session/update",
-            "params": {"sessionId": "s1", "update": update}}))
-            .await;
-    }
-
-    /// initialize + session/new.
-    async fn handshake(&mut self) {
-        let init = self.expect("initialize").await;
-        assert_eq!(
-            init["params"]["clientCapabilities"]["fs"],
-            json!({"readTextFile": true, "writeTextFile": true})
-        );
-        self.respond(
-            &init,
-            json!({"protocolVersion": 1, "agentCapabilities": {"loadSession": false}, "authMethods": []}),
-        )
-        .await;
-        let new = self.expect("session/new").await;
-        self.respond(&new, json!({"sessionId": "s1"})).await;
-    }
-
-    async fn permission(&mut self, id: &str, call: &str, title: &str) {
-        self.send(json!({"jsonrpc": "2.0", "id": id, "method": "session/request_permission", "params": {
-            "sessionId": "s1",
-            "options": [
-                {"optionId": "yes", "name": "Allow", "kind": "allow_once"},
-                {"optionId": "always", "name": "Always", "kind": "allow_always"},
-                {"optionId": "no", "name": "Reject", "kind": "reject_once"}
-            ],
-            "toolCall": {"toolCallId": call, "title": title, "kind": "execute", "status": "pending"}}}))
-            .await;
-    }
-}
-
-struct Harness {
-    ops: async_channel::Sender<Op>,
-    events: async_channel::Receiver<AgentEvent>,
-    stderr: Arc<Mutex<String>>,
-    _dir: tempfile::TempDir,
-    workspace: PathBuf,
-}
-
-impl Harness {
-    async fn next_event(&self) -> AgentEvent {
-        tokio::time::timeout(Duration::from_secs(10), self.events.recv())
-            .await
-            .expect("event in time")
-            .expect("open")
-    }
-
-    async fn next_turn(&self) -> Vec<AgentEvent> {
-        let mut events = Vec::new();
-        loop {
-            let event = self.next_event().await;
-            let done = matches!(event, AgentEvent::TurnFinished { .. });
-            events.push(event);
-            if done {
-                return events;
-            }
-        }
-    }
-
-    async fn until(&self, pred: impl Fn(&AgentEvent) -> bool) -> AgentEvent {
-        loop {
-            let event = self.next_event().await;
-            if pred(&event) {
-                return event;
-            }
-        }
-    }
-
-    async fn send(&self, op: Op) {
-        self.ops.send(op).await.expect("send");
-    }
-}
-
-fn start(approval: ApprovalMode) -> (Harness, Fake) {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let workspace = dir.path().canonicalize().expect("canonical");
-    let (client_side, agent_side) = tokio::io::duplex(1 << 20);
-    let (client_read, client_write) = tokio::io::split(client_side);
-    let (agent_read, agent_write) = tokio::io::split(agent_side);
-    let (ops_tx, ops_rx) = async_channel::unbounded();
-    let (events_tx, events_rx) = async_channel::unbounded();
-    let stderr = Arc::new(Mutex::new(String::new()));
-    let context = RunContext {
-        agent: AcpAgent::ClaudeCode,
-        workspace: workspace.clone(),
-        session_dir: None,
-        approval,
-        ops: ops_rx,
-        events: events_tx,
-        stderr: Arc::clone(&stderr),
-    };
-    tokio::spawn(crate::runner::run(
-        client_read.compat(),
-        client_write.compat_write(),
-        context,
-    ));
-    let fake = Fake {
-        lines: BufReader::new(agent_read).lines(),
-        out: agent_write,
-    };
-    let harness = Harness {
-        ops: ops_tx,
-        events: events_rx,
-        stderr,
-        _dir: dir,
-        workspace,
-    };
-    (harness, fake)
-}
-
-fn outline(events: &[AgentEvent]) -> Vec<String> {
-    events
-        .iter()
-        .map(|event| match event {
-            AgentEvent::TurnStarted { turn_id } => format!("turn {turn_id}"),
-            AgentEvent::StepStarted { step, .. } => format!("step {step}"),
-            AgentEvent::ReasoningDelta(text) => format!("thinking {text}"),
-            AgentEvent::TextDelta(text) => format!("text {text}"),
-            AgentEvent::ToolCallStarted {
-                call_id,
-                kind,
-                summary,
-                ..
-            } => format!("start {call_id} {kind:?} {summary}"),
-            AgentEvent::ToolCallFinished {
-                call_id,
-                output,
-                success,
-                diff,
-                ..
-            } => format!(
-                "finish {call_id} ok={success} {output:?}{}",
-                diff.as_ref()
-                    .map(|d| format!(" diff {} +{} -{}", d.path, d.added, d.removed))
-                    .unwrap_or_default()
-            ),
-            AgentEvent::ApprovalRequested {
-                call_id,
-                kind,
-                summary,
-            } => format!("approve? {call_id} {kind:?} {summary}"),
-            AgentEvent::Usage(u) => format!("usage {} {}", u.input_tokens, u.output_tokens),
-            AgentEvent::TurnFinished { reason, .. } => format!("finished {reason:?}"),
-            AgentEvent::Error(message) => format!("error {message}"),
-            other => format!("{other:?}"),
-        })
-        .collect()
-}
+use crate::test_support::outline;
+use crate::test_support::start;
 
 #[tokio::test]
 async fn maps_a_turn_of_updates() {
@@ -262,6 +57,7 @@ async fn maps_a_turn_of_updates() {
     assert_eq!(
         outline(&harness.next_turn().await),
         vec![
+            "options ",
             "turn 1",
             "step 0",
             "thinking plan",

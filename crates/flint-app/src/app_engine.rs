@@ -55,6 +55,9 @@ impl FlintApp {
                 _ => None,
             };
             finished |= matches!(event, AgentEvent::TurnFinished { .. });
+            if let AgentEvent::SessionOptions(options) = &event {
+                self.sessions[ix].options = options.clone();
+            }
             let session = &mut self.sessions[ix];
             let change = session.view.fold(event, now);
             session.apply(change);

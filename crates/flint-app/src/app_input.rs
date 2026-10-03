@@ -167,6 +167,9 @@ impl FlintApp {
         cx: &mut Context<Self>,
     ) -> bool {
         let plain = !key.modifiers.platform && !key.modifiers.control && !key.modifiers.alt;
+        if self.option_menu.is_some() && (plain || key.key == "escape") {
+            return self.option_menu_key(key.key.as_str(), cx);
+        }
         if self.agent_menu && key.key == "escape" {
             self.agent_menu = false;
             cx.notify();

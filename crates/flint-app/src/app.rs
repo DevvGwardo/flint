@@ -50,6 +50,9 @@ actions!(
 /// Startup options parsed from the command line.
 #[derive(Debug, Clone, Default)]
 pub struct Options {
+    /// Start an ACP agent as soon as it is picked, so its options (model,
+    /// mode, …) are ready before the first message. Off in tests.
+    pub start_agents_early: bool,
     pub workspace: Option<PathBuf>,
     pub demo: bool,
     /// Demo: stop after this many scripted events (mid-stream screenshots).
@@ -135,6 +138,8 @@ pub struct FlintApp {
     pub help_open: bool,
     /// The agent picker above the composer is open.
     pub agent_menu: bool,
+    /// An agent-option menu (model, reasoning, mode, more) is open.
+    pub option_menu: Option<crate::session_options::OptionMenu>,
     /// Summary row whose answer was just copied, and when.
     pub copied: Option<(usize, Instant)>,
     /// Sidebar row with its context menu open.
@@ -215,6 +220,7 @@ impl FlintApp {
             settings_form: None,
             help_open: false,
             agent_menu: false,
+            option_menu: None,
             copied: None,
             session_menu: None,
             renaming: None,

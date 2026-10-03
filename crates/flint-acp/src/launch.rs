@@ -168,6 +168,30 @@ pub fn find(name: &str, search_path: &str) -> Option<PathBuf> {
         .find(|candidate| candidate.is_file())
 }
 
+/// A user-facing explanation with the fix, from an agent error and the
+/// adapter's recent stderr.
+pub fn describe(agent: &AcpAgent, message: &str, code: Option<i64>, stderr: &str) -> String {
+    let combined = format!("{message}\n{stderr}");
+    let detail = message.trim();
+    if looks_like_auth_error(code, &combined) {
+        return format!(
+            "{} isn't logged in ({detail}). {}",
+            agent.name(),
+            agent.login_hint()
+        );
+    }
+    let lines: Vec<&str> = stderr.lines().filter(|l| !l.trim().is_empty()).collect();
+    let tail = lines[lines.len().saturating_sub(4)..].join(" · ");
+    if tail.is_empty() {
+        format!("{} stopped responding: {detail}", agent.name())
+    } else {
+        format!(
+            "{} stopped responding: {detail}. Adapter output: {tail}",
+            agent.name()
+        )
+    }
+}
+
 /// Whether an error from the agent means it isn't logged in.
 pub fn looks_like_auth_error(code: Option<i64>, message: &str) -> bool {
     // ACP's `auth_required` error code.

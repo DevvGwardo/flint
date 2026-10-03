@@ -19,8 +19,10 @@ pub mod header;
 pub mod layout;
 pub mod mention;
 pub mod menus;
+pub mod option_chips;
 pub mod palette;
 pub mod session;
+pub mod session_options;
 pub mod settings;
 pub mod settings_view;
 pub mod sidebar;
@@ -42,7 +44,10 @@ use crate::app::Options;
 
 /// Parses command-line flags (everything after the program name).
 pub fn parse_options(args: impl IntoIterator<Item = String>) -> Options {
-    let mut options = Options::default();
+    let mut options = Options {
+        start_agents_early: true,
+        ..Options::default()
+    };
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
         match arg.as_str() {

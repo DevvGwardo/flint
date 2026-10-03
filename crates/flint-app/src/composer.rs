@@ -169,6 +169,7 @@ pub fn render(app: &FlintApp, cx: &mut Context<FlintApp>) -> AnyElement {
                 .child(ui::icon(IconName::ChevronDown, 12., p.text_subtle))
                 .test_support(),
         )
+        .children(crate::option_chips::chips(app, cx))
         // ACP agents choose their own reasoning depth; the chip is flint's.
         .when(
             app.effort_supported && app.session().agent == AgentKind::Flint,
@@ -183,13 +184,16 @@ pub fn render(app: &FlintApp, cx: &mut Context<FlintApp>) -> AnyElement {
             },
         )
         .child(div().flex_1())
-        .child(
-            chip("approval-hint")
-                .on_click(cx.listener(|this, _, _, cx| this.toggle_approval(cx)))
-                .child(ui::icon(mode_icon, 14., mode_color))
-                .child(ui::label(mode_text, size::SM, mode_color))
-                .child(ui::label("shift+tab", size::SM, p.text_subtle)),
-        )
+        // When the agent has its own modes, its mode chip replaces auto-run.
+        .when(app.session_slots().mode.is_none(), |bar| {
+            bar.child(
+                chip("approval-hint")
+                    .on_click(cx.listener(|this, _, _, cx| this.toggle_approval(cx)))
+                    .child(ui::icon(mode_icon, 14., mode_color))
+                    .child(ui::label(mode_text, size::SM, mode_color))
+                    .child(ui::label("shift+tab", size::SM, p.text_subtle)),
+            )
+        })
         .child(div().w(px(4.)))
         .child(send);
 

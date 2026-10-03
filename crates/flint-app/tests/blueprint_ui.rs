@@ -1158,3 +1158,144 @@ fn agent_picker_sets_a_fresh_session_and_opens_a_new_one_after_start(cx: &mut Te
     assert_eq!(agents, (vec![AgentKind::ClaudeCode, AgentKind::Codex], 1));
     assert_eq!(ui.composer_text(cx), "");
 }
+
+fn agent_options(mode: &str) -> AgentEvent {
+    use flint_agent::OptionChoice;
+    use flint_agent::SessionOption;
+    let option =
+        |id: &str, category: Option<&str>, current: &str, choices: &[(&str, &str)]| SessionOption {
+            id: id.to_string(),
+            name: id.to_string(),
+            description: None,
+            category: category.map(str::to_string),
+            current: current.to_string(),
+            choices: choices
+                .iter()
+                .map(|(value, name)| OptionChoice {
+                    value: (*value).to_string(),
+                    name: (*name).to_string(),
+                    description: Some(format!("about {name}")),
+                })
+                .collect(),
+        };
+    AgentEvent::SessionOptions(vec![
+        option(
+            "mode",
+            Some("mode"),
+            mode,
+            &[
+                ("default", "Manual"),
+                ("acceptEdits", "Accept Edits"),
+                ("plan", "Plan"),
+                ("bypassPermissions", "Bypass"),
+            ],
+        ),
+        option(
+            "model",
+            Some("model"),
+            "default",
+            &[("default", "Default"), ("opus", "Opus")],
+        ),
+        option(
+            "effort",
+            Some("thought_level"),
+            "high",
+            &[("low", "Low"), ("high", "High")],
+        ),
+        option(
+            "fast",
+            Some("model_config"),
+            "off",
+            &[("on", "On"), ("off", "Off")],
+        ),
+        option(
+            "agent",
+            None,
+            "default",
+            &[("default", "Default"), ("reviewer", "Reviewer")],
+        ),
+    ])
+}
+
+/// A Claude Code session with scripted options attached.
+fn acp_session(cx: &mut TestAppContext) -> (Ui, Engine) {
+    let ui = open(cx);
+    ui.app.update(cx, |app, _| {
+        app.sessions[0].agent = flint_agent::AgentKind::ClaudeCode
+    });
+    let engine = ui.engine(cx);
+    engine.send(cx, agent_options("default"));
+    (ui, engine)
+}
+
+fn has(ui: &Ui, cx: &mut TestAppContext, id: &str) -> bool {
+    let id = id.to_string();
+    ui.with(cx, move |window, _| {
+        window.try_find(ElementId::Name(id.into())).is_some()
+    })
+}
+
+#[gpui_kit::test]
+fn agent_option_chips_render_and_replace_auto_run(cx: &mut TestAppContext) {
+    let (ui, _engine) = acp_session(cx);
+    for id in [
+        "option-model",
+        "option-reasoning",
+        "option-mode",
+        "option-fast",
+        "option-more",
+    ] {
+        assert!(has(&ui, cx, id), "{id} missing");
+    }
+    assert!(!has(&ui, cx, "approval-hint"));
+    assert!(!has(&ui, cx, "effort-chip"));
+}
+
+#[gpui_kit::test]
+fn option_menus_send_set_session_option(cx: &mut TestAppContext) {
+    let (ui, engine) = acp_session(cx);
+    // Keyboard: open the model menu, move down, Enter.
+    ui.click(cx, "option-model");
+    assert!(has(&ui, cx, "option-menu"));
+    ui.press(cx, "down");
+    ui.press(cx, "enter");
+    assert!(
+        matches!(engine.sent().as_slice(), [Op::SetSessionOption { id, value }] if id == "model" && value == "opus")
+    );
+    assert!(!has(&ui, cx, "option-menu"));
+    // Mouse: reasoning menu, first row.
+    ui.click(cx, "option-reasoning");
+    ui.click(cx, ("option-item", 0usize));
+    assert!(
+        matches!(engine.sent().as_slice(), [Op::SetSessionOption { id, value }] if id == "effort" && value == "low")
+    );
+    // Fast is a toggle.
+    ui.click(cx, "option-fast");
+    assert!(
+        matches!(engine.sent().as_slice(), [Op::SetSessionOption { id, value }] if id == "fast" && value == "on")
+    );
+    // More lists the remaining options; picking one opens its choices.
+    ui.click(cx, "option-more");
+    ui.click(cx, ("option-item", 0usize));
+    ui.click(cx, ("option-item", 1usize));
+    assert!(
+        matches!(engine.sent().as_slice(), [Op::SetSessionOption { id, value }] if id == "agent" && value == "reviewer")
+    );
+}
+
+#[gpui_kit::test]
+fn shift_tab_cycles_the_agents_mode(cx: &mut TestAppContext) {
+    let (ui, engine) = acp_session(cx);
+    ui.press(cx, "shift-tab");
+    assert!(
+        matches!(engine.sent().as_slice(), [Op::SetSessionOption { id, value }] if id == "mode" && value == "acceptEdits")
+    );
+    engine.send(cx, agent_options("plan"));
+    // From Plan it wraps to Manual, skipping Bypass.
+    ui.press(cx, "shift-tab");
+    assert!(
+        matches!(engine.sent().as_slice(), [Op::SetSessionOption { id, value }] if id == "mode" && value == "default")
+    );
+    // flint's auto-run is untouched.
+    assert_eq!(ui.read(cx, |app, _| app.approval), ApprovalMode::Auto);
+}

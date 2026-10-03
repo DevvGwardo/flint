@@ -59,6 +59,7 @@ impl FlintApp {
         if fresh {
             let ix = self.active;
             self.sessions[ix].agent = kind;
+            self.start_agent_early(ix, cx);
             self.composer
                 .update(cx, |state, cx| state.focus(window, cx));
             cx.notify();
@@ -80,7 +81,28 @@ impl FlintApp {
         self.new_session(window, cx);
         let ix = self.active;
         self.sessions[ix].agent = kind;
+        self.start_agent_early(ix, cx);
         cx.notify();
+    }
+
+    /// Starts an ACP agent right away (its adapter takes 20–50 s), so its
+    /// options are ready by the first message. Opening a session uses no
+    /// plan quota; only prompts do.
+    fn start_agent_early(&mut self, ix: usize, cx: &mut Context<Self>) {
+        let session = &self.sessions[ix];
+        if !self.options.start_agents_early
+            || session.agent == AgentKind::Flint
+            || session.ops.is_some()
+        {
+            return;
+        }
+        if !self.options.ephemeral() && session.dir.is_none() {
+            self.sessions[ix].dir =
+                Some(crate::store::sessions_dir(&self.home).join(crate::store::new_id()));
+        }
+        if let Err(err) = self.ensure_engine(ix, cx) {
+            self.apply_event(ix, flint_agent::AgentEvent::Error(format!("{err:#}")), cx);
+        }
     }
 
     /// Starts an ACP agent for a session (see `ensure_engine`).

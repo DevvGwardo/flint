@@ -283,6 +283,8 @@ impl SessionView {
                 before_tokens,
                 after_tokens,
             }),
+            // Kept on the session (composer chips), not in the transcript.
+            AgentEvent::SessionOptions(_) => Change::default(),
         }
     }
 

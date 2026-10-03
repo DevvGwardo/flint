@@ -28,6 +28,8 @@ pub struct Session {
     pub list: ListState,
     /// flint's engine or an ACP agent; fixed once the session has started.
     pub agent: AgentKind,
+    /// The agent's own options (model, reasoning, mode, …), as last reported.
+    pub options: Vec<flint_agent::SessionOption>,
     pub workspace: PathBuf,
     pub created: SystemTime,
     /// Last activity, for ordering and the sidebar's relative time.
@@ -70,6 +72,7 @@ impl Session {
             view: SessionView::default(),
             list,
             agent: AgentKind::Flint,
+            options: Vec::new(),
             workspace,
             created: SystemTime::now(),
             touched: SystemTime::now(),
