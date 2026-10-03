@@ -30,6 +30,10 @@ pub struct Session {
     pub agent: AgentKind,
     /// The agent's own options (model, reasoning, mode, …), as last reported.
     pub options: Vec<flint_agent::SessionOption>,
+    /// The ACP agent has opened its session (it reported its options).
+    pub agent_ready: bool,
+    /// The ACP agent failed before it was ready.
+    pub agent_failed: bool,
     pub workspace: PathBuf,
     pub created: SystemTime,
     /// Last activity, for ordering and the sidebar's relative time.
@@ -73,6 +77,8 @@ impl Session {
             list,
             agent: AgentKind::Flint,
             options: Vec::new(),
+            agent_ready: false,
+            agent_failed: false,
             workspace,
             created: SystemTime::now(),
             touched: SystemTime::now(),
@@ -96,6 +102,14 @@ impl Session {
             let at = change.appended.start;
             self.list.splice(at..at, change.appended.len());
         }
+    }
+
+    /// An ACP agent is starting up (its adapter can take 20–50 s).
+    pub fn agent_starting(&self) -> bool {
+        self.agent != flint_agent::AgentKind::Flint
+            && self.ops.is_some()
+            && !self.agent_ready
+            && !self.agent_failed
     }
 
     pub fn title(&self) -> String {

@@ -2,6 +2,7 @@
 //! centered on the page, and suggestion chips, over a faint ember glow.
 
 use gpui_kit::assets::IconName;
+use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use crate::app::FlintApp;
@@ -48,6 +49,24 @@ pub fn render(app: &FlintApp, window: &mut Window, cx: &mut Context<FlintApp>) -
     // The tip floats over the top-right corner, clear of the centered hero
     // only on wide windows; on narrow ones it would sit on the headline.
     let roomy = window.viewport_size().width >= px(1200.);
+    // On short windows the mark goes, so the greeting never crowds the header.
+    let show_logo = window.viewport_size().height >= px(720.);
+    let folder_chip = div()
+        .id("welcome-folder")
+        .px(px(12.))
+        .rounded(px(12.))
+        .flex()
+        .items_center()
+        .gap(px(6.))
+        .cursor_pointer()
+        .border_1()
+        .border_color(p.border_strong)
+        .hover(|style| style.bg(p.surface))
+        .on_click(cx.listener(|this, _, _, cx| this.toggle_project_menu(cx)))
+        .child(ui::icon(IconName::Folder, 22., p.accent))
+        .child(workspace.clone())
+        .child(ui::icon(IconName::ChevronDown, 18., p.text_subtle))
+        .test_support();
     let notice = (!app.settings.tip_dismissed && roomy).then(|| {
         div()
             .id("welcome-tip")
@@ -131,16 +150,20 @@ pub fn render(app: &FlintApp, window: &mut Window, cx: &mut Context<FlintApp>) -
                 .flex_col()
                 .items_center()
                 .gap(px(32.))
-                .child(
-                    div()
-                        .size(px(48.))
-                        .rounded(px(13.))
-                        .bg(p.accent_soft)
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .child(ui::icon(IconName::Flame, 24., p.accent)),
-                )
+                .when(show_logo, |hero| {
+                    hero.child(
+                        div()
+                            .id("welcome-logo")
+                            .size(px(48.))
+                            .rounded(px(13.))
+                            .bg(p.accent_soft)
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(ui::icon(IconName::Flame, 24., p.accent))
+                            .test_support(),
+                    )
+                })
                 .child(
                     div()
                         .flex()
@@ -154,12 +177,18 @@ pub fn render(app: &FlintApp, window: &mut Window, cx: &mut Context<FlintApp>) -
                                 .text_color(p.text_subtle)
                                 .child("Ready when you are."),
                         )
+                        // The folder is a chip: click it to pick another project.
                         .child(
                             div()
+                                .flex()
+                                .items_center()
+                                .gap(px(10.))
                                 .text_size(px(34.))
                                 .line_height(px(44.))
                                 .font_weight(FontWeight::MEDIUM)
-                                .child(format!("What should we build in {workspace}?")),
+                                .child("What should we build in")
+                                .child(folder_chip)
+                                .child("?"),
                         ),
                 )
                 .child(composer)

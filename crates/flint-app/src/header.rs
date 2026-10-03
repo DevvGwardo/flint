@@ -141,5 +141,5 @@ pub fn render(
         .gap(px(12.))
         .child(title)
         .child(actions);
-    app.drag_region(bar, cx)
+    app.drag_region(bar, cx).test_support()
 }

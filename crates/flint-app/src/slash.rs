@@ -6,6 +6,7 @@ pub enum SlashCommand {
     Clear,
     Model,
     Agent,
+    Mode,
     Effort,
     Approval,
     Review,
@@ -29,7 +30,12 @@ pub const COMMANDS: &[(SlashCommand, &str, &str)] = &[
         "/agent",
         "Switch agent: /agent claude, codex or flint",
     ),
-    (SlashCommand::Effort, "/effort", "Cycle reasoning effort"),
+    (SlashCommand::Effort, "/effort", "Reasoning effort"),
+    (
+        SlashCommand::Mode,
+        "/mode",
+        "The agent's mode (or flint's auto-run)",
+    ),
     (
         SlashCommand::Approval,
         "/approval",
@@ -47,9 +53,12 @@ pub fn active_query(text: &str) -> Option<&str> {
 
 pub fn matches(query: &str) -> Vec<(SlashCommand, &'static str, &'static str)> {
     let query = query.to_lowercase();
-    COMMANDS
+    let mut found: Vec<_> = COMMANDS
         .iter()
         .copied()
         .filter(|(_, name, _)| name[1..].starts_with(&query))
-        .collect()
+        .collect();
+    // An exact name wins over longer ones it prefixes (`/mode` vs `/model`).
+    found.sort_by_key(|(_, name, _)| name[1..] != query);
+    found
 }

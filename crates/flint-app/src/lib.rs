@@ -21,6 +21,7 @@ pub mod mention;
 pub mod menus;
 pub mod option_chips;
 pub mod palette;
+pub mod project_menu;
 pub mod session;
 pub mod session_options;
 pub mod settings;

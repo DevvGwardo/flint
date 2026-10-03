@@ -88,7 +88,7 @@ impl FlintApp {
     /// Starts an ACP agent right away (its adapter takes 20–50 s), so its
     /// options are ready by the first message. Opening a session uses no
     /// plan quota; only prompts do.
-    fn start_agent_early(&mut self, ix: usize, cx: &mut Context<Self>) {
+    pub(crate) fn start_agent_early(&mut self, ix: usize, cx: &mut Context<Self>) {
         let session = &self.sessions[ix];
         if !self.options.start_agents_early
             || session.agent == AgentKind::Flint

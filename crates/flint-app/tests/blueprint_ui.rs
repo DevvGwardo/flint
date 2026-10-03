@@ -633,7 +633,10 @@ fn plus_opens_the_same_file_picker(cx: &mut TestAppContext) {
             ..test_options()
         },
     );
+    // "+" opens the project menu; its last row is "Attach file…".
     ui.click(cx, "attach");
+    let attach = ui.read(cx, |app, _| app.project_items().len() - 1);
+    ui.click(cx, ("project-item", attach));
     let menu = ui.read(cx, |app, _| {
         app.mention.as_ref().map(|m| (m.inline, m.results.len()))
     });
@@ -1230,7 +1233,8 @@ fn acp_session(cx: &mut TestAppContext) -> (Ui, Engine) {
 
 fn has(ui: &Ui, cx: &mut TestAppContext, id: &str) -> bool {
     let id = id.to_string();
-    ui.with(cx, move |window, _| {
+    ui.with(cx, move |window, cx| {
+        window.render_frame(cx);
         window.try_find(ElementId::Name(id.into())).is_some()
     })
 }
@@ -1298,4 +1302,130 @@ fn shift_tab_cycles_the_agents_mode(cx: &mut TestAppContext) {
     );
     // flint's auto-run is untouched.
     assert_eq!(ui.read(cx, |app, _| app.approval), ApprovalMode::Auto);
+}
+
+#[gpui_kit::test]
+fn plus_menu_lists_folders_and_picking_one_sets_the_workspace(cx: &mut TestAppContext) {
+    use flint_app::project_menu::ProjectItem;
+    let ui = open(cx);
+    let other = temp_dir("other-project");
+    // A saved session elsewhere makes that folder a recent one.
+    ui.app.update(cx, |app, _| {
+        app.sessions
+            .push(flint_app::session::Session::new(9_999, other.clone()));
+    });
+    ui.click(cx, "attach");
+    let items = ui.read(cx, |app, _| app.project_items());
+    assert_eq!(
+        items,
+        vec![
+            ProjectItem::OpenFolder,
+            ProjectItem::Recent(other.clone()),
+            ProjectItem::AttachFile,
+        ]
+    );
+    for n in 0..3usize {
+        assert!(ui.with(cx, move |w, _| w.try_find(("project-item", n)).is_some()));
+    }
+    // An unstarted session moves to the chosen folder.
+    ui.click(cx, ("project-item", 1usize));
+    assert_eq!(
+        ui.read(cx, |app, _| (
+            app.session().workspace.clone(),
+            app.sessions.len(),
+            app.project_menu
+        )),
+        (other.clone(), 2, None)
+    );
+
+    // A started session stays put; the folder opens in a new session.
+    let _engine = ui.engine(cx);
+    ui.input(cx, "first task");
+    ui.press(cx, "enter");
+    let first = ui.read(cx, |app, _| app.sessions[1].workspace.clone());
+    let elsewhere = temp_dir("elsewhere");
+    ui.app
+        .update(cx, |app, cx| app.set_project_folder(elsewhere.clone(), cx));
+    assert_eq!(
+        ui.read(cx, |app, _| (
+            app.sessions.len(),
+            app.session().workspace.clone(),
+            app.sessions[1].workspace.clone()
+        )),
+        (3, elsewhere, first)
+    );
+}
+
+#[gpui_kit::test]
+fn welcome_folder_chip_opens_the_project_menu(cx: &mut TestAppContext) {
+    let ui = open(cx);
+    ui.click(cx, "welcome-folder");
+    assert!(has(&ui, cx, "project-menu"));
+    ui.press(cx, "escape");
+    assert!(!has(&ui, cx, "project-menu"));
+}
+
+#[gpui_kit::test]
+fn open_picker_does_not_push_the_logo_into_the_header(cx: &mut TestAppContext) {
+    let ui = open(cx);
+    let bounds = |ui: &Ui, cx: &mut TestAppContext, id: &'static str| {
+        ui.with(cx, move |window, cx| {
+            window.render_frame(cx);
+            window.find(ElementId::Name(id.into())).bounds()
+        })
+    };
+    let header = bounds(&ui, cx, "header");
+    let before = bounds(&ui, cx, "welcome-logo");
+    ui.click(cx, "attach");
+    let attach = ui.read(cx, |app, _| app.project_items().len() - 1);
+    ui.click(cx, ("project-item", attach));
+    assert!(ui.read(cx, |app, _| app.mention.is_some()));
+    let after = bounds(&ui, cx, "welcome-logo");
+    assert_eq!(after.origin, before.origin, "the picker moved the hero");
+    assert!(
+        after.origin.y >= header.origin.y + header.size.height,
+        "logo {after:?} overlaps header {header:?}"
+    );
+}
+
+#[gpui_kit::test]
+fn starting_agent_shows_a_status_line_and_greyed_chips(cx: &mut TestAppContext) {
+    let ui = open(cx);
+    ui.app.update(cx, |app, _| {
+        app.sessions[0].agent = flint_agent::AgentKind::Codex
+    });
+    let engine = ui.engine(cx);
+    assert!(ui.read(cx, |app, _| app.session().agent_starting()));
+    assert!(has(&ui, cx, "agent-starting"));
+    assert!(ui.with(cx, |w, _| {
+        w.try_find(("option-placeholder", 0usize)).is_some()
+    }));
+    engine.send(cx, agent_options("default"));
+    assert!(!has(&ui, cx, "agent-starting"));
+    assert!(has(&ui, cx, "option-model"));
+}
+
+#[gpui_kit::test]
+fn slash_model_and_mode_open_the_agents_menus(cx: &mut TestAppContext) {
+    use flint_app::session_options::MenuTarget;
+    let (ui, _engine) = acp_session(cx);
+    ui.input(cx, "/model");
+    ui.press(cx, "enter");
+    assert_eq!(
+        ui.read(cx, |app, _| app
+            .option_menu
+            .as_ref()
+            .map(|m| m.target.clone())),
+        Some(MenuTarget::Option("model".into()))
+    );
+    ui.press(cx, "escape");
+    ui.input(cx, "/mode");
+    ui.press(cx, "enter");
+    assert_eq!(
+        ui.read(cx, |app, _| app
+            .option_menu
+            .as_ref()
+            .map(|m| m.target.clone())),
+        Some(MenuTarget::Option("mode".into()))
+    );
 }

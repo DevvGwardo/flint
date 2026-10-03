@@ -200,7 +200,7 @@ pub fn render(app: &FlintApp, cx: &mut Context<FlintApp>) -> Option<AnyElement> 
                 .child(line("@", "Attach a workspace file"))
                 .child(line(
                     "/",
-                    "Commands: new, clear, agent, model, effort, approval, review",
+                    "Commands: new, clear, agent, model, effort, mode, approval, review",
                 ))
                 .child(line("⇧⇥", "Switch auto-run / ask before changes"))
                 .child(line(

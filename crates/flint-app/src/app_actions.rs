@@ -22,14 +22,8 @@ impl FlintApp {
             let Some(path) = paths.into_iter().next() else {
                 return;
             };
-            this.update(cx, |app, cx| {
-                app.workspace = path.clone();
-                let session = app.new_session_value(path);
-                app.sessions.push(session);
-                app.active = app.sessions.len() - 1;
-                cx.notify();
-            })
-            .ok();
+            this.update(cx, |app, cx| app.set_project_folder(path, cx))
+                .ok();
         })
         .detach();
     }

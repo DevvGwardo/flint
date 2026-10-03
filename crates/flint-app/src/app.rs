@@ -140,6 +140,8 @@ pub struct FlintApp {
     pub agent_menu: bool,
     /// An agent-option menu (model, reasoning, mode, more) is open.
     pub option_menu: Option<crate::session_options::OptionMenu>,
+    /// The "+" menu (project folder, recent folders, attach) and its selection.
+    pub project_menu: Option<usize>,
     /// Summary row whose answer was just copied, and when.
     pub copied: Option<(usize, Instant)>,
     /// Sidebar row with its context menu open.
@@ -221,6 +223,7 @@ impl FlintApp {
             help_open: false,
             agent_menu: false,
             option_menu: None,
+            project_menu: None,
             copied: None,
             session_menu: None,
             renaming: None,

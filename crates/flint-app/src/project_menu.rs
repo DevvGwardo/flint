@@ -70,7 +70,12 @@ impl FlintApp {
     }
 
     /// Keys while the menu is open; returns whether the key was consumed.
-    pub fn project_menu_key(&mut self, key: &str, window: &mut Window, cx: &mut Context<Self>) -> bool {
+    pub fn project_menu_key(
+        &mut self,
+        key: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
         let Some(selected) = self.project_menu else {
             return false;
         };
@@ -119,16 +124,27 @@ impl FlintApp {
 
 fn item_label(item: &ProjectItem) -> (IconName, String, Option<String>) {
     match item {
-        ProjectItem::OpenFolder => (IconName::FolderOpen, "Open project folder…".to_string(), Some("⌘O".to_string())),
+        ProjectItem::OpenFolder => (
+            IconName::FolderOpen,
+            "Open project folder…".to_string(),
+            Some("⌘O".to_string()),
+        ),
         ProjectItem::Recent(path) => (IconName::Folder, folder_name(path), Some(short_path(path))),
-        ProjectItem::AttachFile => (IconName::Paperclip, "Attach file…".to_string(), Some("@".to_string())),
+        ProjectItem::AttachFile => (
+            IconName::Paperclip,
+            "Attach file…".to_string(),
+            Some("@".to_string()),
+        ),
     }
 }
 
 /// `~/code/app` style path for the menu.
 fn short_path(path: &Path) -> String {
     let home = std::env::var_os("HOME").map(PathBuf::from);
-    match home.as_deref().and_then(|home| path.strip_prefix(home).ok()) {
+    match home
+        .as_deref()
+        .and_then(|home| path.strip_prefix(home).ok())
+    {
         Some(rest) => format!("~/{}", rest.display()),
         None => path.display().to_string(),
     }

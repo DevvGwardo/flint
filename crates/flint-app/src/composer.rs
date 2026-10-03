@@ -155,7 +155,7 @@ pub fn render(app: &FlintApp, cx: &mut Context<FlintApp>) -> AnyElement {
                 .border_1()
                 .border_color(p.border_strong)
                 .child(ui::icon(IconName::Plus, 17., p.text_muted))
-                .on_click(cx.listener(|this, _, window, cx| this.open_mention_picker(window, cx)))
+                .on_click(cx.listener(|this, _, _, cx| this.toggle_project_menu(cx)))
                 .test_support(),
         )
         .child(
@@ -217,6 +217,26 @@ pub fn render(app: &FlintApp, cx: &mut Context<FlintApp>) -> AnyElement {
         )
         .child(toolbar);
 
+    // Menus float over the page instead of taking room in the column, so
+    // opening one never pushes the welcome screen's hero into the header.
+    // On the welcome screen they open below the composer (over the
+    // suggestions); in a conversation, above it.
+    let welcome = app.session().view.items.is_empty();
+    let popover = crate::menus::render(app, cx)
+        .or_else(|| crate::project_menu::render(app, cx))
+        .map(|menu| {
+            deferred(
+                div()
+                    .absolute()
+                    .left_0()
+                    .w_full()
+                    .when(welcome, |d| d.top_full().mt(px(8.)))
+                    .when(!welcome, |d| d.bottom_full().mb(px(8.)))
+                    .child(menu),
+            )
+            .with_priority(1)
+        });
+
     let pinned = app
         .session()
         .view
@@ -231,13 +251,39 @@ pub fn render(app: &FlintApp, cx: &mut Context<FlintApp>) -> AnyElement {
         .flex()
         .flex_col()
         .gap(px(10.))
-        .when(running && pinned.is_none(), |col| {
-            col.child(status_line(app))
+        .when(app.session().agent_starting(), |col| {
+            col.child(starting_line(app))
         })
+        .when(
+            running && pinned.is_none() && !app.session().agent_starting(),
+            |col| col.child(status_line(app)),
+        )
         .children(pinned)
-        .children(crate::menus::render(app, cx))
-        .child(card)
+        .child(div().relative().w_full().child(card).children(popover))
         .into_any_element()
+}
+
+/// "Starting Claude Code…" while an ACP adapter opens its session.
+fn starting_line(app: &FlintApp) -> impl IntoElement {
+    let p = palette();
+    div()
+        .id("agent-starting")
+        .px(px(6.))
+        .flex()
+        .items_center()
+        .gap(px(9.))
+        .child(ui::spinner(app.now(), 13., p.accent))
+        .child(ui::label(
+            format!("Starting {}…", app.session().agent.label()),
+            size::BASE - 1.,
+            p.text,
+        ))
+        .child(ui::label(
+            "the first start can take up to a minute",
+            size::SM,
+            p.text_subtle,
+        ))
+        .test_support()
 }
 
 /// `✻ Forging… (29s · ↓ 383 tokens) · esc to interrupt`

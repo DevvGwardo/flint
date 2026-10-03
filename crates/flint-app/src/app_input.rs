@@ -6,6 +6,7 @@ use gpui_kit::*;
 
 use crate::app::FlintApp;
 use crate::mention;
+use crate::session_options::MenuTarget;
 use crate::slash;
 use crate::slash::SlashCommand;
 
@@ -119,7 +120,15 @@ impl FlintApp {
         match command {
             SlashCommand::New => self.new_session(window, cx),
             SlashCommand::Clear => self.clear_session(window, cx),
-            SlashCommand::Model => self.open_settings(window, cx),
+            // For an ACP agent these open its own option menus.
+            SlashCommand::Model => match self.session_slots().model {
+                Some(model) => self.open_option_menu(MenuTarget::Option(model.id), cx),
+                None => self.open_settings(window, cx),
+            },
+            SlashCommand::Mode => match self.session_slots().mode {
+                Some(mode) => self.open_option_menu(MenuTarget::Option(mode.id), cx),
+                None => self.toggle_approval(cx),
+            },
             SlashCommand::Agent => {
                 // Leave "/agent " for the user to finish with a name.
                 self.composer.update(cx, |state, cx| {
@@ -127,7 +136,10 @@ impl FlintApp {
                     state.focus(window, cx);
                 });
             }
-            SlashCommand::Effort => self.cycle_effort(cx),
+            SlashCommand::Effort => match self.session_slots().reasoning {
+                Some(reasoning) => self.open_option_menu(MenuTarget::Option(reasoning.id), cx),
+                None => self.cycle_effort(cx),
+            },
             SlashCommand::Approval => self.toggle_approval(cx),
             SlashCommand::Review => self.review(None, cx),
             SlashCommand::Help => self.help_open = true,
@@ -167,6 +179,9 @@ impl FlintApp {
         cx: &mut Context<Self>,
     ) -> bool {
         let plain = !key.modifiers.platform && !key.modifiers.control && !key.modifiers.alt;
+        if self.project_menu.is_some() && (plain || key.key == "escape") {
+            return self.project_menu_key(key.key.as_str(), window, cx);
+        }
         if self.option_menu.is_some() && (plain || key.key == "escape") {
             return self.option_menu_key(key.key.as_str(), cx);
         }

@@ -55,8 +55,15 @@ impl FlintApp {
                 _ => None,
             };
             finished |= matches!(event, AgentEvent::TurnFinished { .. });
-            if let AgentEvent::SessionOptions(options) = &event {
-                self.sessions[ix].options = options.clone();
+            match &event {
+                AgentEvent::SessionOptions(options) => {
+                    self.sessions[ix].options = options.clone();
+                    self.sessions[ix].agent_ready = true;
+                }
+                AgentEvent::Error(_) if !self.sessions[ix].agent_ready => {
+                    self.sessions[ix].agent_failed = true;
+                }
+                _ => {}
             }
             let session = &mut self.sessions[ix];
             let change = session.view.fold(event, now);
@@ -190,6 +197,7 @@ impl FlintApp {
             .is_some_and(|ops| ops.is_closed())
         {
             self.sessions[ix].ops = None;
+            self.sessions[ix].agent_failed = false;
         }
         self.send_message(ix, text, message, cx);
     }

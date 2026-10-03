@@ -33,6 +33,25 @@ fn chip(id: impl Into<ElementId>) -> Stateful<Div> {
 /// or before the agent has reported any.
 pub fn chips(app: &FlintApp, cx: &mut Context<FlintApp>) -> Vec<AnyElement> {
     let p = palette();
+    if app.session().options.is_empty() && app.session().agent_starting() {
+        // Greyed until the agent reports its options.
+        return ["Model", "Reasoning", "Mode"]
+            .into_iter()
+            .enumerate()
+            .map(|(n, name)| {
+                div()
+                    .id(("option-placeholder", n))
+                    .h(px(34.))
+                    .px(px(11.))
+                    .flex()
+                    .items_center()
+                    .opacity(0.45)
+                    .child(ui::label(name, size::BASE - 1., p.text_subtle))
+                    .test_support()
+                    .into_any_element()
+            })
+            .collect();
+    }
     let slots = app.session_slots();
     let mut out = Vec::new();
     let label = |o: &flint_agent::SessionOption| {
