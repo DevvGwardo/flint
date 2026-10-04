@@ -2,6 +2,28 @@
 
 Flint is a high-performance native macOS desktop application for coding agents, engineered in Rust using the [GPUI](https://github.com/zed-industries/zed) GPU-accelerated UI framework. It supports both a native, autonomous agent loop and external agents adhering to the [Agent Client Protocol (ACP)](https://agentclientprotocol.com).
 
+## Current implementation constraints
+
+Edition 2024 and Rust 1.95.0 are pinned. GPUI kit/base/component 0.7.0 use
+gpui-pre 0.3.7; installed APIs, not unrelated upstream versions, govern the UI.
+Chat retains ordered 8-ms coalescing with at most 256 events per pump batch.
+Appends and existing-row remeasurement are applied once per batch, preserving
+native variable-height list anchors and explicit tail following.
+
+Native tools require supported provider completion before dispatch, preserve
+valid JSON strings/nulls, and bound file input and edit results at 8 MiB.
+ACP settings remain backend-confirmed; native remembered approvals, harness
+guards and undo are not applied to external agents. Owned Unix process groups
+provide cleanup, not a sandbox. ACP output storage is bounded, but its shared
+event channel still needs end-to-end backpressure.
+
+Compact composers reserve readable input and send/stop space; wrapped options
+scroll. Custom primary controls export explicit AccessKit Button roles and
+names, using GPUI's existing native click handlers.
+
+See [the current gap-closure ledger](GAP-CLOSURE-20261003.md) for exact caps,
+validation, filesystem race limits and native accessibility limitations.
+
 ---
 
 ## 1. System Overview

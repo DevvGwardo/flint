@@ -27,7 +27,7 @@
 
 <p align="center">
   <img src="https://img.shields.io/badge/Platform-macOS-black?style=flat-square&logo=apple" alt="macOS" />
-  <img src="https://img.shields.io/badge/Rust-2021-dea584?style=flat-square&logo=rust" alt="Rust" />
+  <img src="https://img.shields.io/badge/Rust-2024-dea584?style=flat-square&logo=rust" alt="Rust" />
   <img src="https://img.shields.io/badge/GUI-GPUI-blue?style=flat-square" alt="GPUI" />
   <img src="https://img.shields.io/badge/License-Apache--2.0-green?style=flat-square" alt="License" />
 </p>
@@ -58,10 +58,39 @@
   subscriptions.
 - **Sessions.** Several run concurrently, are saved to `~/.flint/sessions/`, and
   are restored on launch. Long conversations are trimmed to a context budget.
+  Drafts stay with their session. **Jump to latest** resumes following output
+  after you scroll back.
+- **Git worktrees.** Choose **Git worktrees…** from the composer's `+` menu
+  or command palette to open an existing checkout or create one on a new
+  branch. Enter a base branch or commit (default `HEAD`). New checkouts live
+  under `~/.flint/worktrees/` (or `$FLINT_HOME/worktrees/`) and inherit the
+  selected agent without moving the original session or its draft.
+  Sessions, terminals, file mentions and edits use the selected checkout;
+  worktrees still group under the same repository in the sidebar.
+  Removal requires confirmation, refuses dirty or locked checkouts, and is
+  disabled for checkouts referenced by sessions, archives or terminals.
+  It never force-deletes a checkout or deletes its branch.
+- **Prompt queue and steering.** Keep writing while the agent works.
+  **Enter** or **Queue** adds a follow-up to the session's **Up next** tray;
+  prompts run one at a time after successful turns. Edit, reorder, remove,
+  pause or resume them without changing your current draft. Files and images
+  are captured when queued, and pending prompts restore **paused** after restart.
+  The queue holds up to 20 prompts and 32 MB of captured content.
+  **Steer now** applies a queued instruction at the native agent's next model
+  step without interrupting tools. With Claude, Codex or Droid, it stops the
+  current turn and sends that prompt next instead. The composer's **Steer**
+  button (or **⌘Enter**, when no approval is pending) applies a draft directly.
+  **Stop** pauses pending work rather than starting another queued turn.
+  Output sent from a tool card or terminal joins the same queue when busy.
 - **Approvals.** Auto-run, or ask before changes; approvals are pinned above
   the composer (`y` approve, `a` approve always, `n` deny when the composer is
   empty).
 - **Diffs.** A files-changed card per turn and a changes panel to review them.
+- **File previews.** Click a local file link in an answer, or the eye button
+  in Changes, to view it in the right-hand panel. Markdown is rendered;
+  source and other UTF-8 text stay selectable and literal. Preview reads are
+  limited to 512 KB; unavailable or unsupported files show an in-app message.
+  Web links still open in your browser.
 - **Dockable panels.** Drag the six-dot grip in the sidebar, chat, changes,
   or terminal header onto another panel's left, right, top, or bottom edge.
   Drag dividers to resize. The layout is saved to `~/.flint/layout.json`;
@@ -86,12 +115,22 @@
 - **`@` mentions** of workspace files, **`/` commands**
   (`/new`, `/clear`, `/model`, `/agent`, `/effort`, `/approval`, `/review`,
   `/help`) and a **command palette**.
+  File indexing runs in the background. Text attachments use a bounded prefix
+  of regular workspace files; changing a fresh session's project clears its
+  relative file selections.
 - **Image prompts.** Use **+ → Attach image…** to send up to four PNG, JPEG,
   GIF or WebP images (5 MB each), including files outside the workspace.
   Image prompts require a vision-capable model or ACP agent.
 
 > [!TIP]
 > **Limitations:** There is no light theme yet, and the thumbs up/down feedback on answers is only stored locally on your machine.
+
+Native file tools refuse inputs above 8 MiB. Command approval is not a shell
+sandbox: remembered command-prefix approvals apply only to allowlisted bare
+`cargo` subcommands (`test`, `build`, `check`, `clippy`, `fmt`, `bench`);
+other commands require an exact match.
+Provider streams need a supported terminal completion before tools execute.
+See [current gap-closure evidence and remaining limits](docs/GAP-CLOSURE-20261003.md).
 
 ## Architecture
 
@@ -169,6 +208,14 @@ graph TD
 
 > [!NOTE]
 > For in-depth component specifications, sequence diagrams, and lifecycle flows, see [Architecture & Internals](docs/ARCHITECTURE.md).
+
+### Turn Execution Lifecycle
+
+Every turn passes through context budgeting, streaming model evaluation, tool execution via Harness Guard, and UI state reconciliation.
+
+<p align="center">
+  <img src="assets/turn_lifecycle.jpg" alt="Turn Execution Lifecycle" width="100%" />
+</p>
 
 ## Workspace & Interface
 
