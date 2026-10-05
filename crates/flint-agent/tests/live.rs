@@ -67,7 +67,9 @@ fn live_creates_and_tests_add_py() {
             } => {
                 eprintln!("compacted {before_tokens} -> {after_tokens}");
             }
-            AgentEvent::SessionOptions(_) | AgentEvent::SessionStopped { .. } => {}
+            AgentEvent::SessionOptions(_)
+            | AgentEvent::SessionStopped { .. }
+            | AgentEvent::FilesReverted { .. } => {}
             AgentEvent::SubagentStarted { .. } | AgentEvent::SubagentEvent { .. } => {}
             AgentEvent::TerminalStarted { .. }
             | AgentEvent::TerminalOutput { .. }
@@ -78,6 +80,7 @@ fn live_creates_and_tests_add_py() {
                 break;
             }
             AgentEvent::TurnStarted { .. }
+            | AgentEvent::SteeringAccepted { .. }
             | AgentEvent::StepStarted { .. }
             | AgentEvent::ReasoningDelta(_)
             | AgentEvent::TextDelta(_)

@@ -11,10 +11,11 @@ use serde_json::{Map, Value, json};
 use tokio_util::sync::CancellationToken;
 
 use crate::approvals::Approvals;
+use crate::mcp::McpHub;
 use crate::protocol::{AgentConfig, AgentEvent, ReasoningEffort, TurnEndReason};
 use crate::provider::Message;
 use crate::session::Session;
-use crate::tools::{ToolOutcome, head_tail};
+use crate::tools::{ToolContext, ToolOutcome, head_tail};
 
 pub(crate) const MAX_PARALLEL_SUBAGENTS: usize = 4;
 const MAX_SUBAGENT_SESSIONS: usize = 32;
@@ -37,6 +38,10 @@ pub(super) struct Child {
 
 pub(super) struct Subagents {
     config: AgentConfig,
+    /// Each child gets `tools.child()`: the parent's workspace, sandbox and
+    /// undo journal, with its own record of what it has read.
+    tools: ToolContext,
+    mcp: Option<Arc<McpHub>>,
     children: HashMap<String, Child>,
     saved: HashMap<String, Metadata>,
     active: HashSet<String>,
@@ -44,7 +49,7 @@ pub(super) struct Subagents {
 }
 
 impl Subagents {
-    pub fn new(config: AgentConfig) -> Self {
+    pub fn new(config: AgentConfig, tools: ToolContext, mcp: Option<Arc<McpHub>>) -> Self {
         let mut saved = HashMap::new();
         let mut next_id = 1;
         if let Some(dir) = &config.session_dir
@@ -72,6 +77,8 @@ impl Subagents {
         }
         Self {
             config,
+            tools,
+            mcp,
             children: HashMap::new(),
             saved,
             active: HashSet::new(),
@@ -197,6 +204,8 @@ impl Subagents {
             events,
             approvals,
             Arc::new(Mutex::new(effort)),
+            self.tools.child(),
+            self.mcp.clone(),
             true,
         );
         session.call_prefix = format!("{id}:");

@@ -16,6 +16,26 @@ impl FlintApp {
             beats.truncate(stop);
         }
         self.play(uid, beats, self.options.demo_instant, cx);
+        if self.options.demo_queue {
+            let queue = &mut self.sessions[0].prompt_queue;
+            for text in [
+                "Add regression tests for keyboard navigation.",
+                "Polish the empty state and check compact layouts.",
+            ] {
+                queue
+                    .enqueue(crate::prompt_queue::Prompt::new(
+                        text.into(),
+                        text.into(),
+                        Vec::new(),
+                    ))
+                    .ok();
+            }
+            queue.paused = true;
+            self.queue_popover = self
+                .options
+                .window_size
+                .is_some_and(|(_, height)| height <= 600.);
+        }
         // Other sessions working in the background, to show concurrency.
         for extra in demo::extra_sessions(&self.workspace) {
             let mut session = self.new_session_value(extra.workspace);

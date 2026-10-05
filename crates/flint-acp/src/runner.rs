@@ -70,6 +70,7 @@ pub(crate) struct RunContext {
     pub session_dir: Option<PathBuf>,
     pub approval: ApprovalMode,
     pub agent_terminals: bool,
+    pub preferred_options: std::collections::BTreeMap<String, String>,
     pub ops: Receiver<Op>,
     pub events: Sender<AgentEvent>,
     /// Last stderr lines of the adapter, for error messages.
@@ -83,6 +84,28 @@ where
     R: AsyncRead + Send + 'static,
     W: AsyncWrite + Send + 'static,
 {
+    // Observe Shutdown even while startup or a setting RPC owns the foreground.
+    // Forward all other ops in order; do not discard queued user messages.
+    let (ops_tx, ops) = async_channel::unbounded();
+    let (shutdown_tx, shutdown) = tokio::sync::watch::channel(false);
+    let (interrupts, _) = tokio::sync::watch::channel(0u64);
+    let on_interrupt = interrupts.clone();
+    let incoming = ctx.ops;
+    let op_bridge = tokio::spawn(async move {
+        while let Ok(op) = incoming.recv().await {
+            let stopping = matches!(op, Op::Shutdown);
+            if stopping {
+                let _ = shutdown_tx.send(true);
+            }
+            if matches!(op, Op::Interrupt) {
+                on_interrupt.send_modify(|epoch| *epoch = epoch.saturating_add(1));
+            }
+            if ops_tx.send(op).await.is_err() || stopping {
+                return;
+            }
+        }
+        let _ = shutdown_tx.send(true);
+    });
     let saved = ctx
         .session_dir
         .as_deref()
@@ -101,12 +124,16 @@ where
         auto_approve: AtomicBool::new(ctx.approval == ApprovalMode::Auto),
         loading: AtomicBool::new(false),
         options: Mutex::new(Options::default()),
+        options_changed: tokio::sync::watch::channel(0).0,
         terminals: Terminals::new(
             &ctx.workspace,
             ctx.events.clone(),
             &ctx.agent.label_prefix(),
         ),
         agent_terminals: ctx.agent_terminals,
+        shutdown,
+        interrupts,
+        interrupts_seen: std::sync::atomic::AtomicU64::new(0),
     });
 
     let on_update = Arc::clone(&shared);
@@ -200,7 +227,22 @@ where
                         _cx| {
                 match on_create.terminals.create(&request) {
                     Ok(id) => responder.respond(CreateTerminalResponse::new(id)),
-                    Err(message) => responder.respond_with_error(rpc_error(message)),
+                    Err(message) => {
+                        // Never log command/argument/env values: a command may
+                        // contain credentials. The UI and peer get the reason.
+                        eprintln!(
+                            "flint: WARN terminal/create failed ({}): {}",
+                            crate::terminals::request_diagnostic(&request),
+                            crate::terminals::diagnostic_reason(&request, &message),
+                        );
+                        let events = on_create
+                            .with_mapper(|mapper| mapper.terminal_failed(&request, &message))
+                            .unwrap_or_default();
+                        on_create.emit_all(events);
+                        responder.respond_with_error(rpc_error(format!(
+                            "{message}. This is a Flint terminal creation error, not evidence that the shell is broken."
+                        )))
+                    }
                 }
             },
             agent_client_protocol::on_receive_request!(),
@@ -260,12 +302,21 @@ where
             agent_client_protocol::on_receive_request!(),
         )
         .connect_with(ByteStreams::new(writer, reader), async move |cx| {
-            if let Some(live) = open_session(cx, main_shared, ctx.session_dir, saved).await {
-                live.run(ctx.ops).await;
+            let mut shutdown = main_shared.shutdown.clone();
+            let live = tokio::select! {
+                biased;
+                _ = shutdown.wait_for(|stopped| *stopped) => None,
+                live = open_session(cx, main_shared, ctx.session_dir, saved, ctx.preferred_options) => live,
+            };
+            if let Some(live) = live {
+                live.run(ops).await;
             }
             Ok(())
         })
         .await;
+    op_bridge.abort();
+    shared.cancel_pending();
+    shared.terminals.shutdown();
     if let Err(err) = result
         && !shared.events.is_closed()
     {
@@ -287,6 +338,7 @@ async fn open_session(
     shared: Arc<Shared>,
     session_dir: Option<PathBuf>,
     saved: Option<Saved>,
+    preferred_options: std::collections::BTreeMap<String, String>,
 ) -> Option<Live> {
     let agent = shared.agent.clone();
     let fail = |message: String| shared.emit_all(vec![AgentEvent::Error(message)]);
@@ -310,13 +362,15 @@ async fn open_session(
             .write_text_file(true))
         .terminal(true)
         .meta(meta);
-    let init = cx
-        .send_request(
-            InitializeRequest::new(ProtocolVersion::V1)
-                .client_capabilities(capabilities)
-                .client_info(Implementation::new("flint", env!("CARGO_PKG_VERSION"))),
+    let init = shared
+        .rpc(
+            cx.send_request(
+                InitializeRequest::new(ProtocolVersion::V1)
+                    .client_capabilities(capabilities)
+                    .client_info(Implementation::new("flint", env!("CARGO_PKG_VERSION"))),
+            )
+            .block_task(),
         )
-        .block_task()
         .await;
     let init = match init {
         Ok(init) => init,
@@ -330,12 +384,14 @@ async fn open_session(
     if let Some(saved) = &saved {
         if init.agent_capabilities.load_session {
             shared.loading.store(true, Ordering::Relaxed);
-            let loaded = cx
-                .send_request(LoadSessionRequest::new(
-                    saved.session_id.clone(),
-                    shared.workspace.clone(),
-                ))
-                .block_task()
+            let loaded = shared
+                .rpc(
+                    cx.send_request(LoadSessionRequest::new(
+                        saved.session_id.clone(),
+                        shared.workspace.clone(),
+                    ))
+                    .block_task(),
+                )
                 .await;
             shared.loading.store(false, Ordering::Relaxed);
             match loaded {
@@ -362,9 +418,11 @@ async fn open_session(
     let reopened = session_id.is_some();
     let session_id = match session_id {
         Some(id) => id,
-        None => match cx
-            .send_request(NewSessionRequest::new(shared.workspace.clone()))
-            .block_task()
+        None => match shared
+            .rpc(
+                cx.send_request(NewSessionRequest::new(shared.workspace.clone()))
+                    .block_task(),
+            )
             .await
         {
             Ok(created) => {
@@ -379,13 +437,38 @@ async fn open_session(
     };
     let mut live = Live::new(
         cx,
-        shared,
+        Arc::clone(&shared),
         session_id,
         session_dir,
         saved.clone().unwrap_or_default().options,
     );
-    if !reopened && let Some(saved) = saved {
-        live.reapply(&saved.options).await;
+    // Keep the connection alive so the user can replace an unavailable
+    // preference. Live gates prompts until a valid identity is chosen.
+    if let Some(saved) = saved {
+        let offered = shared.options();
+        let identity: std::collections::BTreeMap<_, _> = saved
+            .options
+            .iter()
+            .filter(|(id, _)| {
+                id.as_str() == "model"
+                    || id.as_str() == "provider"
+                    || offered.get(id).is_some_and(|option| {
+                        matches!(option.category.as_deref(), Some("model" | "provider"))
+                    })
+            })
+            .map(|(id, value)| (id.clone(), value.clone()))
+            .collect();
+        live.restore_preferences(&identity).await;
+        if !reopened {
+            let other = saved
+                .options
+                .into_iter()
+                .filter(|(id, _)| !identity.contains_key(id))
+                .collect();
+            live.reapply(&other).await;
+        }
+    } else {
+        live.restore_preferences(&preferred_options).await;
     }
     live.save();
     Some(live)

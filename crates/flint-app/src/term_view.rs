@@ -17,6 +17,7 @@ use flint_term::TermEvent;
 use flint_term::Terminal;
 use gpui_kit::*;
 use regex::Regex;
+use unicode_width::UnicodeWidthChar;
 
 use crate::term_paint::Metrics;
 use crate::term_paint::PaintState;
@@ -56,6 +57,25 @@ const NAMED_KEYS: &[&str] = &[
 static URL: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#"(https?|file)://[^\s<>"'`)\]}]+"#).expect("url regex"));
 
+fn url_at_column(line: &str, col: usize) -> Option<&str> {
+    URL.find_iter(line).find_map(|m| {
+        let start: usize = line[..m.start()]
+            .chars()
+            .map(|ch| ch.width().unwrap_or(0))
+            .sum();
+        let end = start
+            + m.as_str()
+                .chars()
+                .map(|ch| ch.width().unwrap_or(0))
+                .sum::<usize>();
+        (col >= start && col < end).then(|| m.as_str())
+    })
+}
+
+pub struct LinkClicked(pub String);
+
+impl EventEmitter<LinkClicked> for TermView {}
+
 pub struct TermView {
     pub terminal: Terminal,
     pub focus: FocusHandle,
@@ -69,6 +89,8 @@ pub struct TermView {
     /// Set on a mirror of a command an agent is running: the session it
     /// belongs to and the agent's terminal id.
     pub agent: Option<AgentTerminal>,
+    /// The session that owns this shell or command mirror.
+    pub session_uid: Option<u64>,
     pub exited: Option<Option<i32>>,
     bell_until: Option<Instant>,
     /// IME text being composed.
@@ -132,6 +154,7 @@ impl TermView {
             read_only,
             fixed_label: None,
             agent: None,
+            session_uid: None,
             exited: None,
             bell_until: None,
             marked: None,
@@ -153,6 +176,7 @@ impl TermView {
         poll: bool,
         cx: &mut Context<Self>,
     ) -> Self {
+        let uid = agent.0;
         let mut view = Self::new(
             Terminal::detached(crate::term_panel::initial_size()),
             cwd,
@@ -162,6 +186,7 @@ impl TermView {
         );
         view.fixed_label = Some(label);
         view.agent = Some(agent);
+        view.session_uid = Some(uid);
         view
     }
 
@@ -183,12 +208,14 @@ impl TermView {
 
     /// Tab label: a fixed label, the program's title, or the folder.
     pub fn label(&self) -> String {
-        let base = self.fixed_label.clone().unwrap_or_else(|| {
-            self.title
-                .clone()
-                .filter(|t| !t.trim().is_empty())
-                .unwrap_or_else(|| crate::session::folder_name(&self.cwd))
-        });
+        let base = self
+            .fixed_label
+            .as_deref()
+            .or_else(|| self.title.as_deref().filter(|t| !t.trim().is_empty()))
+            .map_or_else(
+                || crate::ui::one_line(&crate::session::folder_name(&self.cwd)),
+                crate::ui::one_line,
+            );
         match self.exited {
             Some(Some(code)) if code != 0 => format!("{base} (exit {code})"),
             Some(_) => format!("{base} (done)"),
@@ -290,7 +317,7 @@ impl TermView {
         let (row, col, right) = metrics.cell_at(event.position, self.cols, self.rows);
         if event.modifiers.platform {
             if let Some(url) = self.url_at(row, col) {
-                cx.open_url(&url);
+                cx.emit(LinkClicked(url));
             }
             return;
         }
@@ -341,11 +368,7 @@ impl TermView {
 
     fn url_at(&self, row: usize, col: usize) -> Option<String> {
         let line = self.terminal.snapshot().text_lines().get(row)?.clone();
-        URL.find_iter(&line).find_map(|m| {
-            let start = line[..m.start()].chars().count();
-            let end = start + m.as_str().chars().count();
-            (col >= start && col < end).then(|| m.as_str().to_string())
-        })
+        url_at_column(&line, col).map(str::to_owned)
     }
 
     /// Fits the grid to `bounds` (tells the program on change).
@@ -366,6 +389,10 @@ impl TermView {
         });
     }
 }
+
+#[cfg(test)]
+#[path = "term_view_tests.rs"]
+mod tests;
 
 impl Focusable for TermView {
     fn focus_handle(&self, _: &App) -> FocusHandle {

@@ -30,11 +30,13 @@ pub fn config_for(
     let Some(found) = effective.resolve_key(key_file, sources) else {
         bail!(
             "{NO_KEY}. Set FLINT_API_KEY (or OPENAI_API_KEY) in the environment, or choose a \
-             key file in Settings, then retry."
+             key file in Settings, then retry. An unauthenticated local server still needs \
+             a nonempty dummy key."
         );
     };
     let mut config = AgentConfig {
         workspace: workspace.to_path_buf(),
+        general: false,
         base_url: effective.base_url,
         model: (sources.env)("FLINT_MODEL").unwrap_or_else(|| settings.model.clone()),
         api_key: found.key,
@@ -49,6 +51,8 @@ pub fn config_for(
         session_dir: None,
         context_budget_tokens: flint_agent::DEFAULT_CONTEXT_BUDGET_TOKENS,
         reasoning_effort: None,
+        sandbox: settings.sandbox && (sources.env)("FLINT_SANDBOX").as_deref() != Some("off"),
+        mcp_servers: settings.mcp_server_configs(),
     };
     config.subagent_model = (sources.env)("FLINT_SUBAGENT_MODEL")
         .or_else(|| Some(settings.subagent_model.trim().to_string()))
@@ -57,12 +61,8 @@ pub fn config_for(
     Ok(config)
 }
 
-/// Current branch name from `.git/HEAD`, or a short commit for a detached head.
+/// Current branch name (or a short commit for a detached head), including
+/// inside a linked worktree.
 pub fn git_branch(workspace: &Path) -> Option<String> {
-    let head = std::fs::read_to_string(workspace.join(".git/HEAD")).ok()?;
-    let head = head.trim();
-    match head.strip_prefix("ref: refs/heads/") {
-        Some(branch) => Some(branch.to_string()),
-        None => Some(head.chars().take(7).collect()),
-    }
+    crate::project::read_branch(workspace)
 }

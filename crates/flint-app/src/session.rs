@@ -14,11 +14,14 @@ use flint_agent::AgentKind;
 use flint_agent::ApprovalMode;
 use flint_agent::FileDiff;
 use flint_agent::Op;
+use flint_agent::ToolKind;
+use flint_agent::TurnEndReason;
 use gpui_kit::*;
 
 use crate::store;
 use crate::store::Logged;
 use crate::view_model::Change;
+use crate::view_model::Item;
 use crate::view_model::SessionView;
 
 pub struct Session {
@@ -29,6 +32,9 @@ pub struct Session {
     pub dir: Option<PathBuf>,
     pub view: SessionView,
     pub list: ListState,
+    pub subagent_lists: std::collections::HashMap<String, ListState>,
+    pub selected_subagent: Option<String>,
+    pub subagents_expanded: bool,
     /// flint's engine or an ACP agent; fixed once the session has started.
     pub agent: AgentKind,
     /// The agent's own options (model, reasoning, mode, …), as last reported.
@@ -43,6 +49,8 @@ pub struct Session {
     pub native_approval: Option<ApprovalMode>,
     pub native_allow_all: bool,
     pub workspace: PathBuf,
+    /// No project attachment; tools use a private working folder.
+    pub general: bool,
     pub created: SystemTime,
     /// Last activity, for ordering and the sidebar's relative time.
     pub touched: SystemTime,
@@ -60,6 +68,11 @@ pub struct Session {
     pub first_text: Option<Duration>,
     /// The last message as shown and as sent (with attachments), for Retry.
     pub last_message: Option<(String, String, Vec<flint_agent::ImageAttachment>)>,
+    pub prompt_queue: crate::prompt_queue::Queue,
+    pub queue_scroll: ScrollHandle,
+    /// An accepted prompt is waiting for TurnStarted, or a steering ack.
+    pub prompt_pending: bool,
+    pub steering_pending: Option<u64>,
     /// Failed UI writes are retained in order and retried before archiving.
     pub(crate) pending_records: VecDeque<Logged>,
     pub(crate) event_writer: Option<store::EventWriter>,
@@ -77,10 +90,81 @@ pub struct Session {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Status {
     Idle,
+    /// An ACP agent is starting up (its adapter can take 20–50 s).
+    Starting,
     Running,
     NeedsApproval,
+    /// The last turn failed, hit the step limit, or the agent could not
+    /// start. Needs you until `seen`.
+    Failed {
+        seen: bool,
+    },
+    /// The user stopped the last turn (or quit while it ran).
+    Stopped,
     Unread,
     Done,
+}
+
+/// How a status line is coloured.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tone {
+    Muted,
+    Warning,
+    Danger,
+}
+
+/// Where a status falls when sessions are grouped or filtered by it; the
+/// glyphs still show the finer [`Status`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Bucket {
+    /// Blocked on an approval, or finished with output not yet read.
+    NeedsYou,
+    Working,
+    /// Finished and already seen.
+    Ready,
+    /// Nothing has happened yet.
+    Inactive,
+}
+
+impl Bucket {
+    pub const ALL: [Bucket; 4] = [
+        Bucket::NeedsYou,
+        Bucket::Working,
+        Bucket::Ready,
+        Bucket::Inactive,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Bucket::NeedsYou => "Needs you",
+            Bucket::Working => "Working",
+            Bucket::Ready => "Ready",
+            Bucket::Inactive => "Inactive",
+        }
+    }
+}
+
+impl Status {
+    pub fn bucket(self) -> Bucket {
+        match self {
+            Status::NeedsApproval | Status::Unread | Status::Failed { seen: false } => {
+                Bucket::NeedsYou
+            }
+            Status::Running | Status::Starting => Bucket::Working,
+            Status::Done | Status::Stopped | Status::Failed { seen: true } => Bucket::Ready,
+            Status::Idle => Bucket::Inactive,
+        }
+    }
+}
+
+/// `45s`, `3m 05s`, `1h 12m`: a running turn's elapsed time.
+pub fn clock(elapsed: Duration) -> String {
+    let secs = elapsed.as_secs();
+    match secs {
+        0..=59 => format!("{secs}s"),
+        60..=3_599 => format!("{}m {:02}s", secs / 60, secs % 60),
+        _ => format!("{}h {}m", secs / 3_600, secs % 3_600 / 60),
+    }
 }
 
 impl Session {
@@ -92,6 +176,9 @@ impl Session {
             dir: None,
             view: SessionView::default(),
             list,
+            subagent_lists: Default::default(),
+            selected_subagent: None,
+            subagents_expanded: true,
             agent: AgentKind::Flint,
             options: Vec::new(),
             agent_ready: false,
@@ -100,6 +187,7 @@ impl Session {
             native_approval: None,
             native_allow_all: false,
             workspace,
+            general: false,
             created: SystemTime::now(),
             touched: SystemTime::now(),
             unread: false,
@@ -109,6 +197,10 @@ impl Session {
             first_token: None,
             first_text: None,
             last_message: None,
+            prompt_queue: Default::default(),
+            queue_scroll: ScrollHandle::new(),
+            prompt_pending: false,
+            steering_pending: None,
             pending_records: VecDeque::new(),
             event_writer: None,
             persistence_task: None,
@@ -121,13 +213,33 @@ impl Session {
     }
 
     /// Keeps the virtual list in step with a view-model change.
-    pub fn apply(&self, change: Change) {
-        for ix in change.updated {
-            self.list.remeasure_items(ix..ix + 1);
+    pub fn apply(&mut self, mut change: Change) {
+        for (id, child_change) in std::mem::take(&mut change.children) {
+            let list = self.subagent_lists.entry(id).or_insert_with(|| {
+                let list = ListState::new(0, ListAlignment::Top, px(1200.));
+                list.set_follow_mode(FollowMode::Tail);
+                list
+            });
+            Self::apply_list(list, child_change);
+        }
+        Self::apply_list(&self.list, change);
+    }
+
+    pub(crate) fn apply_list(list: &ListState, mut change: Change) {
+        change.updated.sort_unstable();
+        change.updated.dedup();
+        let mut rows = change.updated.into_iter().peekable();
+        while let Some(start) = rows.next() {
+            let mut end = start + 1;
+            while rows.peek() == Some(&end) {
+                rows.next();
+                end += 1;
+            }
+            list.remeasure_items(start..end);
         }
         if !change.appended.is_empty() {
             let at = change.appended.start;
-            self.list.splice(at..at, change.appended.len());
+            list.splice(at..at, change.appended.len());
         }
     }
 
@@ -146,13 +258,56 @@ impl Session {
             .unwrap_or_else(|| "New session".to_string())
     }
 
+    /// What gives the session its colour: stable across restarts for saved
+    /// sessions (their folder name), else the run-local uid.
+    pub fn color_seed(&self) -> u64 {
+        match self.dir.as_ref().and_then(|dir| dir.file_name()) {
+            Some(name) => name
+                .as_encoded_bytes()
+                .iter()
+                .fold(0_u64, |acc, byte| acc.rotate_left(5) ^ u64::from(*byte)),
+            None => self.uid,
+        }
+    }
+
+    /// Subagents still working under this session's tool calls.
+    pub fn running_subagents(&self) -> usize {
+        self.view
+            .subagents
+            .iter()
+            .filter(|child| child.view.running)
+            .count()
+    }
+
+    /// Tokens used over every finished turn, input and output.
+    pub fn total_tokens(&self) -> u64 {
+        let usage = &self.view.session_usage;
+        usage.input_tokens + usage.output_tokens + usage.reasoning_tokens
+    }
+
+    /// The text of the most recent message, either side, for sidebar search.
+    pub fn last_message_text(&self) -> Option<&str> {
+        self.view.items.iter().rev().find_map(|item| match item {
+            Item::User(text) | Item::Assistant { text, .. } if !text.is_empty() => {
+                Some(text.as_str())
+            }
+            _ => None,
+        })
+    }
+
     pub fn status(&self) -> Status {
         if self.view.pending_approvals > 0 {
             Status::NeedsApproval
         } else if self.view.running {
             Status::Running
+        } else if self.agent_starting() {
+            Status::Starting
+        } else if self.failure_text().is_some() {
+            Status::Failed { seen: !self.unread }
         } else if self.unread {
             Status::Unread
+        } else if self.view.last_reason == Some(TurnEndReason::Interrupted) {
+            Status::Stopped
         } else if self.view.turns.is_empty() {
             Status::Idle
         } else {
@@ -160,8 +315,150 @@ impl Session {
         }
     }
 
+    /// Why the session is stuck, when its last turn failed or its agent never
+    /// started.
+    pub fn failure(&self) -> Option<String> {
+        self.failure_text().map(str::to_owned)
+    }
+
+    fn failure_text(&self) -> Option<&str> {
+        if let Some(error) = &self.view.idle_error {
+            return Some(error);
+        }
+        match &self.view.last_reason {
+            Some(TurnEndReason::Failed(error)) => Some(error),
+            Some(TurnEndReason::StepLimit) => Some("stopped at the step limit"),
+            _ => None,
+        }
+    }
+
+    /// What the agent is doing right now, for a running session.
+    pub fn activity(&self) -> String {
+        let subagents = self.running_subagents();
+        if subagents > 0 {
+            return format!(
+                "{subagents} subagent{} working",
+                if subagents == 1 { "" } else { "s" }
+            );
+        }
+        let from = self
+            .view
+            .current_turn
+            .and_then(|t| self.view.turns.get(t))
+            .map_or(0, |turn| turn.first);
+        let items = self.view.items.get(from..).unwrap_or_default();
+        // Parallel reads finish out of order: the newest unfinished call wins.
+        if let Some(call) = items.iter().rev().find_map(|item| match item {
+            Item::Tool(call) if call.result.is_none() => Some(call),
+            _ => None,
+        }) {
+            let what = crate::ui::one_line(&call.summary);
+            return match call.kind {
+                ToolKind::Command => format!("Running {what}"),
+                ToolKind::Edit => format!("Editing {what}"),
+                ToolKind::Read => format!("Reading {what}"),
+                ToolKind::Search => format!("Searching {what}"),
+                ToolKind::Other if call.name == flint_agent::tools::SPAWN_AGENT => {
+                    format!("Delegating: {what}")
+                }
+                ToolKind::Other => format!("Using {}", call.name),
+            };
+        }
+        match items.last() {
+            Some(Item::Thinking { duration: None, .. }) => "Thinking…".to_string(),
+            Some(Item::Assistant {
+                streaming: true, ..
+            }) => "Writing…".to_string(),
+            Some(Item::Nudge { .. }) => "Checking its work…".to_string(),
+            _ => "Working…".to_string(),
+        }
+    }
+
+    /// How long the running turn has taken, at `now` on the app's clock.
+    pub fn running_for(&self, now: Duration) -> Option<Duration> {
+        self.view
+            .running
+            .then_some(self.view.turn_started)
+            .flatten()
+            .map(|started| now.saturating_sub(started))
+    }
+
+    /// The sidebar's second line: what the session is doing or how it ended.
+    pub fn status_line(&self, now: Duration) -> (String, Tone) {
+        if !self.prompt_queue.items.is_empty()
+            && matches!(self.status(), Status::Idle | Status::Done | Status::Stopped)
+        {
+            return (
+                format!(
+                    "{} queued · {}",
+                    self.prompt_queue.items.len(),
+                    if self.prompt_queue.paused {
+                        "paused"
+                    } else {
+                        "up next"
+                    }
+                ),
+                Tone::Muted,
+            );
+        }
+        match self.status() {
+            Status::NeedsApproval => (approval_line(&self.view.items), Tone::Warning),
+            Status::Starting => (format!("Starting {}…", self.agent.label()), Tone::Muted),
+            Status::Running => {
+                let mut text = self.activity();
+                if let Some(elapsed) = self.running_for(now) {
+                    text.push_str(" · ");
+                    text.push_str(&clock(elapsed));
+                }
+                (text, Tone::Muted)
+            }
+            Status::Failed { .. } => {
+                let why = self.failure_text().unwrap_or_default();
+                let first = crate::ui::one_line(why.lines().next().unwrap_or_default().trim());
+                (format!("Failed: {first}"), Tone::Danger)
+            }
+            Status::Stopped => match self.last_turn_files() {
+                Some(files) => (format!("Stopped · {files}"), Tone::Muted),
+                None => ("Stopped".to_string(), Tone::Muted),
+            },
+            Status::Unread | Status::Done => (
+                self.last_turn_files()
+                    .unwrap_or_else(|| "Answered".to_string()),
+                Tone::Muted,
+            ),
+            Status::Idle if self.view.items.is_empty() => {
+                ("No messages yet".to_string(), Tone::Muted)
+            }
+            Status::Idle => ("Idle".to_string(), Tone::Muted),
+        }
+    }
+
+    /// `2 files changed · +10 −3` for the last turn, when it changed files.
+    fn last_turn_files(&self) -> Option<String> {
+        let turn = self.view.turns.last()?;
+        let n = turn.files.len();
+        (n > 0).then(|| {
+            format!(
+                "{n} file{} changed · +{} −{}",
+                if n == 1 { "" } else { "s" },
+                turn.added,
+                turn.removed
+            )
+        })
+    }
+
     /// Queues an ordered saved event (no-op for unsaved sessions). A flush
     /// barrier is required when the caller needs disk acknowledgment.
+    pub(crate) fn log_event(&mut self, event: &AgentEvent) -> std::io::Result<()> {
+        // Unsaved sessions discard events, so don't copy their payloads just
+        // to drop the owned record. Saved sessions retain the existing writer.
+        if self.dir.is_none() {
+            return Ok(());
+        }
+        self.log(Logged::Event(event.clone()))
+    }
+
+    /// Queues an owned record, with the same persistence and flush behavior.
     pub fn log(&mut self, record: Logged) -> std::io::Result<()> {
         if let Some(dir) = &self.dir {
             self.pending_records.push_back(record);
@@ -224,8 +521,17 @@ impl Session {
                 created_at: unix_secs(self.created),
                 updated_at: unix_secs(self.touched),
                 agent: self.agent,
+                general: self.general,
             },
         )
+    }
+
+    pub fn workspace_label(&self) -> String {
+        if self.general {
+            "General agent".into()
+        } else {
+            folder_name(&self.workspace)
+        }
     }
 
     /// Records time to first token / first text for the last message.
@@ -344,6 +650,27 @@ impl Session {
             }
         }
         true
+    }
+}
+
+fn approval_line(items: &[Item]) -> String {
+    let mut waiting = items.iter().filter_map(|item| match item {
+        Item::Approval {
+            summary,
+            decision: None,
+            ..
+        } => Some(summary.as_str()),
+        _ => None,
+    });
+    let Some(first) = waiting.next() else {
+        return "Needs approval".to_string();
+    };
+    let more = waiting.count();
+    let first = crate::ui::one_line(first);
+    if more == 0 {
+        format!("Approve: {first}")
+    } else {
+        format!("Approve: {first} (+{more} more)")
     }
 }
 

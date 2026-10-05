@@ -112,6 +112,60 @@ pub struct OptionMenu {
 }
 
 impl FlintApp {
+    pub(crate) fn confirm_agent_preferences(&mut self, ix: usize, options: &[SessionOption]) {
+        let agent = self.sessions[ix].agent;
+        let uid = self.sessions[ix].uid;
+        let mut changed = false;
+        let mut provider_changed = false;
+        for option in options {
+            let key = (agent, option.id.clone());
+            let confirmed = self
+                .agent_choice_requests
+                .get(&key)
+                .is_some_and(|(owner, value)| *owner == uid && *value == option.current);
+            if confirmed && remembered_option(option) {
+                provider_changed |=
+                    option.category.as_deref() == Some("provider") || option.id == "provider";
+                self.agent_choice_requests.remove(&key);
+                let saved = self
+                    .settings
+                    .agent_options
+                    .entry(crate::settings::agent_key(agent).into())
+                    .or_default();
+                changed |= saved.get(&option.id) != Some(&option.current);
+                saved.insert(option.id.clone(), option.current.clone());
+            }
+        }
+        // A provider change can pick a different model itself. Keep that
+        // confirmed pair, rather than replaying an old provider's model.
+        if provider_changed {
+            for option in options
+                .iter()
+                .filter(|option| option.category.as_deref() == Some("model"))
+            {
+                if self
+                    .agent_choice_requests
+                    .contains_key(&(agent, option.id.clone()))
+                {
+                    continue;
+                }
+                let saved = self
+                    .settings
+                    .agent_options
+                    .entry(crate::settings::agent_key(agent).into())
+                    .or_default();
+                changed |= saved.get(&option.id) != Some(&option.current);
+                saved.insert(option.id.clone(), option.current.clone());
+            }
+        }
+        if changed
+            && !self.options.ephemeral()
+            && let Err(err) = self.settings.save(&self.home)
+        {
+            self.store_error = Some(format!("Couldn't save selected model/provider: {err}"));
+        }
+    }
+
     pub fn session_slots(&self) -> Slots {
         slots(&self.session().options)
     }
@@ -195,23 +249,46 @@ impl FlintApp {
     }
 
     /// Sends `Op::SetSessionOption`, starting the agent if it isn't running.
-    /// The chip shows the new value right away; the agent's reply confirms it.
+    /// Chips retain the confirmed value until the agent reports its new state.
     pub fn set_session_option(&mut self, id: &str, value: &str, cx: &mut Context<Self>) {
         let ix = self.active;
-        if let Some(option) = self.sessions[ix].options.iter_mut().find(|o| o.id == id) {
-            option.current = value.to_string();
+        if !self.sessions[ix].options.iter().any(|option| {
+            option.id == id && option.choices.iter().any(|choice| choice.value == value)
+        }) {
+            self.store_error =
+                Some("This agent setting is no longer available. Reopen its menu.".into());
+            cx.notify();
+            return;
         }
         if self.sessions[ix].ops.is_none()
             && let Err(err) = self.ensure_engine(ix, cx)
         {
             self.apply_event(ix, flint_agent::AgentEvent::Error(format!("{err:#}")), cx);
+            return;
         }
-        if let Some(ops) = &self.sessions[ix].ops {
+        let sent = self.sessions[ix].ops.as_ref().is_some_and(|ops| {
             ops.try_send(Op::SetSessionOption {
                 id: id.to_string(),
                 value: value.to_string(),
             })
-            .ok();
+            .is_ok()
+        });
+        if !sent {
+            self.store_error = Some(
+                "Couldn't apply agent setting: the engine is unavailable. Retry after it restarts."
+                    .into(),
+            );
+        } else if self.sessions[ix]
+            .options
+            .iter()
+            .any(|option| option.id == id && remembered_option(option))
+        {
+            self.agent_choice_requests.insert(
+                (self.sessions[ix].agent, id.to_string()),
+                (self.sessions[ix].uid, value.to_string()),
+            );
+            let options = self.sessions[ix].options.clone();
+            self.confirm_agent_preferences(ix, &options);
         }
         cx.notify();
     }
@@ -253,6 +330,10 @@ impl FlintApp {
         cx.notify();
         true
     }
+}
+
+fn remembered_option(option: &SessionOption) -> bool {
+    matches!(option.category.as_deref(), Some("model" | "provider")) || option.id == "provider"
 }
 
 #[cfg(test)]

@@ -18,8 +18,8 @@ const DEFAULT_JEV_BASE_URL: &str = "https://api.typesafe.ai";
 const DEFAULT_JEV_MODEL: &str = "jev-latest";
 
 impl AgentConfig {
-    /// A config with no approvals, no saved session and JEV when
-    /// `TYPESAFE_API_KEY` is set.
+    /// A config with no approvals, no saved session, sandboxed commands and
+    /// JEV when `TYPESAFE_API_KEY` is set.
     pub fn new(workspace: PathBuf, base_url: String, model: String, api_key: String) -> Self {
         Self {
             base_url,
@@ -27,11 +27,14 @@ impl AgentConfig {
             subagent_model: env_var("FLINT_SUBAGENT_MODEL"),
             api_key,
             workspace,
+            general: false,
             approval: ApprovalMode::Auto,
             jev: jev_from_env(),
             session_dir: None,
             context_budget_tokens: DEFAULT_CONTEXT_BUDGET_TOKENS,
             reasoning_effort: None,
+            sandbox: true,
+            mcp_servers: Vec::new(),
         }
     }
 

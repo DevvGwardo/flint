@@ -79,11 +79,14 @@ impl Snapshot {
             .iter()
             .map(|runs| {
                 let mut line = String::new();
+                let mut col = 0;
                 for run in runs {
-                    while line.chars().count() < run.col {
+                    while col < run.col {
                         line.push(' ');
+                        col += 1;
                     }
                     line.push_str(&run.text);
+                    col = run.col + run.width;
                 }
                 line.trim_end().to_string()
             })
@@ -139,11 +142,6 @@ pub(crate) fn build<T: alacritty_terminal::event::EventListener>(
         } else {
             1
         };
-        let mut text = String::new();
-        text.push(cell.c);
-        if let Some(zero_width) = cell.zerowidth() {
-            text.extend(zero_width);
-        }
         let style = (
             fg,
             bg,
@@ -166,20 +164,30 @@ pub(crate) fn build<T: alacritty_terminal::event::EventListener>(
                         run.strikeout,
                     ) == style =>
             {
-                run.text.push_str(&text);
+                run.text.push(cell.c);
+                if let Some(zero_width) = cell.zerowidth() {
+                    run.text.extend(zero_width);
+                }
                 run.width += width;
             }
-            _ => line.push(Run {
-                col,
-                width,
-                text,
-                fg: style.0,
-                bg: style.1,
-                bold: style.2,
-                italic: style.3,
-                underline: style.4,
-                strikeout: style.5,
-            }),
+            _ => {
+                let mut text = String::new();
+                text.push(cell.c);
+                if let Some(zero_width) = cell.zerowidth() {
+                    text.extend(zero_width);
+                }
+                line.push(Run {
+                    col,
+                    width,
+                    text,
+                    fg: style.0,
+                    bg: style.1,
+                    bold: style.2,
+                    italic: style.3,
+                    underline: style.4,
+                    strikeout: style.5,
+                });
+            }
         }
     }
     // Trailing blank cells and blank-only runs on the default background

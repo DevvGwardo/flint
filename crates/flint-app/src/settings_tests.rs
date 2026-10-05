@@ -3,6 +3,8 @@ use pretty_assertions::assert_eq;
 use super::KeySources;
 use super::KeyStatus;
 use super::Settings;
+use super::jev_key_set;
+use super::key_with_typesafe_fallback;
 use flint_agent::ApprovalMode;
 
 #[test]
@@ -13,6 +15,48 @@ fn defaults_point_at_a_public_endpoint() {
     assert_eq!(settings.api_key_file, "");
     assert_eq!(settings.subagent_model, "");
     assert_eq!(settings.approval_mode(), ApprovalMode::AskForChanges);
+}
+
+#[test]
+fn agent_model_provider_defaults_round_trip_without_changing_native_settings() {
+    use flint_agent::AgentKind;
+    let dir = tempfile::tempdir().unwrap();
+    let mut settings = Settings {
+        default_agent: AgentKind::Droid,
+        model: "native-selected-model".into(),
+        base_url: "https://selected-provider.example/v1".into(),
+        ..Settings::default()
+    };
+    settings.agent_options.insert(
+        "droid".into(),
+        [
+            ("model".into(), "droid-selected-model".into()),
+            ("provider".into(), "selected-provider".into()),
+        ]
+        .into(),
+    );
+    settings.save(dir.path()).unwrap();
+    let loaded = Settings::load(dir.path(), &KeySources::none());
+    assert_eq!(loaded, settings);
+    assert_eq!(
+        loaded.agent_options(AgentKind::Droid)["model"],
+        "droid-selected-model"
+    );
+    assert!(loaded.agent_options(AgentKind::ClaudeCode).is_empty());
+}
+
+#[test]
+fn existing_config_keeps_model_provider_and_defaults_to_native_agent() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        Settings::path(dir.path()),
+        "model = \"selected-model\"\nbase_url = \"https://selected-provider.example/v1\"\n",
+    )
+    .unwrap();
+    let loaded = Settings::load(dir.path(), &KeySources::none());
+    assert_eq!(loaded.default_agent, flint_agent::AgentKind::Flint);
+    assert_eq!(loaded.model, "selected-model");
+    assert_eq!(loaded.base_url, "https://selected-provider.example/v1");
 }
 
 #[test]
@@ -199,6 +243,56 @@ fn environment_keys_come_from_the_injected_lookup() {
 }
 
 #[test]
+fn typesafe_private_file_fallback_is_trimmed_and_scoped_to_the_judge() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file = dir.path().join("typesafe.key");
+    std::fs::write(&file, "  fixture-typesafe-key\n").expect("write");
+    assert_eq!(
+        key_with_typesafe_fallback("TYPESAFE_API_KEY", None, &file).as_deref(),
+        Some("fixture-typesafe-key")
+    );
+    for name in ["FLINT_API_KEY", "OPENAI_API_KEY", "OTHER_PROVIDER_KEY"] {
+        assert!(key_with_typesafe_fallback(name, None, &file).is_none());
+    }
+    assert_eq!(
+        key_with_typesafe_fallback(
+            "TYPESAFE_API_KEY",
+            Some("  environment-override  ".into()),
+            &file,
+        )
+        .as_deref(),
+        Some("environment-override")
+    );
+    std::fs::write(&file, " \n").expect("empty");
+    assert!(key_with_typesafe_fallback("TYPESAFE_API_KEY", None, &file).is_none());
+    assert!(!jev_key_set(&KeySources::none()));
+}
+
+#[test]
+fn typesafe_judge_uses_injected_credentials_without_changing_the_model_key() {
+    let sources = KeySources {
+        env: |name| match name {
+            "OPENAI_API_KEY" => Some("fixture-model-key".into()),
+            "TYPESAFE_API_KEY" => Some("fixture-judge-key".into()),
+            _ => None,
+        },
+        ..KeySources::none()
+    };
+    assert!(jev_key_set(&sources));
+    let dir = tempfile::tempdir().expect("tempdir");
+    let config = crate::engine::config_for(
+        dir.path(),
+        &Settings::default(),
+        None,
+        &sources,
+        ApprovalMode::Auto,
+    )
+    .expect("config");
+    assert_eq!(config.api_key, "fixture-model-key");
+    assert_eq!(config.jev.expect("judge").api_key, "fixture-judge-key");
+}
+
+#[test]
 fn subtle_text_meets_normal_text_contrast_on_primary_surfaces() {
     fn luminance(color: gpui_kit::Hsla) -> f32 {
         let color = color.to_rgb();
@@ -216,4 +310,30 @@ fn subtle_text_meets_normal_text_contrast_on_primary_surfaces() {
         let contrast = (luminance(p.text_subtle) + 0.05) / (luminance(background) + 0.05);
         assert!(contrast >= 4.5, "contrast {contrast} is below 4.5:1");
     }
+}
+
+#[test]
+fn sandbox_and_mcp_servers_load_from_the_config_file() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    assert!(Settings::default().sandbox);
+    std::fs::write(
+        Settings::path(dir.path()),
+        "sandbox = false\n\n[mcp_servers.github]\ncommand = \"github-mcp\"\nargs = [\"stdio\"]\n\
+         env = { GITHUB_TOKEN = \"t\" }\n\n[mcp_servers.off]\ncommand = \"x\"\nenabled = false\n",
+    )
+    .expect("write");
+    let settings = Settings::load(dir.path(), &KeySources::none());
+    assert!(!settings.sandbox);
+    let servers = settings.mcp_server_configs();
+    assert_eq!(servers.len(), 1);
+    assert_eq!(servers[0].name, "github");
+    assert_eq!(servers[0].command, "github-mcp");
+    assert_eq!(servers[0].args, ["stdio"]);
+    assert_eq!(
+        servers[0].env,
+        [("GITHUB_TOKEN".to_string(), "t".to_string())]
+    );
+    // Saving keeps them.
+    settings.save(dir.path()).expect("save");
+    assert_eq!(Settings::load(dir.path(), &KeySources::none()), settings);
 }

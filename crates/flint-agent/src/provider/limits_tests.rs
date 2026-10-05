@@ -53,3 +53,28 @@ fn budget_is_the_window_minus_a_bounded_reply_reserve() {
     assert_eq!(budget_for_window(Some(small)), 16_384);
     assert_eq!(budget_for_window(None), 112_000);
 }
+
+#[test]
+fn retry_after_reads_seconds() {
+    use std::time::Duration;
+    assert_eq!(super::parse_retry_after("7"), Some(Duration::from_secs(7)));
+    assert_eq!(
+        super::parse_retry_after(" 1.5 "),
+        Some(Duration::from_millis(1500))
+    );
+    assert_eq!(
+        super::parse_retry_after("Wed, 21 Oct 2015 07:28:00 GMT"),
+        None
+    );
+    assert_eq!(super::parse_retry_after("-1"), None);
+}
+
+#[test]
+fn retry_after_rejects_nonfinite_values_and_caps_extreme_delays() {
+    for value in ["NaN", "inf", "-inf", "-0.5", "invalid"] {
+        assert_eq!(super::parse_retry_after(value), None);
+    }
+    for value in ["61", "1e300", "18446744073709551616"] {
+        assert_eq!(super::parse_retry_after(value), Some(super::MAX_RETRY_WAIT));
+    }
+}

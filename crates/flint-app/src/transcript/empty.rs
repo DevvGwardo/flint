@@ -5,7 +5,6 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use crate::app::FlintApp;
-use crate::session::folder_name;
 use crate::settings::KeyStatus;
 use crate::theme::palette;
 use crate::theme::size;
@@ -17,10 +16,17 @@ const SUGGESTIONS: &[(&str, IconName)] = &[
     ("Review my uncommitted changes", IconName::GitCompare),
     ("Add input validation", IconName::ShieldCheck),
 ];
+const GENERAL_SUGGESTIONS: &[(&str, IconName)] = &[
+    ("Help me plan my day", IconName::ListTree),
+    ("Explain a topic simply", IconName::Lightbulb),
+    ("Help me write something", IconName::Paperclip),
+    ("Think through a decision with me", IconName::Flame),
+];
 
 pub fn render(app: &FlintApp, window: &mut Window, cx: &mut Context<FlintApp>) -> impl IntoElement {
     let p = palette();
-    let workspace = folder_name(&app.session().workspace);
+    let workspace = app.session().workspace_label();
+    let general = app.session().general;
     let readiness = {
         let agent = app.session().agent;
         let credential = if agent == flint_agent::AgentKind::Flint {
@@ -49,10 +55,16 @@ pub fn render(app: &FlintApp, window: &mut Window, cx: &mut Context<FlintApp>) -
         (credential, permission)
     };
     let composer = crate::composer::render(app, window, cx);
-    let chips = SUGGESTIONS.iter().enumerate().map(|(ix, (text, icon))| {
+    let suggestions = if general {
+        GENERAL_SUGGESTIONS
+    } else {
+        SUGGESTIONS
+    };
+    let chips = suggestions.iter().enumerate().map(|(ix, (text, icon))| {
         let text = *text;
         div()
             .id(("suggestion", ix))
+            .role(gpui_kit::Role::Button)
             .aria_label(text)
             .tab_index(0)
             .focus_visible(|style| style.border_color(p.accent))
@@ -85,6 +97,7 @@ pub fn render(app: &FlintApp, window: &mut Window, cx: &mut Context<FlintApp>) -
     let show_logo = window.viewport_size().height >= px(720.);
     let folder_chip = div()
         .id("welcome-folder")
+        .role(gpui_kit::Role::Button)
         .aria_label("Choose workspace")
         .tab_index(0)
         .focus_visible(|style| style.border_color(p.accent))
@@ -227,7 +240,11 @@ pub fn render(app: &FlintApp, window: &mut Window, cx: &mut Context<FlintApp>) -
                                 .line_height(px(30.))
                                 .font_weight(FontWeight::MEDIUM)
                                 .text_color(p.text)
-                                .child("New session"),
+                                .child(if general {
+                                    "What can I help you with?"
+                                } else {
+                                    "New session"
+                                }),
                         )
                         // The folder is a chip: click it to pick another project.
                         .child(div().w_full().min_w_0().child(folder_chip)),
@@ -243,8 +260,10 @@ pub fn render(app: &FlintApp, window: &mut Window, cx: &mut Context<FlintApp>) -
                         .gap(px(3.))
                         .child(ui::label(
                             format!(
-                                "Workspace: {} · Agent: {}",
-                                if app.session().workspace.is_dir() {
+                                "{} · Agent: {}",
+                                if general {
+                                    "No project needed · Private working folder".into()
+                                } else if app.session().workspace.is_dir() {
                                     workspace.clone()
                                 } else {
                                     "folder unavailable; choose a folder".into()

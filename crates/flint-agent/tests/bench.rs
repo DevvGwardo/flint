@@ -168,7 +168,7 @@ async fn bench_command_flood() {
     let args = json!({"command": "yes 'flint flood line' | head -c 100000000"});
     let started = Instant::now();
     let outcome = flint_agent::tools::execute(
-        dir.path(),
+        &flint_agent::tools::ToolContext::new(dir.path().to_path_buf(), false),
         "run_command",
         args.as_object().expect("object"),
         &on_output,

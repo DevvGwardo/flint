@@ -10,7 +10,9 @@
 //!    reasoning is dropped, and long tool-call arguments (e.g. whole files
 //!    passed to `write_file`) are shortened. User messages and assistant text
 //!    stay intact.
-//! 2. Still over the trigger: the oldest whole turns are dropped.
+//! 2. Still over the trigger: the oldest whole turns are dropped. What each
+//!    one asked, answered and edited is kept in one [`Message::Summary`]
+//!    after the system prompt, so earlier instructions are not forgotten.
 //! 3. Still over the target: the older protected turn is compacted too, and
 //!    then the current turn's tool outputs except the latest few, so the
 //!    next compaction is several steps away.
@@ -33,6 +35,15 @@ const ARGS_MAX_CHARS: usize = 600;
 const KEEP_RECENT_TOOL_OUTPUTS: usize = 4;
 /// Per-message overhead in characters (role, ids, JSON punctuation).
 const MESSAGE_OVERHEAD_CHARS: usize = 16;
+/// The summary of dropped turns stays under this, and under
+/// [`SUMMARY_BUDGET_SHARE`] of the budget; oldest entries go first.
+const SUMMARY_MAX_CHARS: usize = 3_000;
+const SUMMARY_BUDGET_SHARE: f64 = 0.05;
+/// Characters kept of a dropped turn's request and of its answer.
+const SUMMARY_FIELD_CHARS: usize = 240;
+const SUMMARY_HEADER: &str = "Earlier in this session (older turns were removed to save space; \
+    this is what they covered, oldest first):";
+const SUMMARY_OMITTED: &str = "- (earlier requests omitted)";
 
 /// Estimates request size and decides when to compact.
 #[derive(Debug, Clone)]
@@ -106,6 +117,8 @@ impl ContextTracker {
         }
 
         // Phase 2: drop the oldest whole turns.
+        let summary_chars =
+            SUMMARY_MAX_CHARS.min((self.budget as f64 * SUMMARY_BUDGET_SHARE * 4.0) as usize);
         while self.estimate(history) > trigger {
             let starts = turn_starts(history);
             let protected_from = protected_start(&starts, history.len());
@@ -115,7 +128,9 @@ impl ContextTracker {
             if second > protected_from || first >= protected_from {
                 break;
             }
+            let entry = summarize_turn(&history[first..second]);
             history.drain(first..second);
+            add_to_summary(history, entry, summary_chars);
             changed = true;
         }
 
@@ -147,8 +162,100 @@ impl ContextTracker {
     }
 }
 
-/// Indices of real user messages (turn starts); the system prompt and
-/// nudges are not turns.
+/// One line for a dropped turn: what was asked, answered and edited.
+fn summarize_turn(turn: &[Message]) -> String {
+    let asked = turn.iter().find_map(|m| match m {
+        Message::User(text) | Message::UserWithImages { text, .. } => Some(text.as_str()),
+        _ => None,
+    });
+    let answer = turn.iter().rev().find_map(|m| match m {
+        Message::Assistant {
+            content,
+            tool_calls,
+            ..
+        } if tool_calls.is_empty() && !content.trim().is_empty() => Some(content.as_str()),
+        _ => None,
+    });
+    let mut edited: Vec<String> = Vec::new();
+    for message in turn {
+        if let Message::Assistant { tool_calls, .. } = message {
+            for call in tool_calls {
+                if matches!(call.name.as_str(), "write_file" | "edit_file")
+                    && let Ok(args) = serde_json::from_str::<Value>(&call.arguments)
+                    && let Some(path) = args.get("path").and_then(Value::as_str)
+                    && !edited.iter().any(|p| p == path)
+                    && edited.len() < 8
+                {
+                    edited.push(path.to_string());
+                }
+            }
+        }
+    }
+    let mut line = format!("- Asked: {}", one_line(asked.unwrap_or("(nothing)")));
+    if let Some(answer) = answer {
+        line.push_str(&format!(" | Answered: {}", one_line(answer)));
+    }
+    if !edited.is_empty() {
+        line.push_str(&format!(" | Edited: {}", edited.join(", ")));
+    }
+    line
+}
+
+fn one_line(text: &str) -> String {
+    let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.chars().count() <= SUMMARY_FIELD_CHARS {
+        return flat;
+    }
+    let mut cut: String = flat.chars().take(SUMMARY_FIELD_CHARS).collect();
+    cut.push('…');
+    cut
+}
+
+/// Appends `entry` to the summary after the system prompt, creating it if
+/// needed, and drops its oldest entries past `max_chars`.
+fn add_to_summary(history: &mut Vec<Message>, entry: String, max_chars: usize) {
+    let at = usize::from(matches!(history.first(), Some(Message::System(_))));
+    let existing = history
+        .iter()
+        .position(|m| matches!(m, Message::Summary(_)));
+    let mut lines: Vec<String> = match existing.map(|i| &history[i]) {
+        Some(Message::Summary(text)) => text
+            .lines()
+            .filter(|l| l.starts_with("- ") && *l != SUMMARY_OMITTED)
+            .map(str::to_string)
+            .collect(),
+        _ => Vec::new(),
+    };
+    let mut omitted = existing.is_some_and(
+        |i| matches!(&history[i], Message::Summary(text) if text.contains(SUMMARY_OMITTED)),
+    );
+    lines.push(entry);
+    let size = |lines: &[String]| {
+        SUMMARY_HEADER.len()
+            + SUMMARY_OMITTED.len()
+            + lines.iter().map(|l| l.len() + 1).sum::<usize>()
+    };
+    while lines.len() > 1 && size(&lines) > max_chars {
+        lines.remove(0);
+        omitted = true;
+    }
+    let mut text = SUMMARY_HEADER.to_string();
+    if omitted {
+        text.push('\n');
+        text.push_str(SUMMARY_OMITTED);
+    }
+    for line in lines {
+        text.push('\n');
+        text.push_str(&line);
+    }
+    match existing {
+        Some(i) => history[i] = Message::Summary(text),
+        None => history.insert(at, Message::Summary(text)),
+    }
+}
+
+/// Indices of real user messages (turn starts); the system prompt, the
+/// summary and nudges are not turns.
 fn turn_starts(history: &[Message]) -> Vec<usize> {
     history
         .iter()
@@ -204,6 +311,7 @@ fn compact_message(message: &mut Message) -> bool {
         | Message::User(_)
         | Message::UserWithImages { .. }
         | Message::Nudge(_)
+        | Message::Summary(_)
         | Message::Tool { .. } => false,
     }
 }
@@ -239,7 +347,10 @@ fn kchars(n: usize) -> String {
 fn message_chars(message: &Message) -> usize {
     MESSAGE_OVERHEAD_CHARS
         + match message {
-            Message::System(text) | Message::User(text) | Message::Nudge(text) => text.len(),
+            Message::System(text)
+            | Message::User(text)
+            | Message::Nudge(text)
+            | Message::Summary(text) => text.len(),
             // Base64 bytes are not text tokens. Budget conservatively per image.
             Message::UserWithImages { text, images } => text.len() + images.len() * 8_000,
             // Reasoning is replayed on tool-call messages (see session.rs).

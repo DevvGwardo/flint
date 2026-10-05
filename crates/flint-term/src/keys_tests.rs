@@ -67,3 +67,25 @@ fn paste_is_bracketed_and_cannot_escape() {
     assert_eq!(paste("a\nb", false), b"a\rb");
     assert_eq!(paste("x\x1b[201~y", true), b"\x1b[200~xy\x1b[201~");
 }
+
+#[test]
+fn nested_paste_marker_cannot_create_a_close_before_appended_command() {
+    let bytes = paste("é\n\x1b[20\x1b[201~1~\necho injected\n", true);
+    assert!(bytes.starts_with(b"\x1b[200~"));
+    assert!(bytes.ends_with(b"\x1b[201~"));
+    let payload = &bytes[6..bytes.len() - 6];
+    assert!(
+        !payload.contains(&0x1b),
+        "no escape may survive inside a paste"
+    );
+    assert!(std::str::from_utf8(payload).unwrap().starts_with("é\r"));
+    assert!(
+        std::str::from_utf8(payload)
+            .unwrap()
+            .ends_with("\recho injected\r")
+    );
+    assert_eq!(
+        paste("é\n界\r\n", true),
+        "\x1b[200~é\r界\r\x1b[201~".as_bytes()
+    );
+}

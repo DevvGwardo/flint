@@ -31,10 +31,13 @@ actions!(
         TogglePalette,
         ToggleChanges,
         ToggleSidebar,
+        CycleSessionGrouping,
         ToggleApproval,
         OpenWorkspace,
+        OpenWorktrees,
         OpenSettings,
         Interrupt,
+        UndoLastTurn,
         FocusComposer,
         RevealWorkspace,
         OpenTerminal,
@@ -46,6 +49,8 @@ actions!(
         MenuDismiss,
         DeleteSession,
         ResetPanelLayout,
+        ArrangeSessionGrid,
+        ResetSessionPanes,
         Quit,
     ]
 );
@@ -75,6 +80,8 @@ pub struct Options {
     pub demo_stop: Option<usize>,
     /// Demo: apply every event immediately.
     pub demo_instant: bool,
+    /// Offline composer/queue screenshot fixture; requires --demo.
+    pub demo_queue: bool,
     /// Demo: ask for approval before the final test run.
     pub demo_approval: bool,
     /// Demo: expand the finished turn's work block.
@@ -128,9 +135,60 @@ impl Options {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionFilter {
     All,
-    Running,
-    Unread,
+    Only(crate::session::Bucket),
 }
+
+/// How the sidebar groups sessions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionGrouping {
+    /// By repository, with every worktree of it together.
+    Project,
+    /// By [`crate::session::Bucket`].
+    Status,
+    /// By which agent runs the session.
+    Agent,
+}
+
+impl SessionGrouping {
+    pub fn next(self) -> Self {
+        match self {
+            Self::Project => Self::Status,
+            Self::Status => Self::Agent,
+            Self::Agent => Self::Project,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Project => "Project",
+            Self::Status => "Status",
+            Self::Agent => "Agent",
+        }
+    }
+
+    /// The value saved in settings.
+    pub fn setting(self) -> &'static str {
+        match self {
+            Self::Project => "project",
+            Self::Status => "status",
+            Self::Agent => "agent",
+        }
+    }
+
+    /// From the saved value; anything else groups by project.
+    pub fn from_setting(value: &str) -> Self {
+        match value {
+            "status" => Self::Status,
+            "agent" => Self::Agent,
+            _ => Self::Project,
+        }
+    }
+}
+
+/// Sessions and archived sessions the sidebar lists before "Show more", and
+/// how many each "Show more" adds.
+pub const SESSION_PAGE: usize = 50;
+pub const ARCHIVE_PAGE: usize = 10;
 
 pub struct FlintApp {
     pub sessions: Vec<Session>,
@@ -143,6 +201,9 @@ pub struct FlintApp {
     pub key_path: Option<PathBuf>,
     pub key_sources: KeySources,
     pub settings: Settings,
+    /// Only the latest explicit choice can become a future-session default.
+    pub(crate) agent_choice_requests:
+        std::collections::HashMap<(flint_agent::AgentKind, String), (u64, String)>,
     pub model: String,
     pub effort: Option<ReasoningEffort>,
     /// False once the endpoint said it ignores `reasoning_effort`.
@@ -158,18 +219,26 @@ pub struct FlintApp {
     pub archive_confirm: Option<u64>,
     pub store_error: Option<String>,
     pub changes_open: bool,
+    pub file_preview: Option<crate::file_preview::FilePreview>,
+    pub(crate) file_preview_revision: u64,
+    pub(crate) file_preview_task: Option<Task<()>>,
     pub selected_change: Option<usize>,
     pub change_diff_scroll: UniformListScrollHandle,
     pub(crate) change_diff_cache: std::cell::RefCell<Option<crate::diff::CachedDiff>>,
     pub dock_layout: crate::docking::Layout,
     pub(crate) dock_revision: u64,
     pub(crate) docking: Option<crate::docking::Panel>,
+    pub session_workspace: crate::session_workspace::Workspace,
     pub palette: Option<Entity<CommandState>>,
     pub composer: Entity<TextareaState>,
     pub search: Entity<InputState>,
     pub sidebar_scroll: ScrollHandle,
     pub archive_scroll: ScrollHandle,
     pub filter: SessionFilter,
+    pub grouping: SessionGrouping,
+    /// Sessions listed so far; grows by a page per "Show more".
+    pub session_limit: usize,
+    pub archive_limit: usize,
     pub mention: Option<crate::app_input::MentionMenu>,
     pub slash: Option<crate::app_input::SlashMenu>,
     /// Files attached with `@` for the next message.
@@ -202,8 +271,13 @@ pub struct FlintApp {
     pub option_menu: Option<crate::session_options::OptionMenu>,
     /// The "+" menu (project folder, recent folders, attach) and its selection.
     pub project_menu: Option<usize>,
+    /// Git worktree discovery, creation and safe removal.
+    pub worktree_form: Option<crate::worktree_picker::WorktreeForm>,
+    pub queue_popover: bool,
+    pub queue_edit: Option<crate::queue_actions::QueueEdit>,
     /// Summary row whose answer was just copied, and when.
     pub copied: Option<(usize, Instant)>,
+    pub copied_conversation: Option<crate::subagent_ui::Conversation>,
     /// Sidebar row with its context menu open.
     pub session_menu: Option<usize>,
     /// Session being renamed, with its title input.
@@ -224,6 +298,7 @@ pub struct FlintApp {
     pub(crate) options: Options,
     pub(crate) next_uid: u64,
     pub(crate) file_index: std::collections::HashMap<PathBuf, Vec<String>>,
+    pub(crate) file_index_task: Option<(PathBuf, Task<()>)>,
     pub(crate) subscriptions: Vec<Subscription>,
     /// Animation clock; runs only while a session is working.
     pub(crate) ticker: Option<Task<()>>,
@@ -234,15 +309,21 @@ pub struct FlintApp {
 
 impl FlintApp {
     pub fn new(options: Options, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let workspace = options
-            .workspace
-            .clone()
-            .or_else(|| std::env::current_dir().ok())
-            .unwrap_or_default();
         let home = options
             .home
             .clone()
             .unwrap_or_else(crate::settings::flint_home);
+        let workspace = options
+            .workspace
+            .clone()
+            .unwrap_or_else(|| crate::general::workspace(&home));
+        let general_error = if options.workspace.is_none() {
+            crate::general::prepare(&home)
+                .err()
+                .map(|error| format!("Couldn't prepare the general-agent working folder: {error}"))
+        } else {
+            None
+        };
         let key_path = options.key_path.clone();
         let key_sources = options.key_sources.clone().unwrap_or_default();
         let settings = Settings::load(&home, &key_sources);
@@ -266,10 +347,21 @@ impl FlintApp {
             cx.subscribe_in(
                 &composer,
                 window,
-                |this, _, event: &InputEvent, window, cx| match event {
-                    InputEvent::PressEnter { shift: false, .. } => this.submit(window, cx),
-                    InputEvent::Change => this.composer_changed(window, cx),
-                    _ => {}
+                |this, composer, event: &InputEvent, window, cx| {
+                    if &this.composer != composer {
+                        return;
+                    }
+                    match event {
+                        InputEvent::PressEnter {
+                            secondary: true,
+                            shift: false,
+                        } if !this.session().view.has_pending_approval() => {
+                            this.steer_draft(window, cx)
+                        }
+                        InputEvent::PressEnter { shift: false, .. } => this.submit(window, cx),
+                        InputEvent::Change => this.composer_changed(window, cx),
+                        _ => {}
+                    }
                 },
             ),
             cx.subscribe(&search, |this, _, event: &InputEvent, cx| {
@@ -280,6 +372,7 @@ impl FlintApp {
                 cx.notify();
             }),
         ];
+        let grouping = SessionGrouping::from_setting(&settings.session_grouping);
         let mut app = Self {
             sessions: Vec::new(),
             workspace: workspace.clone(),
@@ -292,26 +385,34 @@ impl FlintApp {
             effort_supported: true,
             approval: settings.approval_mode(),
             settings,
+            agent_choice_requests: Default::default(),
             sidebar_open: true,
             sidebar_visible: true,
             session_drawer: false,
             archived_session: None,
             archives: Vec::new(),
             archive_confirm: None,
-            store_error: None,
+            store_error: general_error,
             changes_open: options.open_changes,
+            file_preview: None,
+            file_preview_revision: 0,
+            file_preview_task: None,
             selected_change: None,
             change_diff_scroll: UniformListScrollHandle::new(),
             change_diff_cache: Default::default(),
             dock_layout,
             dock_revision: 0,
             docking: None,
+            session_workspace: Default::default(),
             palette: None,
             composer,
             search,
             sidebar_scroll: ScrollHandle::new(),
             archive_scroll: ScrollHandle::new(),
             filter: SessionFilter::All,
+            grouping,
+            session_limit: SESSION_PAGE,
+            archive_limit: ARCHIVE_PAGE,
             mention: None,
             slash: None,
             attachments: Vec::new(),
@@ -333,7 +434,11 @@ impl FlintApp {
             terminal: crate::term_panel::TermPanel::new(false, terminal_height),
             option_menu: None,
             project_menu: None,
+            worktree_form: None,
+            queue_popover: false,
+            queue_edit: None,
             copied: None,
+            copied_conversation: None,
             session_menu: None,
             renaming: None,
             rename_subscription: None,
@@ -351,6 +456,7 @@ impl FlintApp {
             options: options.clone(),
             next_uid: 0,
             file_index: Default::default(),
+            file_index_task: None,
             subscriptions,
             ticker: None,
             refocus_composer: false,
@@ -362,6 +468,7 @@ impl FlintApp {
         let fresh = app.new_session_value(workspace);
         app.sessions.insert(0, fresh);
         app.active = 0;
+        app.load_session_layout(window, cx);
         app.subscriptions.push(cx.on_app_quit(|app, _| {
             // Drain synchronously before returning a future: GPUI gives quit
             // futures only 100 ms, which is not a disk-write guarantee.
@@ -374,6 +481,7 @@ impl FlintApp {
         }));
         if options.demo {
             app.start_demo(cx);
+            crate::automation::seed_queue_editor(&mut app, window, cx);
         }
         if let Some(turns) = options.demo_long.or(options.scroll_test.then_some(200)) {
             app.load_long_session(turns, cx);
@@ -395,7 +503,7 @@ impl FlintApp {
                 .update(cx, |state, cx| state.set_value(prompt, window, cx));
             app.submit(window, cx);
         }
-        crate::automation::schedule_dump(cx);
+        crate::automation::schedule_dump(window, cx);
         if options.open_palette {
             app.open_palette(window, cx);
         } else if !crate::automation::background_launch() {
@@ -411,8 +519,12 @@ impl FlintApp {
             if window.is_window_active() {
                 if this.refocus_composer || window.focused(cx).is_none() {
                     this.refocus_composer = false;
-                    this.composer
-                        .update(cx, |state, cx| state.focus(window, cx));
+                    if this.session().selected_subagent.is_some() {
+                        this.focus.focus(window, cx);
+                    } else {
+                        this.composer
+                            .update(cx, |state, cx| state.focus(window, cx));
+                    }
                 }
             } else if this.composer.read(cx).focus_handle(cx).is_focused(window) {
                 this.refocus_composer = true;
@@ -432,7 +544,10 @@ impl FlintApp {
             app.composer_changed(window, cx);
         }
         // Reopen the terminal dock if it was open last time.
-        if (app.settings.terminal_open && !app.options.ephemeral()) || app.options.open_terminal {
+        if !app.session_workspace.tiled()
+            && ((app.settings.terminal_open && !app.options.ephemeral())
+                || app.options.open_terminal)
+        {
             app.toggle_terminal(window, cx);
             if let (Some(text), Some(view)) = (
                 app.options.terminal_input.clone(),
@@ -449,7 +564,10 @@ impl FlintApp {
 
     pub(crate) fn new_session_value(&mut self, workspace: PathBuf) -> Session {
         self.next_uid += 1;
-        Session::new(self.next_uid, workspace)
+        let mut session = Session::new(self.next_uid, workspace);
+        session.general = session.workspace == crate::general::workspace(&self.home);
+        session.agent = self.settings.default_agent;
+        session
     }
 
     pub fn session(&self) -> &Session {
@@ -465,7 +583,11 @@ impl FlintApp {
     }
 
     pub fn branch(&self) -> Option<String> {
-        engine::git_branch(&self.session().workspace)
+        if self.session().general {
+            None
+        } else {
+            engine::git_branch(&self.session().workspace)
+        }
     }
 
     pub fn toggle_item(&mut self, ix: usize, cx: &mut Context<Self>) {
@@ -514,6 +636,7 @@ impl FlintApp {
 
     /// Opens the changes panel on a file (or the first changed file).
     pub fn review(&mut self, path: Option<String>, cx: &mut Context<Self>) {
+        self.clear_file_preview();
         let changes = &self.session().view.changes;
         self.selected_change = path
             .and_then(|path| changes.iter().position(|f| f.path == path))
@@ -523,12 +646,30 @@ impl FlintApp {
     }
 
     pub fn select_session(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.select_session_with_focus(ix, true, window, cx);
+    }
+
+    pub(crate) fn select_session_with_focus(
+        &mut self,
+        ix: usize,
+        focus: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if ix < self.sessions.len() {
+            let old = self.session().uid;
+            let new = self.sessions[ix].uid;
+            self.follow_session_selection(old, new, window, cx);
             self.discard_rename();
             self.active = ix;
+            self.sessions[ix].selected_subagent = None;
+            self.copied = None;
+            self.copied_conversation = None;
             self.sessions[ix].unread = false;
             self.selected_change = None;
             self.session_menu = None;
+            self.queue_popover = false;
+            self.queue_edit = None;
             self.session_drawer = false;
             self.drawer_return_focus = None;
             self.approval_preview = None;
@@ -542,32 +683,52 @@ impl FlintApp {
             {
                 self.settle_changes_async(self.sessions[ix].uid, cx);
             }
-            self.composer
-                .update(cx, |state, cx| state.focus(window, cx));
+            if focus {
+                self.focus_session_input(window, cx);
+            }
+            self.save_session_layout();
             cx.notify();
         }
     }
 
     pub fn select_change(&mut self, ix: usize, cx: &mut Context<Self>) {
+        self.clear_file_preview();
         self.selected_change = Some(ix);
         self.changes_open = true;
         cx.notify();
     }
 
     pub(crate) fn new_session(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.new_session_for(self.session().agent, window, cx);
+    }
+
+    pub(crate) fn new_session_for(
+        &mut self,
+        agent: flint_agent::AgentKind,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let old = self.session().uid;
+        self.inherit_agent_identity(agent);
         self.discard_rename();
         // Reuse an untouched session in this workspace instead of stacking empty ones.
         let reusable = self.sessions.iter().position(|s| {
-            s.view.items.is_empty() && s.ops.is_none() && s.workspace == self.workspace
+            s.view.items.is_empty()
+                && s.prompt_queue.items.is_empty()
+                && s.ops.is_none()
+                && s.agent == agent
+                && s.workspace == self.workspace
         });
         match reusable {
             Some(ix) => self.active = ix,
             None => {
-                let session = self.new_session_value(self.workspace.clone());
+                let mut session = self.new_session_value(self.workspace.clone());
+                session.agent = agent;
                 self.sessions.push(session);
                 self.active = self.sessions.len() - 1;
             }
         }
+        self.follow_session_selection(old, self.session().uid, window, cx);
         self.selected_change = None;
         self.session_menu = None;
         self.session_drawer = false;
@@ -577,6 +738,9 @@ impl FlintApp {
             .update(cx, |state, cx| state.set_value("", window, cx));
         self.composer
             .update(cx, |state, cx| state.focus(window, cx));
+        self.save_session_layout();
+        self.remember_agent(agent);
+        self.start_agent_early(self.active, cx);
         cx.notify();
     }
 
@@ -586,14 +750,22 @@ impl FlintApp {
         if self.session().view.items.is_empty() {
             return;
         }
+        let old = self.session().uid;
         self.discard_rename();
         let workspace = self.session().workspace.clone();
-        let session = self.new_session_value(workspace);
+        let agent = self.session().agent;
+        self.inherit_agent_identity(agent);
+        let mut session = self.new_session_value(workspace);
+        session.agent = agent;
         self.sessions.push(session);
         self.active = self.sessions.len() - 1;
+        self.follow_session_selection(old, self.session().uid, window, cx);
         self.selected_change = None;
         self.composer
             .update(cx, |state, cx| state.focus(window, cx));
+        self.save_session_layout();
+        self.remember_agent(agent);
+        self.start_agent_early(self.active, cx);
         cx.notify();
     }
 

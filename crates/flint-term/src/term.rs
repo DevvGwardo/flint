@@ -92,8 +92,46 @@ pub struct SpawnConfig {
 #[derive(Clone)]
 struct Listener {
     tx: Sender<TermEvent>,
+    queued: Receiver<TermEvent>,
+    delivery: Arc<std::sync::Mutex<()>>,
     pending: Arc<AtomicBool>,
     pty_writer: Arc<FairMutex<Option<EventLoopSender>>>,
+}
+
+impl Listener {
+    fn deliver(&self, mut event: TermEvent) {
+        if let TermEvent::Title(title) = &mut event
+            && title.len() > 4000
+        {
+            let mut end = 4000;
+            while !title.is_char_boundary(end) {
+                end -= 1;
+            }
+            title.truncate(end);
+        }
+        // Serialize producers, not the UI consumer. Collapse only pending
+        // informational events of the same kind; preserve every exit event.
+        // There are at most one wakeup, title and bell plus the child's exit.
+        let Ok(_delivery) = self.delivery.lock() else {
+            return;
+        };
+        let mut retained = Vec::new();
+        while let Ok(queued) = self.queued.try_recv() {
+            let superseded = matches!(
+                (&queued, &event),
+                (TermEvent::Title(_), TermEvent::Title(_))
+                    | (TermEvent::Bell, TermEvent::Bell)
+                    | (TermEvent::Wakeup, TermEvent::Wakeup)
+            );
+            if !superseded {
+                retained.push(queued);
+            }
+        }
+        for queued in retained {
+            let _ = self.tx.try_send(queued);
+        }
+        let _ = self.tx.try_send(event);
+    }
 }
 
 impl EventListener for Listener {
@@ -125,7 +163,7 @@ impl EventListener for Listener {
             | Event::TextAreaSizeRequest(..)
             | Event::CursorBlinkingChange => return,
         };
-        let _ = self.tx.try_send(out);
+        self.deliver(out);
     }
 }
 
@@ -196,6 +234,8 @@ impl Terminal {
         let (tx, events) = async_channel::unbounded();
         let listener = Listener {
             tx,
+            queued: events.clone(),
+            delivery: Arc::new(std::sync::Mutex::new(())),
             pending: Arc::new(AtomicBool::new(false)),
             pty_writer: Arc::new(FairMutex::new(None)),
         };
@@ -242,10 +282,22 @@ impl Terminal {
     }
 
     /// Feeds output to a detached terminal (as if a program printed it).
+    ///
+    /// There is no tty in between, so this does the tty's `onlcr` itself:
+    /// every `\n` becomes `\r\n`. Without it, output captured from a pipe
+    /// (an agent's command) staircases, each line starting where the last
+    /// one ended. A `\r` already there is harmless doubled.
     pub fn feed(&self, bytes: &[u8]) {
         if let Backend::Detached(parser) = &self.backend {
+            let mut translated = Vec::with_capacity(bytes.len());
+            for &b in bytes {
+                if b == b'\n' {
+                    translated.push(b'\r');
+                }
+                translated.push(b);
+            }
             let mut term = self.term.lock();
-            parser.lock().advance(&mut *term, bytes);
+            parser.lock().advance(&mut *term, &translated);
             drop(term);
             self.listener.send_event(Event::Wakeup);
         }

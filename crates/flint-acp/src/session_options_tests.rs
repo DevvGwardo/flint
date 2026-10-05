@@ -39,6 +39,55 @@ fn pairs(items: &[(&str, &str)]) -> Vec<(String, String)> {
 }
 
 #[tokio::test]
+async fn shutdown_interrupts_an_unanswered_option_change() {
+    let (harness, mut fake) = start(ApprovalMode::Auto);
+    fake.handshake_with_options(claude_options("default", "default", false))
+        .await;
+    harness
+        .until(|e| matches!(e, AgentEvent::SessionOptions(_)))
+        .await;
+    harness
+        .send(Op::SetSessionOption {
+            id: "mode".into(),
+            value: "plan".into(),
+        })
+        .await;
+    fake.expect("session/set_config_option").await;
+    harness.send(Op::Shutdown).await;
+    fake.closed().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn interrupt_is_not_blocked_by_a_setting_rpc_during_a_turn() {
+    let (harness, mut fake) = start(ApprovalMode::Auto);
+    fake.handshake_with_options(claude_options("default", "default", false))
+        .await;
+    harness
+        .until(|e| matches!(e, AgentEvent::SessionOptions(_)))
+        .await;
+    harness.send(Op::UserMessage("wait".into())).await;
+    fake.expect("session/prompt").await;
+    harness
+        .send(Op::SetSessionOption {
+            id: "mode".into(),
+            value: "plan".into(),
+        })
+        .await;
+    fake.expect("session/set_config_option").await;
+    harness.send(Op::Interrupt).await;
+    fake.expect("session/cancel").await;
+    let events = harness.next_turn().await;
+    assert!(matches!(
+        events.last(),
+        Some(AgentEvent::TurnFinished {
+            reason: flint_agent::TurnEndReason::Interrupted,
+            ..
+        })
+    ));
+    fake.closed().await;
+}
+
+#[tokio::test]
 async fn options_are_emitted_and_set_round_trips() {
     let (harness, mut fake) = start(ApprovalMode::AskForChanges);
     fake.handshake_with_options(claude_options("default", "default", false))

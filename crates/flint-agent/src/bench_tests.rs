@@ -111,6 +111,42 @@ fn bench_sse_parse_throughput() {
 }
 
 #[test]
+fn bench_sse_coalesced_events() {
+    if !enabled() {
+        return;
+    }
+    // Network readers can coalesce many events in one chunk. The original
+    // parser moved the remaining chunk once for every line it consumed.
+    let body = b"data: token\n\n".repeat(20_000);
+    let baseline = || {
+        let mut buf = String::from_utf8_lossy(&body).into_owned();
+        let mut data = Vec::new();
+        let mut out = Vec::new();
+        while let Some(pos) = buf.find('\n') {
+            let line: String = buf.drain(..=pos).collect();
+            let line = line.trim_end_matches(['\n', '\r']);
+            if line.is_empty() {
+                if !data.is_empty() {
+                    out.push(data.join("\n"));
+                    data.clear();
+                }
+            } else if let Some(rest) = line.strip_prefix("data:") {
+                data.push(rest.strip_prefix(' ').unwrap_or(rest).to_string());
+            }
+        }
+        out
+    };
+    assert_eq!(baseline(), SseParser::default().push(&body));
+    let before = median(5, || {
+        std::hint::black_box(baseline());
+    });
+    let after = median(5, || {
+        std::hint::black_box(SseParser::default().push(&body));
+    });
+    eprintln!("BENCH sse_coalesced events=20000: before {before:?} -> after {after:?}");
+}
+
+#[test]
 fn bench_request_build() {
     if !enabled() {
         return;

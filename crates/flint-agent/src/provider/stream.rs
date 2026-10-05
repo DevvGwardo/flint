@@ -7,42 +7,96 @@ use serde_json::Value;
 
 use crate::protocol::Usage;
 
+pub const MAX_SSE_EVENT_BYTES: usize = 1024 * 1024;
+pub const MAX_COMPLETION_BYTES: usize = 8 * 1024 * 1024;
+const MAX_TOOL_CALLS: usize = 256;
+
 /// Splits a byte stream into SSE `data:` payloads.
 #[derive(Debug, Default)]
 pub struct SseParser {
-    buf: String,
+    buf: Vec<u8>,
     data: Vec<String>,
+    skip_lf: bool,
+    data_bytes: usize,
+    exceeded: bool,
 }
 
 impl SseParser {
     /// Feeds bytes; returns every payload completed by them.
     pub fn push(&mut self, bytes: &[u8]) -> Vec<String> {
-        self.buf.push_str(&String::from_utf8_lossy(bytes));
+        if self.exceeded || self.buf.len().saturating_add(bytes.len()) > MAX_SSE_EVENT_BYTES {
+            self.exceeded = true;
+            self.buf.clear();
+            self.data.clear();
+            return Vec::new();
+        }
+        let previous_len = self.buf.len();
+        self.buf.extend_from_slice(bytes);
         let mut out = Vec::new();
-        while let Some(pos) = self.buf.find('\n') {
-            let line: String = self.buf.drain(..=pos).collect();
-            let line = line.trim_end_matches(['\n', '\r']);
+        let mut start = 0;
+        // Decode complete lines, not network chunks, which may split UTF-8.
+        // Scan only new bytes and compact once, avoiding repeated front drains.
+        for pos in previous_len..self.buf.len() {
+            let byte = self.buf[pos];
+            if self.skip_lf {
+                self.skip_lf = false;
+                if byte == b'\n' {
+                    start = pos + 1;
+                    continue;
+                }
+            }
+            if !matches!(byte, b'\n' | b'\r') {
+                continue;
+            }
+            let line = String::from_utf8_lossy(&self.buf[start..pos]);
             if line.is_empty() {
                 if !self.data.is_empty() {
                     out.push(self.data.join("\n"));
                     self.data.clear();
+                    self.data_bytes = 0;
                 }
             } else if let Some(rest) = line.strip_prefix("data:") {
+                self.data_bytes = self.data_bytes.saturating_add(rest.len() + 1);
+                if self.data_bytes > MAX_SSE_EVENT_BYTES {
+                    self.exceeded = true;
+                    self.data.clear();
+                    break;
+                }
                 self.data
                     .push(rest.strip_prefix(' ').unwrap_or(rest).to_string());
             }
             // `event:`, `id:`, `retry:` and `:` comments carry nothing we need.
+            start = pos + 1;
+            self.skip_lf = byte == b'\r';
+        }
+        if start > 0 {
+            self.buf.drain(..start);
         }
         out
     }
 
     /// Flushes a final event that wasn't followed by a blank line.
     pub fn finish(&mut self) -> Option<String> {
-        let line = std::mem::take(&mut self.buf);
-        if let Some(rest) = line.trim_end().strip_prefix("data:") {
-            self.data.push(rest.trim_start().to_string());
+        if self.exceeded {
+            return None;
+        }
+        let bytes = std::mem::take(&mut self.buf);
+        let line = String::from_utf8_lossy(&bytes);
+        self.skip_lf = false;
+        if let Some(rest) = line.strip_prefix("data:") {
+            if self.data_bytes.saturating_add(rest.len() + 1) > MAX_SSE_EVENT_BYTES {
+                self.exceeded = true;
+                self.data.clear();
+                return None;
+            }
+            self.data
+                .push(rest.strip_prefix(' ').unwrap_or(rest).to_string());
         }
         (!self.data.is_empty()).then(|| std::mem::take(&mut self.data).join("\n"))
+    }
+
+    pub fn exceeded(&self) -> bool {
+        self.exceeded
     }
 }
 
@@ -90,11 +144,20 @@ pub struct CompletionBuilder {
     completion: Completion,
     /// Wire index -> position in `tool_calls`.
     indices: Vec<(i64, usize)>,
+    input_bytes: usize,
+    exceeded: bool,
 }
 
 impl CompletionBuilder {
     /// Applies one parsed chunk and returns the deltas to display.
     pub fn apply(&mut self, chunk: &Value) -> Vec<StreamDelta> {
+        // Includes ids, names, arguments, text and reasoning, not just what is
+        // displayed. Account before extending any completion buffer.
+        self.input_bytes = self.input_bytes.saturating_add(chunk.to_string().len());
+        if self.exceeded || self.input_bytes > MAX_COMPLETION_BYTES {
+            self.exceeded = true;
+            return Vec::new();
+        }
         let mut deltas = Vec::new();
         if let Some(usage) = chunk.get("usage").filter(|u| u.is_object()) {
             self.completion.usage = Some(parse_usage(usage));
@@ -143,10 +206,19 @@ impl CompletionBuilder {
             .filter(|s| !s.is_empty());
         let slot = match self.indices.iter().find(|(i, _)| *i == index) {
             // A new id at a known index means the provider reused indices.
-            Some((_, slot)) if id.is_none_or(|id| self.completion.tool_calls[*slot].id == id) => {
+            Some((_, slot))
+                if id.is_none_or(|id| {
+                    let previous = &self.completion.tool_calls[*slot].id;
+                    previous.is_empty() || previous == id
+                }) =>
+            {
                 *slot
             }
             Some(_) | None => {
+                if self.completion.tool_calls.len() >= MAX_TOOL_CALLS {
+                    self.exceeded = true;
+                    return;
+                }
                 self.completion.tool_calls.push(RawToolCall::default());
                 let slot = self.completion.tool_calls.len() - 1;
                 self.indices.retain(|(i, _)| *i != index);
@@ -182,6 +254,10 @@ impl CompletionBuilder {
         }
         self.completion.tool_calls.retain(|c| !c.name.is_empty());
         self.completion
+    }
+
+    pub fn exceeded(&self) -> bool {
+        self.exceeded
     }
 }
 

@@ -39,12 +39,39 @@ pub(crate) struct Shared {
     /// `session/load` replays history as updates; the UI already has it.
     pub loading: AtomicBool,
     pub options: Mutex<Options>,
+    pub options_changed: tokio::sync::watch::Sender<u64>,
     pub terminals: Terminals,
     /// Opt in to the "terminal output" extension.
     pub agent_terminals: bool,
+    pub shutdown: tokio::sync::watch::Receiver<bool>,
+    pub interrupts: tokio::sync::watch::Sender<u64>,
+    pub interrupts_seen: std::sync::atomic::AtomicU64,
 }
 
 impl Shared {
+    pub fn interrupt_pending(&self) -> bool {
+        *self.interrupts.borrow() > self.interrupts_seen.load(Ordering::Relaxed)
+    }
+
+    /// Non-prompt RPCs must not block Shutdown or wait forever on a peer.
+    pub async fn rpc<T>(
+        &self,
+        future: impl std::future::Future<Output = Result<T, agent_client_protocol::Error>>,
+    ) -> Result<T, agent_client_protocol::Error> {
+        let mut shutdown = self.shutdown.clone();
+        let mut interrupts = self.interrupts.subscribe();
+        let seen = self.interrupts_seen.load(Ordering::Relaxed);
+        tokio::select! {
+            biased;
+            _ = shutdown.wait_for(|stopped| *stopped) =>
+                Err(agent_client_protocol::Error::new(-32000, "ACP session is shutting down")),
+            _ = interrupts.wait_for(|epoch| *epoch > seen) =>
+                Err(agent_client_protocol::Error::new(-32000, "ACP request interrupted")),
+            result = tokio::time::timeout(std::time::Duration::from_secs(30), future) =>
+                result.unwrap_or_else(|_| Err(agent_client_protocol::Error::new(-32000, "ACP request timed out after 30 seconds"))),
+        }
+    }
+
     pub fn emit_all(&self, events: Vec<AgentEvent>) {
         for event in events {
             let _ = self.events.try_send(event);
@@ -76,6 +103,8 @@ impl Shared {
         if let Ok(mut slot) = self.options.lock() {
             *slot = options;
         }
+        self.options_changed
+            .send_modify(|epoch| *epoch = epoch.wrapping_add(1));
         self.emit_all(vec![AgentEvent::SessionOptions(list)]);
     }
 

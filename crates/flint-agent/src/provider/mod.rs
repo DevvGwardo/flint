@@ -23,24 +23,37 @@ pub use stream::Timing;
 pub use wire::ChatRequest;
 pub use wire::Message;
 
+/// Retries for dropped connections and server errors: a dead endpoint
+/// should fail fast.
 const MAX_RETRIES: u32 = 3;
+/// Retries when the endpoint says it is busy (429/503): those pass.
+const MAX_THROTTLED_RETRIES: u32 = 5;
+/// Longest wait between retries, whatever the backoff or `Retry-After` say.
+const MAX_RETRY_WAIT: Duration = Duration::from_secs(60);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 /// Longest silence allowed mid-stream before the request is abandoned.
 const IDLE_TIMEOUT: Duration = Duration::from_secs(180);
 /// Keep pooled connections warm between steps (steps are seconds apart).
 const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+/// Enough UTF-8 bytes for the 500-character HTTP error snippet.
+const MAX_ERROR_BYTES: usize = 2000;
+const MAX_STREAM_BYTES: usize = 16 * 1024 * 1024;
+/// Idle timeout remains unchanged; a drip-feed must not run forever.
+const STREAM_DEADLINE: Duration = Duration::from_secs(900);
 
 /// Why a model call failed.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ProviderError {
     Cancelled,
+    /// The stream broke after part of the reply was shown, so the call was
+    /// not retried here (the shown part would repeat).
+    Dropped(String),
     /// Retries exhausted or a non-retryable error.
     Failed(String),
 }
 
 /// An OpenAI-compatible Chat Completions endpoint. One client (and its
 /// keep-alive connection pool) is reused for every call in a session.
-#[derive(Debug)]
 pub struct Provider {
     http: reqwest::Client,
     url: String,
@@ -50,6 +63,16 @@ pub struct Provider {
     api_key: String,
     /// Set once the endpoint rejected `reasoning_effort`; it is not sent again.
     effort_rejected: AtomicBool,
+}
+
+impl std::fmt::Debug for Provider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Provider")
+            .field("url", &self.url)
+            .field("model", &self.model)
+            .field("effort_rejected", &self.effort_rejected)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Provider {
@@ -167,20 +190,37 @@ impl Provider {
                             Ok(completion)
                         }
                         Err(Attempt::Cancelled) => Err(ProviderError::Cancelled),
-                        Err(Attempt::Rejected(_) | Attempt::Retryable(_) | Attempt::Fatal(_)) => {
-                            Err(ProviderError::Failed(message))
-                        }
+                        Err(
+                            Attempt::Rejected(_)
+                            | Attempt::Retryable(_)
+                            | Attempt::Throttled(..)
+                            | Attempt::Fatal(_),
+                        ) => Err(ProviderError::Failed(message)),
                     };
                 }
                 Err(Attempt::Rejected(message) | Attempt::Fatal(message)) => {
                     return Err(ProviderError::Failed(message));
                 }
-                Err(Attempt::Retryable(message)) => {
+                Err(failure @ (Attempt::Retryable(_) | Attempt::Throttled(..))) => {
+                    let (message, retry_after, limit) = match failure {
+                        Attempt::Throttled(message, after) => {
+                            (message, after, MAX_THROTTLED_RETRIES)
+                        }
+                        Attempt::Retryable(message) => (message, None, MAX_RETRIES),
+                        Attempt::Cancelled | Attempt::Rejected(_) | Attempt::Fatal(_) => {
+                            unreachable!("matched above")
+                        }
+                    };
                     attempt += 1;
-                    if shown || attempt > MAX_RETRIES {
+                    if shown {
+                        return Err(ProviderError::Dropped(message));
+                    }
+                    if attempt > limit {
                         return Err(ProviderError::Failed(message));
                     }
-                    let backoff = Duration::from_millis(1000 * 2u64.pow(attempt - 1));
+                    let backoff = retry_after
+                        .unwrap_or_else(|| Duration::from_millis(1000 * 2u64.pow(attempt - 1)))
+                        .min(MAX_RETRY_WAIT);
                     tokio::select! {
                         () = tokio::time::sleep(backoff) => {}
                         () = cancel.cancelled() => return Err(ProviderError::Cancelled),
@@ -206,16 +246,23 @@ impl Provider {
             .body(body)
             .send();
         let response = tokio::select! {
-            response = request => response.map_err(|err| Attempt::Retryable(format!("request failed: {err}")))?,
+            response = tokio::time::timeout(IDLE_TIMEOUT, request) =>
+                response.map_err(|_| Attempt::Retryable("response headers stalled".to_string()))?
+                    .map_err(|err| Attempt::Retryable(format!("request failed: {err}")))?,
             () = cancel.cancelled() => return Err(Attempt::Cancelled),
         };
         let status = response.status();
         if !status.is_success() {
-            let text = response.text().await.unwrap_or_default();
-            let snippet: String = text.chars().take(500).collect();
+            let retry_after = response
+                .headers()
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok())
+                .and_then(parse_retry_after);
+            let snippet = error_snippet(response, cancel).await?;
             let message = format!("provider returned {status}: {snippet}");
             return Err(match status.as_u16() {
-                429 | 500..=599 => Attempt::Retryable(message),
+                429 | 503 => Attempt::Throttled(message, retry_after),
+                500..=599 => Attempt::Retryable(message),
                 400 | 422 => Attempt::Rejected(message),
                 _ => Attempt::Fatal(message),
             });
@@ -228,10 +275,14 @@ impl Provider {
         let mut parser = SseParser::default();
         let mut builder = CompletionBuilder::default();
         let mut done = false;
+        let mut received = 0usize;
+        let deadline = tokio::time::Instant::from_std(started) + STREAM_DEADLINE;
         while !done {
             let next = tokio::select! {
                 next = tokio::time::timeout(IDLE_TIMEOUT, bytes.next()) => next,
                 () = cancel.cancelled() => return Err(Attempt::Cancelled),
+                () = tokio::time::sleep_until(deadline) =>
+                    return Err(Attempt::Retryable("stream exceeded the total deadline".into())),
             };
             let chunk = match next {
                 Err(_) => return Err(Attempt::Retryable("stream stalled".to_string())),
@@ -242,21 +293,74 @@ impl Provider {
                 Ok(Some(Ok(chunk))) => chunk,
             };
             timing.first_byte.get_or_insert_with(|| started.elapsed());
+            received = received.saturating_add(chunk.len());
+            if received > MAX_STREAM_BYTES {
+                return Err(Attempt::Fatal(
+                    "provider stream exceeded the 16 MiB limit".into(),
+                ));
+            }
             for payload in parser.push(&chunk) {
-                done |= handle_payload(&payload, &mut builder, on_delta, shown)?;
+                done = handle_payload(&payload, &mut builder, on_delta, shown)?;
                 if *shown {
                     timing.first_delta.get_or_insert_with(|| started.elapsed());
                 }
+                if done {
+                    break;
+                }
+            }
+            if parser.exceeded() || builder.exceeded() {
+                return Err(Attempt::Fatal(
+                    "provider stream exceeded a parsing/completion limit".into(),
+                ));
             }
         }
-        if let Some(payload) = parser.finish() {
+        if !done && let Some(payload) = parser.finish() {
             handle_payload(&payload, &mut builder, on_delta, shown)?;
+        }
+        if parser.exceeded() || builder.exceeded() {
+            return Err(Attempt::Fatal(
+                "provider stream exceeded a parsing/completion limit".into(),
+            ));
         }
         timing.total = started.elapsed();
         let mut completion = builder.finish();
+        match completion.finish_reason.as_deref() {
+            Some("stop" | "tool_calls") => {}
+            None => {
+                return Err(Attempt::Retryable(
+                    "stream ended without a terminal finish_reason".into(),
+                ));
+            }
+            Some(reason) => {
+                return Err(Attempt::Fatal(format!(
+                    "incomplete or unsupported model outcome: {reason}; no tools were executed"
+                )));
+            }
+        }
         completion.timing = timing;
         Ok(completion)
     }
+}
+
+/// Do not download an entire error page, or lose interruption while reading it.
+async fn error_snippet(
+    response: reqwest::Response,
+    cancel: &CancellationToken,
+) -> Result<String, Attempt> {
+    let mut stream = response.bytes_stream();
+    let mut kept = Vec::new();
+    while kept.len() < MAX_ERROR_BYTES {
+        let next = tokio::select! {
+            next = tokio::time::timeout(IDLE_TIMEOUT, stream.next()) => next,
+            () = cancel.cancelled() => return Err(Attempt::Cancelled),
+        };
+        let Ok(Some(Ok(bytes))) = next else {
+            break;
+        };
+        let room = MAX_ERROR_BYTES - kept.len();
+        kept.extend_from_slice(&bytes[..bytes.len().min(room)]);
+    }
+    Ok(String::from_utf8_lossy(&kept).chars().take(500).collect())
 }
 
 /// Applies one SSE payload; returns true on `[DONE]`.
@@ -291,7 +395,17 @@ enum Attempt {
     /// 400/422: the request itself was refused (maybe an unsupported field).
     Rejected(String),
     Retryable(String),
+    /// 429/503, with the server's `Retry-After` when it sent one.
+    Throttled(String, Option<Duration>),
     Fatal(String),
+}
+
+/// `Retry-After` in seconds (the HTTP-date form is rare from model APIs and
+/// falls back to the backoff).
+fn parse_retry_after(value: &str) -> Option<Duration> {
+    let seconds: f64 = value.trim().parse().ok()?;
+    (seconds.is_finite() && seconds >= 0.0)
+        .then(|| Duration::from_secs_f64(seconds.min(MAX_RETRY_WAIT.as_secs_f64())))
 }
 
 /// What the endpoint says about a model's size limits.
@@ -327,3 +441,6 @@ pub fn model_limits_from_listing(listing: &serde_json::Value, model: &str) -> Op
 #[cfg(test)]
 #[path = "limits_tests.rs"]
 mod limits_tests;
+
+#[cfg(test)]
+mod http_tests;

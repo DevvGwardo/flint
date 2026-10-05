@@ -6,11 +6,11 @@ use std::time::Duration;
 use flint_agent::TurnEndReason;
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::*;
-use gpui_kit::component::text::TextView;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use crate::app::FlintApp;
+use crate::subagent_ui::Conversation;
 use crate::theme::palette;
 use crate::theme::size;
 use crate::turns::TurnInfo;
@@ -21,8 +21,14 @@ use crate::view_model::SessionView;
 /// Files listed in the card before "and N more".
 const CARD_FILES: usize = 4;
 
-pub fn worked_line(ix: usize, turn: &TurnInfo, cx: &mut Context<FlintApp>) -> impl IntoElement {
+pub fn worked_line(
+    target: &Conversation,
+    ix: usize,
+    turn: &TurnInfo,
+    cx: &mut Context<FlintApp>,
+) -> impl IntoElement {
     let p = palette();
+    let target = target.clone();
     let mut extras = Vec::new();
     if turn.nudges > 0 {
         extras.push(format!(
@@ -33,11 +39,17 @@ pub fn worked_line(ix: usize, turn: &TurnInfo, cx: &mut Context<FlintApp>) -> im
     }
     div()
         .id(("worked", ix))
+        .role(gpui_kit::Role::Button)
+        .aria_label(format!(
+            "{} work for turn {}",
+            if turn.expanded { "Hide" } else { "Show" },
+            ix + 1
+        ))
         .flex()
         .items_center()
         .gap(px(10.))
         .cursor_pointer()
-        .on_click(cx.listener(move |this, _, _, cx| this.toggle_work(ix, cx)))
+        .on_click(cx.listener(move |this, _, _, cx| this.toggle_conversation_work(&target, ix, cx)))
         .child(
             div()
                 .flex()
@@ -71,20 +83,33 @@ pub fn worked_line(ix: usize, turn: &TurnInfo, cx: &mut Context<FlintApp>) -> im
         .test_support()
 }
 
-pub fn answer(ix: usize, item: &Item) -> AnyElement {
+pub fn answer(
+    ix: usize,
+    item: &Item,
+    workspace: &std::path::Path,
+    cx: &mut Context<FlintApp>,
+) -> AnyElement {
     let Item::Assistant { text, .. } = item else {
         return div().into_any_element();
     };
     div()
+        .id(("answer", ix))
         .w_full()
         .text_size(px(size::PROSE))
         .line_height(px(24.))
         .text_color(palette().text)
-        .child(TextView::markdown(("md", ix), text.clone()).selectable(true))
+        .child(crate::file_preview::markdown(
+            ("md", ix),
+            text.clone(),
+            workspace.to_path_buf(),
+            cx,
+        ))
+        .test_support()
         .into_any_element()
 }
 
 pub fn summary(
+    target: &Conversation,
     ix: usize,
     item: &Item,
     turn: &TurnInfo,
@@ -113,6 +138,7 @@ pub fn summary(
         let rows = turn.files.iter().take(CARD_FILES).map(|path| {
             let stats = view.changes.iter().find(|f| &f.path == path);
             let path_owned = path.clone();
+            let owner = target.parent;
             div()
                 .id(SharedString::from(format!("card-file-{ix}-{path}")))
                 .px(px(16.))
@@ -122,7 +148,10 @@ pub fn summary(
                 .gap(px(10.))
                 .cursor_pointer()
                 .hover(|style| style.bg(p.raised))
-                .on_click(cx.listener(move |this, _, _, cx| {
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    if let Some(ix) = this.session_index(owner) {
+                        this.select_session_with_focus(ix, false, window, cx);
+                    }
                     this.review(Some(path_owned.clone()), cx);
                 }))
                 .child(ui::icon(file_icon(path), 15., p.text_muted))
@@ -137,6 +166,7 @@ pub fn summary(
                         .child(ui::mono(format!("−{}", f.removed), size::XS, p.danger))
                 })
         });
+        let owner = target.parent;
         div()
             .w_full()
             .rounded(px(14.))
@@ -169,7 +199,10 @@ pub fn summary(
                                 Button::new(("review", ix))
                                     .outline()
                                     .label("Review")
-                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        if let Some(ix) = this.session_index(owner) {
+                                            this.select_session_with_focus(ix, false, window, cx);
+                                        }
                                         this.review(first.clone(), cx);
                                     })),
                             )
@@ -200,6 +233,9 @@ pub fn summary(
             ))
             .tooltip(tip)
     };
+    let copy_target = target.clone();
+    let up_target = target.clone();
+    let down_target = target.clone();
     let actions = div()
         .flex()
         .items_center()
@@ -222,7 +258,7 @@ pub fn summary(
                     )
                     .on_click(cx.listener(move |this, _, _, cx| {
                         if let Some(text) = &answer_text {
-                            this.copy_answer(ix, text.clone(), cx);
+                            this.copy_conversation_answer(&copy_target, ix, text.clone(), cx);
                         }
                     })),
                 )
@@ -238,7 +274,9 @@ pub fn summary(
                 turn.feedback == Some(true),
                 "Good response (kept on this device only)",
             )
-            .on_click(cx.listener(move |this, _, _, cx| this.feedback(ix, true, cx))),
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.conversation_feedback(&up_target, ix, true, cx)
+            })),
         )
         .child(
             action(
@@ -247,7 +285,9 @@ pub fn summary(
                 turn.feedback == Some(false),
                 "Bad response (kept on this device only)",
             )
-            .on_click(cx.listener(move |this, _, _, cx| this.feedback(ix, false, cx))),
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.conversation_feedback(&down_target, ix, false, cx)
+            })),
         )
         .child(ui::label(
             format!(

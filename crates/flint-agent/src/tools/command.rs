@@ -27,12 +27,15 @@ const CAPTURE_TAIL_BYTES: usize = 32 * 1024;
 /// Live output forwarded to the front end per command. Past this the stream
 /// pauses (one notice) and the final result shows the head and tail.
 const STREAM_LIMIT_BYTES: usize = 256 * 1024;
+/// Backpressure prevents fast writers from allocating an unbounded queue.
+const OUTPUT_QUEUE_CHUNKS: usize = 32;
 /// How long to keep reading after the shell exits.
 const DRAIN_AFTER_EXIT: Duration = Duration::from_millis(300);
 
 pub(super) async fn run_command(
     workspace: &Path,
     args: &Map<String, Value>,
+    sandbox: Option<&str>,
     on_output: &(dyn Fn(String) + Send + Sync),
     cancel: &CancellationToken,
 ) -> ToolOutcome {
@@ -45,7 +48,14 @@ pub(super) async fn run_command(
             .clamp(1, MAX_TIMEOUT_SECS),
     );
 
-    let mut cmd = Command::new("sh");
+    let mut cmd = match sandbox {
+        Some(profile) => {
+            let mut cmd = Command::new(super::sandbox::SANDBOX_EXEC);
+            cmd.arg("-p").arg(profile).arg("sh");
+            cmd
+        }
+        None => Command::new("sh"),
+    };
     cmd.arg("-c")
         .arg(command)
         .current_dir(workspace)
@@ -63,12 +73,13 @@ pub(super) async fn run_command(
         Err(err) => return ToolOutcome::error(format!("failed to start command: {err}")),
     };
     let pid = child.id();
-    let (tx, rx) = async_channel::unbounded::<Vec<u8>>();
+    let (tx, rx) = async_channel::bounded::<Vec<u8>>(OUTPUT_QUEUE_CHUNKS);
+    let mut pumps = Vec::with_capacity(2);
     if let Some(stdout) = child.stdout.take() {
-        tokio::spawn(pump(stdout, tx.clone()));
+        pumps.push(tokio::spawn(pump(stdout, tx.clone())));
     }
     if let Some(stderr) = child.stderr.take() {
-        tokio::spawn(pump(stderr, tx.clone()));
+        pumps.push(tokio::spawn(pump(stderr, tx.clone())));
     }
     drop(tx);
 
@@ -76,6 +87,7 @@ pub(super) async fn run_command(
     let mut streamed = 0usize;
     let mut ended = None;
     let mut status = None;
+    let mut pipes_closed = false;
     let deadline = tokio::time::sleep(timeout);
     tokio::pin!(deadline);
     // After the shell exits, a background child may still hold the pipes
@@ -83,8 +95,11 @@ pub(super) async fn run_command(
     let drain = tokio::time::sleep(Duration::from_secs(365 * 24 * 3600));
     tokio::pin!(drain);
     loop {
+        if pipes_closed && status.is_some() {
+            break;
+        }
         tokio::select! {
-            chunk = rx.recv() => match chunk {
+            chunk = rx.recv(), if !pipes_closed => match chunk {
                 Ok(bytes) => {
                     if streamed < STREAM_LIMIT_BYTES {
                         streamed += bytes.len();
@@ -95,8 +110,9 @@ pub(super) async fn run_command(
                     }
                     captured.push(&bytes);
                 }
-                // Both pipes closed: the process (group) is done writing.
-                Err(_) => break,
+                // Closing the pipes does not mean the process has exited.
+                // Keep its wait inside the timeout/cancellation select.
+                Err(_) => pipes_closed = true,
             },
             exited = child.wait(), if status.is_none() => {
                 status = Some(exited.ok());
@@ -113,6 +129,11 @@ pub(super) async fn run_command(
             }
         }
     }
+    // Descendants may still hold pipes open after the drain window. Do not
+    // leave detached readers waiting for those descendants to exit.
+    for pump in pumps {
+        pump.abort();
+    }
     if ended.is_some() {
         kill_group(pid);
         let _ = child.kill().await;
@@ -127,6 +148,13 @@ pub(super) async fn run_command(
     };
     let mut output = captured.model_text(MODEL_OUTPUT_CHARS);
     if !output.is_empty() {
+        output.push('\n');
+    }
+    if sandbox.is_some()
+        && exit_code != Some(0)
+        && let Some(hint) = super::sandbox::denial_hint(&output)
+    {
+        output.push_str(hint);
         output.push('\n');
     }
     match (&ended, exit_code) {
@@ -180,8 +208,18 @@ pub fn head_tail(text: &str, max: usize) -> String {
     }
     let head_len = max * 2 / 5;
     let tail_len = max - head_len;
-    let head: String = text.chars().take(head_len).collect();
-    let tail: String = text.chars().skip(total - tail_len).collect();
+    let head_end = text
+        .char_indices()
+        .nth(head_len)
+        .map_or(text.len(), |(ix, _)| ix);
+    let tail_start = text
+        .char_indices()
+        .rev()
+        .take(tail_len)
+        .last()
+        .map_or(text.len(), |(ix, _)| ix);
+    let head = &text[..head_end];
+    let tail = &text[tail_start..];
     let omitted = total - head_len - tail_len;
     format!("{head}\n… [{omitted} characters omitted] …\n{tail}")
 }
@@ -231,5 +269,31 @@ impl Capture {
             .collect();
         let omitted = self.total - head.len() - tail.len();
         format!("{head}\n… [{omitted} bytes omitted] …\n{tail}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn output_pump_applies_backpressure_and_preserves_every_byte() {
+        let (tx, rx) = async_channel::bounded(OUTPUT_QUEUE_CHUNKS);
+        let size = 8192 * (OUTPUT_QUEUE_CHUNKS + 10);
+        let task = tokio::spawn(async move {
+            let bytes = vec![b'x'; size];
+            pump(bytes.as_slice(), tx).await;
+        });
+        // The producer runs until the queue fills, then yields on send.
+        tokio::task::yield_now().await;
+        assert_eq!(rx.len(), OUTPUT_QUEUE_CHUNKS);
+        assert!(!task.is_finished());
+        let mut received = 0;
+        while let Ok(bytes) = rx.recv().await {
+            assert!(bytes.iter().all(|byte| *byte == b'x'));
+            received += bytes.len();
+        }
+        task.await.expect("pump");
+        assert_eq!(received, size);
     }
 }

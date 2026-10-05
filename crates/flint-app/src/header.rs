@@ -7,7 +7,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use crate::app::FlintApp;
-use crate::session::folder_name;
+use crate::session::Bucket;
 use crate::theme::palette;
 use crate::theme::size;
 use crate::ui;
@@ -24,6 +24,7 @@ pub fn render(app: &FlintApp, window: &mut Window, cx: &mut Context<FlintApp>) -
     let icon_button = |id: &'static str, icon: IconName, tip: &'static str, active: bool| {
         div()
             .id(id)
+            .role(gpui_kit::Role::Button)
             .aria_label(tip)
             .tab_index(0)
             .focus_visible(|style| style.border_1().border_color(p.accent))
@@ -65,6 +66,7 @@ pub fn render(app: &FlintApp, window: &mut Window, cx: &mut Context<FlintApp>) -
                     .truncate()
                     .text_size(px(size::BASE))
                     .font_weight(FontWeight::MEDIUM)
+                    .text_color(ui::tinted(p.text, session.color_seed()))
                     .tooltip(move |window, cx| Tooltip::new(full_title.clone()).build(window, cx))
                     .child(session.title())
                     .test_support(),
@@ -72,7 +74,7 @@ pub fn render(app: &FlintApp, window: &mut Window, cx: &mut Context<FlintApp>) -
         })
         .when(!compact, |row| {
             row.child(div().flex_shrink_0().child(ui::label(
-                folder_name(&session.workspace),
+                session.workspace_label(),
                 size::SM,
                 p.text_subtle,
             )))
@@ -149,10 +151,31 @@ pub fn render(app: &FlintApp, window: &mut Window, cx: &mut Context<FlintApp>) -
         .gap(px(12.))
         .child(crate::docking::handle(crate::docking::Panel::Chat, cx))
         .when(!app.sidebar_visible, |bar| {
+            // Other sessions that need you or are working, so a hidden
+            // sidebar never hides them.
+            let (waiting, working) = app
+                .sessions
+                .iter()
+                .enumerate()
+                .filter(|&(ix, _)| ix != app.active)
+                .fold((0, 0), |(n, w), (_, session)| {
+                    match session.status().bucket() {
+                        Bucket::NeedsYou => (n + 1, w),
+                        Bucket::Working => (n, w + 1),
+                        Bucket::Ready | Bucket::Inactive => (n, w),
+                    }
+                });
+            let label = match (waiting, working) {
+                (0, 0) => "Open sessions".to_string(),
+                (0, w) => format!("Open sessions, {w} working"),
+                (n, 0) => format!("Open sessions, {n} need you"),
+                (n, w) => format!("Open sessions, {n} need you, {w} working"),
+            };
             bar.child(
                 div()
                     .id("sessions-control")
-                    .aria_label("Open sessions")
+                    .role(gpui_kit::Role::Button)
+                    .aria_label(label)
                     .tab_index(0)
                     .focus_visible(|style| style.border_1().border_color(p.accent))
                     .px(px(9.))
@@ -164,10 +187,34 @@ pub fn render(app: &FlintApp, window: &mut Window, cx: &mut Context<FlintApp>) -
                     .gap(px(5.))
                     .hover(|style| style.bg(p.raised))
                     .on_click(cx.listener(|this, _, window, cx| {
-                        this.toggle_session_drawer(window, cx);
+                        this.open_sessions(window, cx);
                     }))
                     .child(ui::icon(IconName::PanelLeft, 16., p.text_muted))
                     .child(ui::label("Sessions", size::SM, p.text))
+                    .when(waiting > 0, |control| {
+                        control.child(
+                            div()
+                                .id("sessions-waiting")
+                                .flex()
+                                .items_center()
+                                .gap(px(3.))
+                                .child(ui::icon(IconName::CircleAlert, 12., p.warning))
+                                .child(ui::label(waiting.to_string(), size::XS, p.warning))
+                                .test_support(),
+                        )
+                    })
+                    .when(working > 0, |control| {
+                        control.child(
+                            div()
+                                .id("sessions-working")
+                                .flex()
+                                .items_center()
+                                .gap(px(3.))
+                                .child(ui::spinner(app.now(), 12., p.accent))
+                                .child(ui::label(working.to_string(), size::XS, p.accent))
+                                .test_support(),
+                        )
+                    })
                     .test_support(),
             )
         })

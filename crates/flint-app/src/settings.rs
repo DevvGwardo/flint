@@ -15,6 +15,12 @@ use serde::Serialize;
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
+    /// Last agent explicitly selected, used for the fresh session on launch.
+    pub default_agent: flint_agent::AgentKind,
+    /// Confirmed model/provider selections, scoped to the ACP agent. Permission
+    /// modes are deliberately not inherited by a new conversation.
+    pub agent_options:
+        std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>>,
     pub model: String,
     /// Empty inherits the parent model. Uses the same endpoint and key.
     pub subagent_model: String,
@@ -37,11 +43,32 @@ pub struct Settings {
     pub terminal_open: bool,
     /// The terminal dock's height in pixels.
     pub terminal_height: f32,
+    /// How the sidebar groups sessions: `project`, `status` or `agent`.
+    pub session_grouping: String,
+    /// Sandbox the agent's shell commands: they may only write inside the
+    /// workspace, temp directories and build caches (macOS).
+    pub sandbox: bool,
+    /// MCP servers whose tools flint's agent may use, by name:
+    /// `[mcp_servers.github] command = "…" args = […] env = { … }`.
+    pub mcp_servers: std::collections::BTreeMap<String, McpServer>,
+}
+
+/// One `[mcp_servers.<name>]` entry.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct McpServer {
+    pub command: String,
+    pub args: Vec<String>,
+    pub env: std::collections::BTreeMap<String, String>,
+    /// `false` keeps the entry but doesn't start it.
+    pub enabled: Option<bool>,
 }
 
 impl Default for Settings {
     fn default() -> Self {
         Self {
+            default_agent: flint_agent::AgentKind::Flint,
+            agent_options: Default::default(),
             model: DEFAULT_MODEL.to_string(),
             subagent_model: String::new(),
             base_url: DEFAULT_BASE_URL.to_string(),
@@ -56,6 +83,9 @@ impl Default for Settings {
             tip_dismissed: false,
             terminal_open: false,
             terminal_height: crate::term_panel::DEFAULT_HEIGHT,
+            session_grouping: "project".to_string(),
+            sandbox: true,
+            mcp_servers: std::collections::BTreeMap::new(),
         }
     }
 }
@@ -75,6 +105,16 @@ pub fn home() -> PathBuf {
 }
 
 impl Settings {
+    pub fn agent_options(
+        &self,
+        agent: flint_agent::AgentKind,
+    ) -> std::collections::BTreeMap<String, String> {
+        self.agent_options
+            .get(agent_key(agent))
+            .cloned()
+            .unwrap_or_default()
+    }
+
     pub fn path(home: &Path) -> PathBuf {
         home.join("config.toml")
     }
@@ -121,6 +161,26 @@ impl Settings {
         Ok(())
     }
 
+    /// The enabled MCP servers, for the engine.
+    pub fn mcp_server_configs(&self) -> Vec<flint_agent::McpServerConfig> {
+        self.mcp_servers
+            .iter()
+            .filter(|(_, server)| {
+                server.enabled != Some(false) && !server.command.trim().is_empty()
+            })
+            .map(|(name, server)| flint_agent::McpServerConfig {
+                name: name.clone(),
+                command: expand_home(server.command.trim()).display().to_string(),
+                args: server.args.clone(),
+                env: server
+                    .env
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect(),
+            })
+            .collect()
+    }
+
     pub fn approval_mode(&self) -> ApprovalMode {
         match self.approval.as_str() {
             "auto" => ApprovalMode::Auto,
@@ -153,11 +213,20 @@ impl Settings {
     }
 }
 
+pub(crate) fn agent_key(agent: flint_agent::AgentKind) -> &'static str {
+    match agent {
+        flint_agent::AgentKind::Flint => "flint",
+        flint_agent::AgentKind::ClaudeCode => "claude_code",
+        flint_agent::AgentKind::Codex => "codex",
+        flint_agent::AgentKind::Droid => "droid",
+    }
+}
+
 const LEGACY_BASE_URL: &str = "http://127.0.0.1:18433/v1";
 const LEGACY_MODEL: &str = "deepseek-v4.1-flash";
 
-/// Where API keys may come from besides the settings: environment variables
-/// and the key file of early installs. The app takes this as a parameter so
+/// Where API keys may come from besides the settings: environment variables,
+/// a private TypeSafe key file, and the key file of early installs. The app takes this as a parameter so
 /// tests can run without the developer's environment or home directory.
 #[derive(Debug, Clone)]
 pub struct KeySources {
@@ -178,14 +247,16 @@ impl KeySources {
 }
 
 impl Default for KeySources {
-    /// The process environment and `~/.fx/surplus.key`.
+    /// The process environment, `$FLINT_HOME/keys/typesafe.key` for the optional
+    /// judge when its environment key is absent, and `~/.fx/surplus.key`.
     fn default() -> Self {
         Self {
             env: |name| {
-                std::env::var(name)
-                    .ok()
-                    .map(|v| v.trim().to_string())
-                    .filter(|v| !v.is_empty())
+                key_with_typesafe_fallback(
+                    name,
+                    std::env::var(name).ok(),
+                    &flint_home().join("keys").join("typesafe.key"),
+                )
             },
             legacy_key_file: Some(home().join(".fx").join("surplus.key")),
         }
@@ -210,6 +281,21 @@ pub struct ResolvedKey {
 fn read_key_file(path: &Path) -> Option<String> {
     let key = std::fs::read_to_string(path).ok()?;
     Some(key.trim().to_string()).filter(|key| !key.is_empty())
+}
+
+fn key_with_typesafe_fallback(
+    name: &str,
+    environment: Option<String>,
+    typesafe_file: &Path,
+) -> Option<String> {
+    environment
+        .map(|key| key.trim().to_string())
+        .filter(|key| !key.is_empty())
+        .or_else(|| {
+            (name == "TYPESAFE_API_KEY")
+                .then(|| read_key_file(typesafe_file))
+                .flatten()
+        })
 }
 
 /// Expands a leading `~/` to the home directory.
@@ -285,8 +371,8 @@ impl Settings {
     }
 }
 
-pub fn jev_key_set() -> bool {
-    std::env::var("TYPESAFE_API_KEY").is_ok_and(|key| !key.trim().is_empty())
+pub fn jev_key_set(sources: &KeySources) -> bool {
+    (sources.env)("TYPESAFE_API_KEY").is_some_and(|key| !key.trim().is_empty())
 }
 
 /// `~/…` for paths under the home directory.

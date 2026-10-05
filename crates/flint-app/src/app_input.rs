@@ -2,6 +2,7 @@
 //! menu, and the keys that drive them and the pinned approval card.
 
 use flint_agent::ApprovalDecision;
+use gpui_kit::component::input::TextareaState;
 use gpui_kit::*;
 use std::path::Path;
 use std::path::PathBuf;
@@ -24,6 +25,18 @@ pub struct SlashMenu {
     pub selected: usize,
 }
 
+fn composer_query_value(state: &TextareaState) -> SharedString {
+    state.value()
+}
+
+pub(crate) fn composer_has_text(state: &TextareaState) -> bool {
+    state.text().chunks().any(|chunk| !chunk.trim().is_empty())
+}
+
+fn composer_is_empty(state: &TextareaState) -> bool {
+    state.text().len() == 0
+}
+
 impl FlintApp {
     pub(crate) fn composer_text(&self, cx: &App) -> String {
         self.composer.read(cx).value().to_string()
@@ -31,7 +44,10 @@ impl FlintApp {
 
     /// Opens or updates the `@` picker and `/` menu as the user types.
     pub(crate) fn composer_changed(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
-        let text = self.composer_text(cx);
+        let text = composer_query_value(self.composer.read(cx));
+        if slash::active_query(&text).is_some() || mention::active_query(&text).is_some() {
+            self.queue_popover = false;
+        }
         match slash::active_query(&text) {
             Some(query) => {
                 let count = slash::matches(query).len();
@@ -47,7 +63,7 @@ impl FlintApp {
         match mention::active_query(&text) {
             Some(query) => {
                 let query = query.to_string();
-                self.update_mention(query, true);
+                self.update_mention(query, true, cx);
             }
             None if self.mention.as_ref().is_some_and(|m| m.inline) => self.mention = None,
             None => {}
@@ -55,12 +71,13 @@ impl FlintApp {
         cx.notify();
     }
 
-    fn update_mention(&mut self, query: String, inline: bool) {
+    fn update_mention(&mut self, query: String, inline: bool, cx: &mut Context<Self>) {
         let workspace = self.session().workspace.clone();
         let files = self
             .file_index
-            .entry(workspace.clone())
-            .or_insert_with(|| mention::index_files(&workspace));
+            .get(&workspace)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
         let results: Vec<String> = mention::search(files, &query)
             .into_iter()
             .cloned()
@@ -80,11 +97,42 @@ impl FlintApp {
             selected,
             inline,
         });
+        if !self.file_index.contains_key(&workspace)
+            && self
+                .file_index_task
+                .as_ref()
+                .is_none_or(|(pending, _)| pending != &workspace)
+        {
+            let source = workspace.clone();
+            let indexing = cx
+                .background_executor()
+                .spawn(async move { mention::index_files(&source) });
+            let destination = workspace.clone();
+            let task = cx.spawn(async move |this, cx| {
+                let files = indexing.await;
+                this.update(cx, |app, cx| {
+                    app.file_index.insert(destination.clone(), files);
+                    // A result belongs to its workspace, never to whatever
+                    // picker/session happens to be active when it finishes.
+                    if app.session().workspace == destination
+                        && let Some(menu) = app.mention.as_ref()
+                    {
+                        let query = menu.query.clone();
+                        let inline = menu.inline;
+                        app.update_mention(query, inline, cx);
+                        cx.notify();
+                    }
+                })
+                .ok();
+            });
+            self.file_index_task = Some((workspace, task));
+        }
     }
 
     /// The "+" button: the same picker, without typing `@`.
     pub fn open_mention_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.update_mention(String::new(), false);
+        self.queue_popover = false;
+        self.update_mention(String::new(), false, cx);
         self.composer
             .update(cx, |state, cx| state.focus(window, cx));
         cx.notify();
@@ -121,6 +169,8 @@ impl FlintApp {
     /// Attach up to four images from any folder. The bytes are checked again
     /// when sending, so a changed or missing file cannot silently disappear.
     pub fn open_image_picker(&mut self, cx: &mut Context<Self>) {
+        let uid = self.session().uid;
+        let workspace = self.session().workspace.clone();
         let paths = cx.prompt_for_paths(PathPromptOptions {
             files: true,
             directories: false,
@@ -132,6 +182,9 @@ impl FlintApp {
                 return;
             };
             this.update(cx, |app, cx| {
+                if app.session().uid != uid || app.session().workspace != workspace {
+                    return;
+                }
                 for path in paths {
                     app.add_image_attachment(path);
                 }
@@ -269,13 +322,14 @@ impl FlintApp {
             },
             SlashCommand::Approval => self.toggle_approval(cx),
             SlashCommand::Review => self.review(None, cx),
+            SlashCommand::Undo => self.undo_last_turn(cx),
             SlashCommand::Help => self.help_open = true,
         }
         cx.notify();
     }
 
     pub(crate) fn run_selected_slash(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let text = self.composer_text(cx);
+        let text = composer_query_value(self.composer.read(cx));
         let selected = self.slash.as_ref().map_or(0, |m| m.selected);
         let command = slash::active_query(&text)
             .and_then(|query| slash::matches(query).get(selected).map(|(c, _, _)| *c));
@@ -353,8 +407,8 @@ impl FlintApp {
             cx.notify();
             return true;
         }
-        if self.session().view.pending_approval().is_some() {
-            let empty = self.composer.read(cx).value().is_empty();
+        if self.session().view.has_pending_approval() {
+            let empty = composer_is_empty(self.composer.read(cx));
             let decision = match (
                 key.key.as_str(),
                 key.modifiers.platform,
@@ -375,3 +429,7 @@ impl FlintApp {
         false
     }
 }
+
+#[cfg(test)]
+#[path = "app_input_tests.rs"]
+mod tests;

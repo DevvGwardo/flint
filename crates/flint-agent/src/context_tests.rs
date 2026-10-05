@@ -186,3 +186,52 @@ fn large_recent_turns_do_not_recompact_every_turn() {
         .unwrap_or(usize::MAX);
     assert!(min_gap >= 2, "compactions at {compacted_at:?}");
 }
+
+#[test]
+fn dropped_turns_leave_a_summary_after_the_system_prompt() {
+    // Long requests can't be stubbed, so whole turns must go.
+    let wordy = |i: usize| {
+        let mut messages = turn(i, 10);
+        messages[0] = Message::User(format!("task {i} {}", "please ".repeat(600)));
+        messages
+    };
+    let tracker = ContextTracker::new(20_000, 0);
+    // Just over the trigger: a few turns go.
+    let mut history = vec![Message::System("sys".into())];
+    for i in 0..17 {
+        history.extend(wordy(i));
+    }
+    tracker.maybe_compact(&mut history).expect("compacted");
+    let Message::Summary(summary) = &history[1] else {
+        panic!("no summary: {:?}", history[1]);
+    };
+    assert!(summary.starts_with(SUMMARY_HEADER));
+    assert!(
+        summary.contains("- Asked: task 0 please please"),
+        "{summary}"
+    );
+    assert!(
+        summary.contains("… | Answered: answer 0 | Edited: f0.py"),
+        "{summary}"
+    );
+    assert!(summary.len() <= SUMMARY_MAX_CHARS);
+    assert!(matches!(history[2], Message::User(_)));
+    assert!(tracker.estimate(&history) <= 16_000);
+
+    // Later compactions extend the same summary, dropping its oldest entries.
+    for i in 17..120 {
+        history.extend(wordy(i));
+        tracker.maybe_compact(&mut history);
+    }
+    let summaries = history
+        .iter()
+        .filter(|m| matches!(m, Message::Summary(_)))
+        .count();
+    assert_eq!(summaries, 1);
+    let Message::Summary(summary) = &history[1] else {
+        panic!("summary moved");
+    };
+    assert!(summary.contains(SUMMARY_OMITTED));
+    assert!(!summary.contains("task 0 "));
+    assert!(summary.len() <= SUMMARY_MAX_CHARS);
+}

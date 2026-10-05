@@ -3,6 +3,7 @@
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::scroll::{Scrollbar, ScrollbarMode};
+use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
@@ -17,6 +18,7 @@ use crate::ui;
 fn panel() -> Div {
     let p = palette();
     div()
+        .block_mouse_except_scroll()
         .w_full()
         .rounded(px(14.))
         .border_1()
@@ -30,13 +32,32 @@ fn panel() -> Div {
 
 fn header(title: &str, hint: &str) -> Div {
     let p = palette();
+    let full_hint = hint.to_string();
     div()
         .px(px(16.))
         .pb(px(6.))
+        .min_w_0()
         .flex()
+        .items_center()
+        .gap(px(12.))
         .justify_between()
-        .child(ui::label(title.to_string(), size::XS, p.text_subtle))
-        .child(ui::label(hint.to_string(), size::XS, p.text_subtle))
+        .child(
+            ui::label(title.to_string(), size::XS, p.text_subtle)
+                .id("menu-title")
+                .flex_1()
+                .min_w_0()
+                .truncate()
+                .test_support(),
+        )
+        .child(
+            ui::label(hint.to_string(), size::XS, p.text_subtle)
+                .id("menu-hint")
+                .flex_shrink_0()
+                .max_w(relative(0.65))
+                .truncate()
+                .tooltip(move |window, cx| Tooltip::new(full_hint.clone()).build(window, cx))
+                .test_support(),
+        )
 }
 
 fn item_row(id: impl Into<ElementId>, selected: bool) -> Stateful<Div> {
@@ -97,12 +118,25 @@ pub fn render(
         let rows = menu.results.iter().enumerate().map(|(n, path)| {
             let (dir, name) = path.rsplit_once('/').unwrap_or(("", path));
             let pick = path.clone();
+            let tip = path.clone();
             item_row(("mention-item", n), n == menu.selected)
+                .role(gpui_kit::Role::Button)
+                .aria_label(format!("Attach file {path}"))
+                .min_w_0()
+                .overflow_hidden()
+                .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
                 .on_click(cx.listener(move |this, _, window, cx| {
                     this.pick_mention(pick.clone(), window, cx)
                 }))
-                .child(ui::icon(file_icon(path), 15., p.text_muted))
-                .child(ui::mono(name.to_string(), size::SM, p.text))
+                .child(ui::icon(file_icon(path), 15., p.text_muted).flex_shrink_0())
+                .child(
+                    ui::mono(name.to_string(), size::SM, p.text)
+                        .id(("mention-name", n))
+                        .min_w_0()
+                        .max_w(relative(0.7))
+                        .truncate()
+                        .test_support(),
+                )
                 .child(
                     div()
                         .min_w_0()
@@ -115,6 +149,7 @@ pub fn render(
                 .test_support()
         });
         let empty = menu.results.is_empty();
+        let indexing = !app.file_index.contains_key(&app.session().workspace);
         let title = if menu.query.is_empty() {
             "Attach a file".to_string()
         } else {
@@ -127,7 +162,11 @@ pub fn render(
                 .child(scroll_rows(app, "mention-menu-rows", max_height, rows))
                 .when(empty, |panel| {
                     panel.child(div().px(px(16.)).py(px(8.)).child(ui::label(
-                        "No files match. Keep typing or press esc.",
+                        if indexing {
+                            "Indexing workspace files..."
+                        } else {
+                            "No files match. Keep typing or press esc."
+                        },
                         size::BASE - 1.,
                         p.text_muted,
                     )))

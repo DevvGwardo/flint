@@ -12,17 +12,27 @@ use gpui_kit::component::*;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
+use crate::app::ARCHIVE_PAGE;
 use crate::app::FlintApp;
 use crate::app::NewSession;
 use crate::app::OpenWorkspace;
+use crate::app::SESSION_PAGE;
 use crate::app::SessionFilter;
+use crate::app::SessionGrouping;
 use crate::app::ToggleSidebar;
 use crate::app::ToggleTerminal;
+use crate::project;
+use crate::session::Bucket;
 use crate::session::Status;
-use crate::session::folder_name;
+use crate::session::Tone;
+use crate::session_groups::GroupKey;
+use crate::session_groups::SessionGroups;
 use crate::theme::palette;
 use crate::theme::size;
 use crate::ui;
+
+/// Minimum content width for full filter names and footer controls.
+pub const MIN_WIDTH: f32 = 264.;
 
 fn white(alpha: f32) -> Hsla {
     hsla(0., 0., 1., alpha)
@@ -34,10 +44,10 @@ struct RowFocus {
 }
 
 #[derive(IntoElement)]
-struct ScrollableRow {
-    id: ElementId,
-    row: Stateful<Div>,
-    scroll: ScrollHandle,
+pub(crate) struct ScrollableRow {
+    pub(crate) id: ElementId,
+    pub(crate) row: Stateful<Div>,
+    pub(crate) scroll: ScrollHandle,
 }
 
 impl RenderOnce for ScrollableRow {
@@ -62,6 +72,7 @@ impl RenderOnce for ScrollableRow {
                     reveal_row(self.scroll, bounds, focused, window);
                 }
             })
+            .test_support()
     }
 }
 
@@ -110,6 +121,7 @@ pub fn render(app: &FlintApp, cx: &mut Context<FlintApp>) -> impl IntoElement {
             .child(
                 div()
                     .id("hide-sidebar")
+                    .role(gpui_kit::Role::Button)
                     .aria_label("Close sessions panel")
                     .tab_index(0)
                     .focus_visible(|style| style.border_1().border_color(p.accent))
@@ -167,21 +179,37 @@ pub fn render(app: &FlintApp, cx: &mut Context<FlintApp>) -> impl IntoElement {
                 .cleanable(true),
         );
 
-    // Group by workspace, most recently active first.
-    let mut ordered = app.visible_sessions(cx);
-    ordered.sort_by_key(|&ix| std::cmp::Reverse(app.sessions[ix].touched));
-    let mut groups: Vec<(std::path::PathBuf, Vec<usize>)> = Vec::new();
-    for ix in ordered {
-        let workspace = &app.sessions[ix].workspace;
-        match groups.iter_mut().find(|(w, _)| w == workspace) {
-            Some((_, rows)) => rows.push(ix),
-            None => groups.push((workspace.clone(), vec![ix])),
-        }
-    }
-    let mut list = Vec::new();
-    for (g, (workspace, rows)) in groups.into_iter().enumerate() {
-        let full_path = workspace.to_string_lossy().to_string();
-        let rows: Vec<_> = rows
+    // Headings per the chosen grouping. A heading counts "n of N" when
+    // search, the filter or paging hides some of its sessions.
+    let SessionGroups { groups, more } = app.session_groups(cx);
+    let mut list: Vec<AnyElement> = Vec::new();
+    for (g, group) in groups.into_iter().enumerate() {
+        let icon = match group.key {
+            GroupKey::Project(..) => ui::icon(IconName::Folder, 13., p.text_subtle),
+            GroupKey::Status(Bucket::NeedsYou) => ui::icon(IconName::ShieldAlert, 13., p.warning),
+            GroupKey::Status(Bucket::Working) => ui::icon(IconName::Loader, 13., p.accent),
+            GroupKey::Status(Bucket::Ready) => ui::icon(IconName::Check, 13., p.text_subtle),
+            GroupKey::Status(Bucket::Inactive) => ui::icon(IconName::Circle, 13., p.text_subtle),
+            GroupKey::Agent(_) => ui::icon(IconName::Bot, 13., p.text_subtle),
+        };
+        let shown = group.rows.len();
+        let total = group.total;
+        let tooltip = group.tooltip.clone();
+        // Project and agent headings say how many of theirs are working or
+        // waiting, so a busy group stands out even when scrolled past.
+        let (working, waiting) = if matches!(group.key, GroupKey::Status(_)) {
+            (0, 0)
+        } else {
+            group.rows.iter().fold((0, 0), |(w, n), &ix| {
+                match app.sessions[ix].status().bucket() {
+                    Bucket::Working => (w + 1, n),
+                    Bucket::NeedsYou => (w, n + 1),
+                    Bucket::Ready | Bucket::Inactive => (w, n),
+                }
+            })
+        };
+        let rows: Vec<_> = group
+            .rows
             .into_iter()
             .map(|ix| session_row(app, ix, cx))
             .collect();
@@ -199,7 +227,7 @@ pub fn render(app: &FlintApp, cx: &mut Context<FlintApp>) -> impl IntoElement {
                         .flex()
                         .items_center()
                         .gap(px(7.))
-                        .child(ui::icon(IconName::Folder, 13., p.text_subtle))
+                        .child(icon)
                         .child(
                             div()
                                 .id(("workspace-label", g))
@@ -209,14 +237,71 @@ pub fn render(app: &FlintApp, cx: &mut Context<FlintApp>) -> impl IntoElement {
                                 .text_size(px(size::SM))
                                 .font_weight(FontWeight::MEDIUM)
                                 .text_color(p.text_subtle)
-                                .tooltip(move |window, cx| {
-                                    Tooltip::new(full_path.clone()).build(window, cx)
+                                .when_some(tooltip, |label, tip| {
+                                    label.tooltip(move |window, cx| {
+                                        Tooltip::new(tip.clone()).build(window, cx)
+                                    })
                                 })
-                                .child(folder_name(&workspace))
+                                .child(group.label)
                                 .test_support(),
-                        ),
+                        )
+                        .when(waiting > 0, |header| {
+                            header.child(
+                                div()
+                                    .id(("group-waiting", g))
+                                    .flex_shrink_0()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(3.))
+                                    .tooltip(move |window, cx| {
+                                        Tooltip::new(format!("{waiting} need you"))
+                                            .build(window, cx)
+                                    })
+                                    .child(ui::icon(IconName::CircleAlert, 11., p.warning))
+                                    .child(ui::label(waiting.to_string(), size::XS, p.warning))
+                                    .test_support(),
+                            )
+                        })
+                        .when(working > 0, |header| {
+                            header.child(
+                                div()
+                                    .id(("group-working", g))
+                                    .flex_shrink_0()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(3.))
+                                    .tooltip(move |window, cx| {
+                                        Tooltip::new(format!("{working} working")).build(window, cx)
+                                    })
+                                    .child(ui::spinner(app.now(), 11., p.accent))
+                                    .child(ui::label(working.to_string(), size::XS, p.accent))
+                                    .test_support(),
+                            )
+                        })
+                        .when(shown < total, |header| {
+                            header.child(div().flex_shrink_0().child(ui::label(
+                                format!("{shown} of {total}"),
+                                size::XS,
+                                p.text_subtle,
+                            )))
+                        }),
                 )
-                .children(rows),
+                .children(rows)
+                .into_any_element(),
+        );
+    }
+    if more > 0 {
+        list.push(
+            show_more(
+                "show-more-sessions",
+                more.min(SESSION_PAGE),
+                more,
+                cx.listener(|this, _, _, cx| {
+                    this.session_limit += SESSION_PAGE;
+                    cx.notify();
+                }),
+            )
+            .into_any_element(),
         );
     }
     let empty = list.is_empty();
@@ -226,31 +311,109 @@ pub fn render(app: &FlintApp, cx: &mut Context<FlintApp>) -> impl IntoElement {
     } else {
         match app.filter {
             SessionFilter::All => "No sessions",
-            SessionFilter::Running => "No running sessions",
-            SessionFilter::Unread => "No unread sessions",
+            SessionFilter::Only(Bucket::NeedsYou) => "Nothing needs you",
+            SessionFilter::Only(Bucket::Working) => "No sessions working",
+            SessionFilter::Only(Bucket::Ready) => "No sessions ready",
+            SessionFilter::Only(Bucket::Inactive) => "No inactive sessions",
         }
     };
 
-    let filter_label = match app.filter {
-        SessionFilter::All => "All",
-        SessionFilter::Running => "Running",
-        SessionFilter::Unread => "Unread",
-    };
+    // Equal-width columns and bounded count slots keep live updates from
+    // moving filter targets or changing the list's available height.
+    let counts = app.bucket_counts(cx);
+    let chips: Vec<_> = [
+        SessionFilter::All,
+        SessionFilter::Only(Bucket::NeedsYou),
+        SessionFilter::Only(Bucket::Working),
+        SessionFilter::Only(Bucket::Ready),
+    ]
+    .into_iter()
+    .enumerate()
+    .map(|(ix, filter)| {
+        let label = match filter {
+            SessionFilter::All => "All",
+            SessionFilter::Only(bucket) => bucket.label(),
+        };
+        let count_color = match filter {
+            SessionFilter::Only(Bucket::NeedsYou) if counts.of(filter) > 0 => p.warning,
+            SessionFilter::Only(Bucket::Working) if counts.of(filter) > 0 => p.accent,
+            _ => p.text_subtle,
+        };
+        filter_chip(
+            ix,
+            label,
+            counts.of(filter),
+            filter == app.filter,
+            count_color,
+        )
+        .on_click(cx.listener(move |this, _, _, cx| this.set_filter(filter, cx)))
+        .test_support()
+    })
+    .collect();
+    let grouping = app.grouping;
+    let group_toggle = div()
+        .id("session-grouping")
+        .role(gpui_kit::Role::Button)
+        .aria_label(format!("Group by {}", grouping.label()))
+        .tab_index(0)
+        .focus_visible(|style| style.border_1().border_color(p.accent))
+        .tooltip(move |window, cx| {
+            Tooltip::new(format!(
+                "Grouped by {}  ⇧⌘G\nClick to group by {}",
+                grouping.label(),
+                grouping.next().label()
+            ))
+            .build(window, cx)
+        })
+        .w(px(98.))
+        .flex_shrink_0()
+        .h(px(24.))
+        .px(px(8.))
+        .rounded(px(6.))
+        .flex()
+        .items_center()
+        .gap(px(5.))
+        .cursor_pointer()
+        .hover(|style| style.bg(white(0.06)))
+        .on_click(cx.listener(|this, _, _, cx| this.set_grouping(this.grouping.next(), cx)))
+        .child(ui::icon(IconName::Layers, 13., p.text_subtle))
+        .child(div().min_w_0().truncate().child(ui::label(
+            grouping.label(),
+            size::XS,
+            p.text_subtle,
+        )))
+        .test_support();
+    let mut chips = chips.into_iter();
+    let first_filters = div().flex().gap(px(4.)).children(chips.by_ref().take(2));
+    let remaining_filters = div().flex().gap(px(4.)).children(chips);
+    let filters = div()
+        .id("session-filters")
+        .flex_shrink_0()
+        .mx(px(10.))
+        .mb(px(2.))
+        .flex()
+        .flex_col()
+        .gap(px(4.))
+        .child(first_filters)
+        .child(remaining_filters);
     let bottom = div()
         .flex_shrink_0()
         .py(px(8.))
         .border_t_1()
         .border_color(white(0.05))
         .child(
-            nav_row("filter", IconName::ListFilter, "Filter sessions", None)
-                .on_click(cx.listener(|this, _, _, cx| this.cycle_filter(cx)))
-                .child(ui::label(filter_label, size::XS, p.text_subtle))
-                .test_support(),
-        )
-        .child(
-            nav_row("settings", IconName::Settings, "Settings", Some("⌘,"))
-                .on_click(cx.listener(|this, _, window, cx| this.open_settings(window, cx)))
-                .test_support(),
+            div()
+                .flex()
+                .items_center()
+                .pr(px(8.))
+                .child(
+                    nav_row("settings", IconName::Settings, "Settings", Some("⌘,"))
+                        .flex_1()
+                        .min_w_0()
+                        .on_click(cx.listener(|this, _, window, cx| this.open_settings(window, cx)))
+                        .test_support(),
+                )
+                .child(group_toggle),
         );
 
     div()
@@ -260,7 +423,11 @@ pub fn render(app: &FlintApp, cx: &mut Context<FlintApp>) -> impl IntoElement {
         .flex()
         .flex_col()
         .rounded(px(14.))
-        .bg(p.sidebar_fill)
+        .bg(if app.session_drawer && !app.sidebar_visible {
+            p.chrome
+        } else {
+            p.sidebar_fill
+        })
         .border_1()
         .border_color(white(0.06))
         .overflow_hidden()
@@ -269,6 +436,7 @@ pub fn render(app: &FlintApp, cx: &mut Context<FlintApp>) -> impl IntoElement {
         .child(open_folder)
         .child(terminal)
         .child(search)
+        .child(filters)
         .child(
             div()
                 .relative()
@@ -325,7 +493,7 @@ pub fn render(app: &FlintApp, cx: &mut Context<FlintApp>) -> impl IntoElement {
                     .border_t_1()
                     .border_color(white(0.05))
                     .child(div().px(px(20.)).py(px(6.)).child(ui::label(
-                        "Archived",
+                        format!("Archived · {}", app.archives.len()),
                         size::SM,
                         p.text_muted,
                     )))
@@ -335,24 +503,34 @@ pub fn render(app: &FlintApp, cx: &mut Context<FlintApp>) -> impl IntoElement {
                             .child(
                                 div()
                                     .id("archive-list")
-                                    .max_h(px(112.))
+                                    // The compact drawer loses the titlebar's height;
+                                    // keep that space available to current sessions.
+                                    .max_h(px(if app.session_drawer && !app.sidebar_visible {
+                                        76.
+                                    } else {
+                                        112.
+                                    }))
                                     .overflow_y_scroll()
                                     .track_scroll(&app.archive_scroll)
                                     .pr(px(12.))
-                                    .children(app.archives.iter().enumerate().map(
-                                        |(ix, (_, meta))| {
-                                            let title = meta
-                                                .title
-                                                .as_deref()
-                                                .unwrap_or("session")
-                                                .to_string();
-                                            let tip = format!(
-                                                "Restore {title}\n{}",
-                                                meta.workspace.display()
-                                            );
-                                            let row =
-                                                div()
+                                    .children(
+                                        app.archives
+                                            .iter()
+                                            .enumerate()
+                                            .take(app.archive_limit)
+                                            .map(|(ix, (_, meta))| {
+                                                let title = meta
+                                                    .title
+                                                    .as_deref()
+                                                    .unwrap_or("session")
+                                                    .to_string();
+                                                let tip = format!(
+                                                    "Restore {title}\n{}",
+                                                    meta.workspace.display()
+                                                );
+                                                let row = div()
                                                     .id(("restore-archive", ix))
+                                                    .role(gpui_kit::Role::Button)
                                                     .aria_label(format!("Restore {title}"))
                                                     .tab_index(0)
                                                     .focus_visible(|style| {
@@ -386,13 +564,27 @@ pub fn render(app: &FlintApp, cx: &mut Context<FlintApp>) -> impl IntoElement {
                                                         ),
                                                     )
                                                     .test_support();
-                                            ScrollableRow {
-                                                id: ("archive-scroll-row", ix).into(),
-                                                row: div().id(("archive-container", ix)).child(row),
-                                                scroll: app.archive_scroll.clone(),
-                                            }
-                                        },
-                                    ))
+                                                ScrollableRow {
+                                                    id: ("archive-scroll-row", ix).into(),
+                                                    row: div()
+                                                        .id(("archive-container", ix))
+                                                        .child(row),
+                                                    scroll: app.archive_scroll.clone(),
+                                                }
+                                            }),
+                                    )
+                                    .when(app.archives.len() > app.archive_limit, |list| {
+                                        let hidden = app.archives.len() - app.archive_limit;
+                                        list.child(show_more(
+                                            "show-more-archives",
+                                            hidden.min(ARCHIVE_PAGE),
+                                            hidden,
+                                            cx.listener(|this, _, _, cx| {
+                                                this.archive_limit += ARCHIVE_PAGE;
+                                                cx.notify();
+                                            }),
+                                        ))
+                                    })
                                     .test_support(),
                             )
                             .child(
@@ -407,6 +599,94 @@ pub fn render(app: &FlintApp, cx: &mut Context<FlintApp>) -> impl IntoElement {
         .test_support()
 }
 
+/// The row that reveals the next page of a long list.
+fn show_more(
+    id: &'static str,
+    next: usize,
+    hidden: usize,
+    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> impl IntoElement {
+    let p = palette();
+    div()
+        .id(id)
+        .role(gpui_kit::Role::Button)
+        .aria_label(format!("Show {next} more"))
+        .tab_index(0)
+        .focus_visible(|style| style.border_2().border_color(p.accent))
+        .mx(px(8.))
+        .mt(px(8.))
+        .px(px(12.))
+        .h(px(32.))
+        .rounded(px(8.))
+        .flex()
+        .items_center()
+        .justify_between()
+        .cursor_pointer()
+        .hover(|style| style.bg(white(0.05)))
+        .on_click(on_click)
+        .child(ui::label(
+            format!("Show {next} more"),
+            size::SM,
+            p.text_muted,
+        ))
+        .child(ui::label(
+            format!("{hidden} hidden"),
+            size::XS,
+            p.text_subtle,
+        ))
+        .test_support()
+}
+
+/// One choice in the filter strip, with how many sessions it would show.
+fn filter_chip(
+    ix: usize,
+    label: &'static str,
+    count: usize,
+    selected: bool,
+    count_color: Hsla,
+) -> Stateful<Div> {
+    let p = palette();
+    let empty = count == 0 && !selected;
+    div()
+        .id(("session-filter", ix))
+        .role(gpui_kit::Role::Button)
+        .aria_label(format!("{label}, {count}"))
+        // Empty chips stay clickable but out of the tab order.
+        .tab_index(if empty { -1 } else { 0 })
+        .focus_visible(|style| style.border_1().border_color(p.accent))
+        .flex_1()
+        .min_w_0()
+        .h(px(24.))
+        .px(px(8.))
+        .rounded(px(6.))
+        .flex()
+        .items_center()
+        .gap(px(5.))
+        .cursor_pointer()
+        .bg(white(if selected { 0.09 } else { 0. }))
+        .hover(|style| style.bg(white(0.06)))
+        .child(div().flex_1().min_w_0().truncate().child(ui::label(
+            label,
+            size::XS,
+            if selected { p.text } else { p.text_subtle },
+        )))
+        .child(
+            div()
+                .w(px(30.))
+                .flex_shrink_0()
+                .text_right()
+                .child(ui::label(
+                    if count > 999 {
+                        "999+".to_string()
+                    } else {
+                        count.to_string()
+                    },
+                    size::XS,
+                    count_color,
+                )),
+        )
+}
+
 fn nav_row(
     id: &'static str,
     icon: IconName,
@@ -416,6 +696,7 @@ fn nav_row(
     let p = palette();
     div()
         .id(id)
+        .role(gpui_kit::Role::Button)
         .aria_label(label)
         .tab_index(0)
         .focus_visible(|style| style.border_2().border_color(p.accent))
@@ -442,14 +723,32 @@ fn nav_row(
         })
 }
 
+/// A session's branch and token total, for the row's third line; `None` when
+/// it has neither.
+fn details_line(session: &crate::session::Session) -> Option<(Option<String>, Option<String>)> {
+    let branch = project::branch(&session.workspace);
+    let tokens = session.total_tokens();
+    let usage = (tokens > 0).then(|| format!("{} tokens", ui::tokens(tokens)));
+    (branch.is_some() || usage.is_some()).then_some((branch, usage))
+}
+
 fn session_row(app: &FlintApp, ix: usize, cx: &mut Context<FlintApp>) -> AnyElement {
     let p = palette();
     let session = &app.sessions[ix];
-    let active = ix == app.active;
+    let active = ix == app.active && session.selected_subagent.is_none();
     let status = session.status();
+    let now = app.now();
     let glyph: AnyElement = match status {
-        Status::Running => ui::spinner(app.now(), 13., p.accent).into_any_element(),
+        Status::Running => ui::spinner(now, 13., p.accent).into_any_element(),
+        Status::Starting => ui::spinner(now, 13., p.text_subtle).into_any_element(),
         Status::NeedsApproval => ui::icon(IconName::ShieldAlert, 13., p.warning).into_any_element(),
+        Status::Failed { seen } => ui::icon(
+            IconName::CircleX,
+            13.,
+            if seen { p.text_subtle } else { p.danger },
+        )
+        .into_any_element(),
+        Status::Stopped => ui::icon(IconName::CircleStop, 12., p.text_subtle).into_any_element(),
         Status::Unread => div()
             .size(px(7.))
             .rounded_full()
@@ -463,41 +762,45 @@ fn session_row(app: &FlintApp, ix: usize, cx: &mut Context<FlintApp>) -> AnyElem
             .border_color(p.text_subtle)
             .into_any_element(),
     };
-    let (subtitle, subtitle_color) = match status {
-        Status::NeedsApproval => ("Needs approval".to_string(), p.warning),
-        Status::Running => (
-            match session.view.running_commands().last() {
-                Some(call) => format!("Running {}", call.summary),
-                None => "Working…".to_string(),
-            },
-            p.text_subtle,
-        ),
-        Status::Unread | Status::Done => (
-            match session.view.turns.last() {
-                Some(turn) if !turn.files.is_empty() => {
-                    let n = turn.files.len();
-                    format!(
-                        "{n} file{} changed · +{} −{}",
-                        if n == 1 { "" } else { "s" },
-                        turn.added,
-                        turn.removed
-                    )
-                }
-                _ => "Answered".to_string(),
-            },
-            p.text_subtle,
-        ),
-        Status::Idle => ("Idle".to_string(), p.text_subtle),
+    let (subtitle, tone) = session.status_line(now);
+    let subtitle_color = match tone {
+        Tone::Muted => p.text_subtle,
+        Tone::Warning => p.warning,
+        Tone::Danger if matches!(status, Status::Failed { seen: true }) => p.text_subtle,
+        Tone::Danger => p.danger,
     };
     // ACP sessions carry their agent's name, e.g. "Claude Code · Answered".
     let subtitle = match session.agent {
         flint_agent::AgentKind::Flint => subtitle,
         agent => format!("{} · {subtitle}", agent.label()),
     };
-    let emphasized = active || matches!(status, Status::Unread | Status::NeedsApproval);
-    let ago = SystemTime::now()
-        .duration_since(session.touched)
-        .unwrap_or_default();
+    // Under another grouping the heading no longer says which project it is.
+    let subtitle = if app.grouping == SessionGrouping::Project {
+        subtitle
+    } else {
+        format!(
+            "{} · {subtitle}",
+            project::identity(&session.workspace).label()
+        )
+    };
+    let emphasized = active
+        || matches!(
+            status,
+            Status::Unread | Status::NeedsApproval | Status::Failed { seen: false }
+        );
+    // A running session shows how long its turn has taken; others, when
+    // they were last active.
+    let (when, when_color) = match session.running_for(now) {
+        Some(elapsed) => (crate::session::clock(elapsed), p.accent),
+        None => (
+            ui::ago(
+                SystemTime::now()
+                    .duration_since(session.touched)
+                    .unwrap_or_default(),
+            ),
+            p.text_subtle,
+        ),
+    };
     let renaming = app
         .renaming
         .as_ref()
@@ -531,10 +834,14 @@ fn session_row(app: &FlintApp, ix: usize, cx: &mut Context<FlintApp>) -> AnyElem
             .min_w_0()
             .truncate()
             .text_size(px(size::BASE))
-            .text_color(if emphasized { p.text } else { p.text_muted })
-            .when(status == Status::Unread, |t| {
-                t.font_weight(FontWeight::MEDIUM)
-            })
+            .text_color(ui::tinted(
+                if emphasized { p.text } else { p.text_muted },
+                session.color_seed(),
+            ))
+            .when(
+                matches!(status, Status::Unread | Status::Failed { seen: false }),
+                |t| t.font_weight(FontWeight::MEDIUM),
+            )
             .tooltip(move |window, cx| Tooltip::new(full_title.clone()).build(window, cx))
             .child(session.title())
             .test_support()
@@ -542,6 +849,7 @@ fn session_row(app: &FlintApp, ix: usize, cx: &mut Context<FlintApp>) -> AnyElem
     };
     let row = div()
         .id(("session", ix))
+        .role(gpui_kit::Role::Button)
         .aria_label(format!("Session: {}", session.title()))
         .tab_index(if is_renaming { -1 } else { 0 })
         .focus_visible(|style| style.border_2().border_color(p.accent))
@@ -589,30 +897,76 @@ fn session_row(app: &FlintApp, ix: usize, cx: &mut Context<FlintApp>) -> AnyElem
                         .flex()
                         .items_center()
                         .gap(px(8.))
-                        .child(title)
-                        .child(div().flex_shrink_0().child(ui::label(
-                            ui::ago(ago),
-                            size::XS,
-                            p.text_subtle,
-                        ))),
+                        .child(title),
                 )
                 .child(
                     div()
-                        .id(("sidebar-subtitle", ix))
                         .min_w_0()
-                        .truncate()
-                        .text_size(px(size::XS))
-                        .text_color(subtitle_color)
-                        .tooltip(move |window, cx| {
-                            Tooltip::new(full_subtitle.clone()).build(window, cx)
-                        })
-                        .child(subtitle)
-                        .test_support(),
-                ),
+                        .flex()
+                        .items_center()
+                        .gap(px(8.))
+                        .child(
+                            div()
+                                .id(("sidebar-subtitle", ix))
+                                .flex_1()
+                                .min_w_0()
+                                .truncate()
+                                .text_size(px(size::XS))
+                                .text_color(subtitle_color)
+                                .tooltip(move |window, cx| {
+                                    Tooltip::new(full_subtitle.clone()).build(window, cx)
+                                })
+                                .child(subtitle)
+                                .test_support(),
+                        )
+                        .child(
+                            div()
+                                .id(("sidebar-when", ix))
+                                .flex_shrink_0()
+                                .child(ui::label(when, size::XS, when_color))
+                                .test_support(),
+                        ),
+                )
+                .when_some(details_line(session), |col, (branch, usage)| {
+                    col.child(
+                        div()
+                            .id(("sidebar-details", ix))
+                            .min_w_0()
+                            .flex()
+                            .items_center()
+                            .gap(px(8.))
+                            .text_size(px(size::XS))
+                            .text_color(p.text_subtle)
+                            .when_some(branch, |line, branch| {
+                                line.child(
+                                    div()
+                                        .id(("sidebar-branch", ix))
+                                        .min_w_0()
+                                        .flex()
+                                        .items_center()
+                                        .gap(px(3.))
+                                        .child(ui::icon(IconName::GitBranch, 11., p.text_subtle))
+                                        .child(div().min_w_0().truncate().child(branch))
+                                        .test_support(),
+                                )
+                            })
+                            .when_some(usage, |line, usage| {
+                                line.child(
+                                    div()
+                                        .id(("sidebar-usage", ix))
+                                        .flex_shrink_0()
+                                        .child(usage)
+                                        .test_support(),
+                                )
+                            })
+                            .test_support(),
+                    )
+                }),
         )
         .child(
             div()
                 .id(("session-actions", ix))
+                .role(gpui_kit::Role::Button)
                 .aria_label(format!("Actions for {}", session.title()))
                 .tab_index(0)
                 .focus_visible(|style| style.border_1().border_color(p.accent))
@@ -638,9 +992,15 @@ fn session_row(app: &FlintApp, ix: usize, cx: &mut Context<FlintApp>) -> AnyElem
                 .test_support(),
         )
         .test_support();
+    let row = if is_renaming {
+        row
+    } else {
+        crate::session_workspace::drag_row(row, session.uid, session.title(), cx)
+    };
     let item = |id: &'static str, icon: IconName, label: &'static str, color: Hsla| {
         div()
             .id((id, ix))
+            .role(gpui_kit::Role::Button)
             .aria_label(label)
             .tab_index(0)
             .focus_visible(|style| style.border_2().border_color(p.accent))
@@ -686,12 +1046,10 @@ fn session_row(app: &FlintApp, ix: usize, cx: &mut Context<FlintApp>) -> AnyElem
                         item(
                             "delete-session",
                             IconName::Archive,
-                            if session.view.running && app.archive_confirm == Some(session.uid) {
-                                "Stop work first?"
-                            } else if session.stopping {
+                            if session.stopping {
                                 "Archive after engine saves"
                             } else {
-                                "Archive (Undo this run)"
+                                "Archive"
                             },
                             p.danger,
                         )
@@ -702,10 +1060,16 @@ fn session_row(app: &FlintApp, ix: usize, cx: &mut Context<FlintApp>) -> AnyElem
                     ),
             )
         });
-    ScrollableRow {
-        id: ("session-scroll-row", session.uid).into(),
-        row: container,
-        scroll: app.sidebar_scroll.clone(),
-    }
-    .into_any_element()
+    div()
+        .flex()
+        .flex_col()
+        .child(ScrollableRow {
+            id: ("session-scroll-row", session.uid).into(),
+            row: container,
+            scroll: app.sidebar_scroll.clone(),
+        })
+        .when(!session.view.subagents.is_empty(), |container| {
+            container.child(crate::subagent_ui::sidebar_children(app, session, cx))
+        })
+        .into_any_element()
 }

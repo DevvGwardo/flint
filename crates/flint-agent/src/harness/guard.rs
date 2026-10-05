@@ -1,12 +1,18 @@
 //! Per-turn guardrails for the agent loop. Deliberately simple rules:
 //!
-//! - Stuck: the same tool call (normalized args) three times, or the same
-//!   command failing twice in a row with identical output -> a nudge to step
+//! - Stuck: the same tool call (normalized args) three times, the same
+//!   command failing twice in a row with identical output, two different
+//!   commands in a row failing with identical output, or a file re-read over
+//!   lines already read three times without editing it -> a nudge to step
 //!   back. A call seen twice becomes a *suspect* the JEV judge may confirm.
-//! - Verify before done: files were edited and no command ran after the last
-//!   edit when the model tries to finish -> one nudge to run tests/build.
+//! - Verify before done: files were edited and no real check (a command
+//!   other than ls/cat/grep/git status and the like) ran after the last edit
+//!   when the model tries to finish -> one nudge to run tests/build. If the
+//!   last check after the edits failed -> one nudge to fix it or say why not.
 //! - Zero-edit watchdog: the task asks for changes, the model used tools but
 //!   edited nothing, and it tries to finish -> one nudge to do the work.
+//! - Open plan: the model's `update_plan` still has open steps when it tries
+//!   to finish -> one nudge to finish or drop them.
 //!
 //! The guard also keeps a small, capped record of the turn that the JEV
 //! judges read (see the `*_state` methods).
@@ -30,6 +36,29 @@ pub const VERIFY_NUDGE: &str = "You modified files during this turn but haven't 
 pub const WATCHDOG_NUDGE: &str = "You inspected files and gathered context, but haven't modified \
     any files or completed the requested changes yet. Implement the solution and verify it \
     before concluding.";
+
+/// The nudge when the last check after the edits failed.
+pub fn failed_check_nudge(command: &str, exit_code: Option<i32>) -> String {
+    let code = exit_code.map_or_else(|| "failed".to_string(), |c| format!("exit {c}"));
+    format!(
+        "The last check after your edits failed: `{command}` ({code}). Fix the cause and run it \
+         again. If the failure is unrelated to your change, say so in your final message with the \
+         evidence instead of claiming success."
+    )
+}
+
+/// The nudge when the plan still has open steps.
+pub fn open_plan_nudge(open: &[String]) -> String {
+    let mut steps: Vec<String> = open.iter().take(5).map(|s| format!("- {s}")).collect();
+    if open.len() > 5 {
+        steps.push(format!("- … and {} more", open.len() - 5));
+    }
+    format!(
+        "Your plan still has open steps:\n{}\nFinish them, or call update_plan to mark them \
+         dropped and say why in your final message.",
+        steps.join("\n")
+    )
+}
 
 /// The stuck nudge for a repeated call or command.
 pub fn stuck_nudge(call: &str) -> String {
@@ -82,9 +111,21 @@ pub struct TurnGuard {
     stuck_suspect: Option<String>,
     tool_calls: u32,
     edited_files: bool,
-    shell_after_last_edit: bool,
+    /// A real check (not just inspection) ran after the last edit.
+    check_after_last_edit: bool,
+    /// The latest real check, when it failed: command and exit code.
+    failed_check: Option<(String, Option<i32>)>,
+    /// Output of the latest failed command, of any command.
+    last_failed_output: Option<String>,
+    /// Line ranges read per file since that file was last edited.
+    read_ranges: HashMap<String, Vec<(u64, u64)>>,
+    /// Reads per file that overlapped an earlier read.
+    rereads: HashMap<String, u32>,
+    open_plan: Vec<String>,
     verify_nudged: bool,
+    failed_check_nudged: bool,
     watchdog_nudged: bool,
+    plan_nudged: bool,
     trace: Vec<TraceEntry>,
     edited_paths: Vec<String>,
     commands_after_last_edit: Vec<CommandEntry>,
@@ -101,40 +142,37 @@ impl TurnGuard {
             stuck_suspect: None,
             tool_calls: 0,
             edited_files: false,
-            shell_after_last_edit: false,
+            check_after_last_edit: false,
+            failed_check: None,
+            last_failed_output: None,
+            read_ranges: HashMap::new(),
+            rereads: HashMap::new(),
+            open_plan: Vec::new(),
             verify_nudged: false,
+            failed_check_nudged: false,
             watchdog_nudged: false,
+            plan_nudged: false,
             trace: Vec::new(),
             edited_paths: Vec::new(),
             commands_after_last_edit: Vec::new(),
         }
     }
 
-    /// Records a call before it runs. `path` is the edited file for edits.
+    /// Records a call attempt before it runs, without claiming an edit happened.
     pub fn record_tool_call(
         &mut self,
         name: &str,
         kind: ToolKind,
         args: &Value,
-        path: Option<&str>,
+        _path: Option<&str>,
     ) {
         self.tool_calls += 1;
         match kind {
-            ToolKind::Edit => {
-                self.edited_files = true;
-                self.shell_after_last_edit = false;
-                self.commands_after_last_edit.clear();
-                if let Some(path) = path {
-                    let path = truncate(path, JEV_MAX_PATH_CHARS);
-                    if !self.edited_paths.contains(&path)
-                        && self.edited_paths.len() < JEV_MAX_EDITED_FILES
-                    {
-                        self.edited_paths.push(path);
-                    }
-                }
-            }
+            ToolKind::Edit => {}
             ToolKind::Command => {
-                self.shell_after_last_edit = true;
+                if !is_inspection(&command_of(name, kind, args)) {
+                    self.check_after_last_edit = true;
+                }
                 if self.commands_after_last_edit.len() < JEV_MAX_COMMANDS {
                     self.commands_after_last_edit.push(CommandEntry {
                         command: truncate(&command_of(name, kind, args), JEV_MAX_ARGS_CHARS),
@@ -142,6 +180,7 @@ impl TurnGuard {
                     });
                 }
             }
+            ToolKind::Read if name == "read_file" => self.record_read(args),
             ToolKind::Read | ToolKind::Search | ToolKind::Other => {}
         }
         let key = call_key(name, args);
@@ -165,6 +204,73 @@ impl TurnGuard {
         }
     }
 
+    /// Records only a completed, successful mutation.
+    fn record_edit(&mut self, path: Option<&str>) {
+        self.edited_files = true;
+        self.check_after_last_edit = false;
+        self.failed_check = None;
+        self.commands_after_last_edit.clear();
+        if let Some(path) = path {
+            let key = path_key(path);
+            self.read_ranges.remove(&key);
+            self.rereads.remove(&key);
+            // Reading a file back after editing it is not a repeat.
+            let quoted = [format!("\"{key}\""), format!("\"./{key}\"")];
+            self.call_counts.retain(|call, _| {
+                !(call.starts_with("read_file(") && quoted.iter().any(|q| call.contains(q)))
+            });
+            let path = truncate(path, JEV_MAX_PATH_CHARS);
+            if !self.edited_paths.contains(&path) && self.edited_paths.len() < JEV_MAX_EDITED_FILES
+            {
+                self.edited_paths.push(path);
+            }
+        }
+    }
+
+    /// Counts a read that covers lines this turn already read from the same
+    /// file (without editing it in between).
+    fn record_read(&mut self, args: &Value) {
+        let Some(path) = args.get("path").and_then(Value::as_str) else {
+            return;
+        };
+        let number = |key: &str| {
+            args.get(key).and_then(|v| {
+                v.as_u64()
+                    .or_else(|| v.as_str().and_then(|s| s.trim().parse().ok()))
+            })
+        };
+        let start = number("offset").unwrap_or(1).max(1);
+        let end = start.saturating_add(number("limit").unwrap_or(READ_DEFAULT_LINES).max(1) - 1);
+        let key = path_key(path);
+        let ranges = self.read_ranges.entry(key.clone()).or_default();
+        let overlaps = ranges.iter().any(|&(s, e)| start <= e && s <= end);
+        ranges.push((start, end));
+        if !overlaps {
+            return;
+        }
+        let count = self.rereads.entry(key.clone()).or_insert(0);
+        *count += 1;
+        let call = format!("read_file {key}");
+        if *count == REREAD_TRIGGER - 1 && self.pending_stuck.is_none() {
+            self.stuck_suspect = Some(call);
+        } else if count.is_multiple_of(REREAD_TRIGGER) {
+            self.pending_stuck = Some(stuck_nudge(&call));
+            self.stuck_suspect = None;
+        }
+    }
+
+    /// Folds a message the user sent mid-turn into the task the finish rules
+    /// read.
+    pub fn add_user_message(&mut self, text: &str) {
+        self.user_message.push('\n');
+        self.user_message.push_str(text);
+    }
+
+    /// Records the model's latest plan: the steps still open.
+    pub fn record_plan(&mut self, open: Vec<String>) {
+        self.open_plan = open;
+    }
+
     /// Records a finished call.
     pub fn record_tool_result(
         &mut self,
@@ -175,6 +281,9 @@ impl TurnGuard {
         exit_code: Option<i32>,
         success: bool,
     ) {
+        if kind == ToolKind::Edit && success {
+            self.record_edit(args.get("path").and_then(Value::as_str));
+        }
         let key = truncate(&call_key(name, args), JEV_MAX_ARGS_CHARS);
         if let Some(entry) = self
             .trace
@@ -192,7 +301,11 @@ impl TurnGuard {
             last.exit_code = Some(exit_code.unwrap_or(if success { 0 } else { 1 }));
         }
         let command = command_of(name, kind, args);
+        if kind == ToolKind::Command && !is_inspection(&command) {
+            self.failed_check = (!success).then(|| (command.clone(), exit_code));
+        }
         if success {
+            self.last_failed_output = None;
             self.last_failure.remove(&command);
             self.failure_streak.remove(&command);
             // A command that now succeeds may legitimately be re-run.
@@ -202,6 +315,15 @@ impl TurnGuard {
             return;
         }
         let normalized = output.trim().to_string();
+        // A different command (or a tweaked one) failing exactly the same way
+        // in a row is the same loop.
+        if !normalized.is_empty()
+            && self.last_failed_output.as_ref() == Some(&normalized)
+            && self.last_failure.get(&command) != Some(&normalized)
+        {
+            self.pending_stuck = Some(stuck_nudge(&command));
+        }
+        self.last_failed_output = Some(normalized.clone());
         if self.last_failure.get(&command) == Some(&normalized) {
             let streak = self.failure_streak.entry(command.clone()).or_insert(1);
             *streak += 1;
@@ -249,7 +371,7 @@ impl TurnGuard {
 
     /// The heuristic finish rules: a nudge to keep going, or `None` to finish.
     pub fn before_finish(&mut self) -> Option<(NudgeReason, String)> {
-        if self.edited_files && !self.shell_after_last_edit && !self.verify_nudged {
+        if self.edited_files && !self.check_after_last_edit && !self.verify_nudged {
             self.verify_nudged = true;
             return Some((NudgeReason::Verify, VERIFY_NUDGE.to_string()));
         }
@@ -260,6 +382,24 @@ impl TurnGuard {
         {
             self.watchdog_nudged = true;
             return Some((NudgeReason::Watchdog, WATCHDOG_NUDGE.to_string()));
+        }
+        self.factual_finish()
+    }
+
+    /// Finish rules that read facts rather than guess, so they apply even
+    /// when the JEV judge has ruled on verify/watchdog: a failed last check,
+    /// and open plan steps.
+    pub fn factual_finish(&mut self) -> Option<(NudgeReason, String)> {
+        if let Some((command, exit_code)) = &self.failed_check
+            && self.edited_files
+            && !self.failed_check_nudged
+        {
+            self.failed_check_nudged = true;
+            return Some((NudgeReason::Verify, failed_check_nudge(command, *exit_code)));
+        }
+        if !self.open_plan.is_empty() && !self.plan_nudged {
+            self.plan_nudged = true;
+            return Some((NudgeReason::Watchdog, open_plan_nudge(&self.open_plan)));
         }
         None
     }
@@ -334,6 +474,52 @@ fn command_of(name: &str, kind: ToolKind, args: &Value) -> String {
         return cmd.trim().to_string();
     }
     call_key(name, args)
+}
+
+/// Lines `read_file` returns without a limit (see `tools/files.rs`).
+const READ_DEFAULT_LINES: u64 = 400;
+/// Overlapping re-reads of one file before the stuck nudge.
+const REREAD_TRIGGER: u32 = 3;
+
+fn path_key(path: &str) -> String {
+    let path = path.trim();
+    path.strip_prefix("./").unwrap_or(path).to_string()
+}
+
+/// Programs that only look around: running them after an edit verifies
+/// nothing.
+const INSPECTION_PROGRAMS: &[&str] = &[
+    "ls", "cat", "head", "tail", "echo", "pwd", "grep", "rg", "find", "fd", "wc", "sed", "awk",
+    "tree", "stat", "file", "which", "printf", "true", "sleep", "cd", "less", "more", "nl", "sort",
+    "uniq", "cut", "du", "df", "date", "whoami", "type", "realpath", "basename", "dirname",
+];
+const INSPECTION_GIT: &[&str] = &[
+    "status", "diff", "log", "show", "branch", "blame", "ls-files",
+];
+
+/// Whether every part of a shell command only inspects (ls, cat, git diff,
+/// …). `cd x && cargo test | tail` is a real check.
+pub fn is_inspection(command: &str) -> bool {
+    command
+        .split(['\n', ';', '|', '&'])
+        .map(str::trim)
+        // `2>&1` splits into a bare `1`: a redirect, not a program.
+        .filter(|part| !part.is_empty() && !part.starts_with(|c: char| c.is_ascii_digit()))
+        .all(|part| {
+            let mut words = part
+                .split_whitespace()
+                .skip_while(|w| w.contains('=') && !w.starts_with('-'));
+            match words.next() {
+                None => true,
+                Some("git") => words
+                    .find(|w| !w.starts_with('-'))
+                    .is_some_and(|sub| INSPECTION_GIT.contains(&sub)),
+                Some(program) => {
+                    let program = program.rsplit('/').next().unwrap_or(program);
+                    INSPECTION_PROGRAMS.contains(&program)
+                }
+            }
+        })
 }
 
 fn truncate(text: &str, max: usize) -> String {
@@ -442,6 +628,52 @@ const CHANGE_VERBS: &[&str] = &[
     "builds",
     "make",
     "makes",
+    "broken",
+    "bug",
+    "bugs",
+    "buggy",
+    "crash",
+    "crashes",
+    "crashing",
+    "fails",
+    "failing",
+    "replace",
+    "replaces",
+    "move",
+    "convert",
+    "extract",
+    "inline",
+    "support",
+    "install",
+    "upgrade",
+    "downgrade",
+    "improve",
+    "optimize",
+    "optimise",
+    "speed",
+    "clean",
+    "cleanup",
+    "resolve",
+    "finish",
+    "complete",
+    "enable",
+    "disable",
+    "wire",
+    "integrate",
+    "extend",
+    "tweak",
+    "adjust",
+    "tighten",
+    "address",
+    "tackle",
+    "split",
+    "merge",
+    "format",
+    "document",
+    "translate",
+    "scaffold",
+    "setup",
+    "configure",
 ];
 
 const QUESTION_STARTERS: &[&str] = &[

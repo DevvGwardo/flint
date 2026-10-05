@@ -110,8 +110,10 @@ impl SessionView {
         turn.final_answer = (turn.first..end)
             .rev()
             .find(|&ix| matches!(self.items[ix], Item::Assistant { .. }));
-        turn.header = (turn.first..end)
-            .find(|&ix| Some(ix) != turn.final_answer && !matches!(self.items[ix], Item::Error(_)));
+        turn.header = (turn.first..end).find(|&ix| {
+            Some(ix) != turn.final_answer
+                && !matches!(self.items[ix], Item::Error(_) | Item::User(_))
+        });
         turn.first..end
     }
 
@@ -127,8 +129,12 @@ impl SessionView {
         };
         if turn.end.is_none() {
             Role::Live
-        } else if matches!(self.items.get(ix), Some(Item::Error(_))) {
-            // Failures stay visible when the work collapses.
+        } else if matches!(
+            self.items.get(ix),
+            Some(Item::Error(_) | Item::User(_) | Item::Reverted { .. })
+        ) {
+            // Failures, messages the user sent mid-turn and undo results
+            // stay visible when the work collapses.
             Role::Plain
         } else if turn.end == Some(ix) {
             Role::Summary
@@ -165,6 +171,7 @@ impl SessionView {
         Change {
             appended: 0..0,
             updated: (turn.first..end).collect(),
+            children: Vec::new(),
         }
     }
 
@@ -193,15 +200,24 @@ impl SessionView {
 
     /// The oldest approval still waiting: (call id, kind, summary).
     pub fn pending_approval(&self) -> Option<(String, ToolKind, String)> {
+        self.pending_approval_ref()
+            .map(|(call_id, kind, summary)| (call_id.to_owned(), kind, summary.to_owned()))
+    }
+
+    pub(crate) fn pending_approval_ref(&self) -> Option<(&str, ToolKind, &str)> {
         self.items.iter().find_map(|item| match item {
             Item::Approval {
                 call_id,
                 kind,
                 summary,
                 decision: None,
-            } => Some((call_id.clone(), *kind, summary.clone())),
+            } => Some((call_id.as_str(), *kind, summary.as_str())),
             _ => None,
         })
+    }
+
+    pub(crate) fn has_pending_approval(&self) -> bool {
+        self.pending_approval_ref().is_some()
     }
 
     pub fn set_feedback(&mut self, ix: usize, positive: bool) -> Change {
@@ -217,20 +233,31 @@ impl SessionView {
         Change::updated(ix)
     }
 
+    /// Count and borrowed commands for the composer's task tray, oldest first.
+    pub(crate) fn running_command_projection(&self) -> (usize, impl Iterator<Item = &ToolCall>) {
+        let mut commands = self.running_commands_iter();
+        // Small trays need one scan even when completed tools precede them.
+        let inline = std::array::from_fn::<_, 8, _>(|_| commands.next());
+        let count = inline.iter().flatten().count() + commands.clone().count();
+        (count, inline.into_iter().flatten().chain(commands))
+    }
+
     /// Commands still running, oldest first (the composer's task tray).
     pub fn running_commands(&self) -> Vec<&ToolCall> {
-        let Some(turn) = self.current_turn.and_then(|ix| self.turns.get(ix)) else {
-            return Vec::new();
-        };
-        self.items[turn.first..]
-            .iter()
-            .filter_map(|item| match item {
-                Item::Tool(call) if call.kind == ToolKind::Command && call.result.is_none() => {
-                    Some(call.as_ref())
-                }
-                _ => None,
-            })
-            .collect()
+        self.running_commands_iter().collect()
+    }
+
+    fn running_commands_iter(&self) -> impl Iterator<Item = &ToolCall> + Clone {
+        let items = self
+            .current_turn
+            .and_then(|ix| self.turns.get(ix))
+            .map_or(&[][..], |turn| &self.items[turn.first..]);
+        items.iter().filter_map(|item| match item {
+            Item::Tool(call) if call.kind == ToolKind::Command && call.result.is_none() => {
+                Some(call.as_ref())
+            }
+            _ => None,
+        })
     }
 
     /// What the running turn is doing, read from its latest row.
@@ -241,9 +268,9 @@ impl SessionView {
                 streaming: true, ..
             }) => Activity::Writing,
             Some(Item::Tool(call)) if call.result.is_none() => match call.kind {
-                ToolKind::Command => Activity::Running(call.summary.clone()),
-                ToolKind::Edit => Activity::Editing(call.summary.clone()),
-                ToolKind::Read => Activity::Reading(call.summary.clone()),
+                ToolKind::Command => Activity::Running(crate::ui::one_line(&call.summary)),
+                ToolKind::Edit => Activity::Editing(crate::ui::one_line(&call.summary)),
+                ToolKind::Read => Activity::Reading(crate::ui::one_line(&call.summary)),
                 ToolKind::Search => Activity::Searching,
                 ToolKind::Other => Activity::Working,
             },
@@ -269,8 +296,9 @@ pub fn command_message(call: &ToolCall) -> (String, String) {
 /// the terminal's buffer.
 pub fn terminal_message(label: &str, text: &str) -> (String, String) {
     let shown = format!("Here's what my terminal ({label}) shows:");
-    let lines: Vec<&str> = text.lines().collect();
-    let tail = lines[lines.len().saturating_sub(SENT_TERMINAL_LINES)..].join("\n");
+    let mut lines: Vec<&str> = text.lines().rev().take(SENT_TERMINAL_LINES).collect();
+    lines.reverse();
+    let tail = lines.join("\n");
     let body = flint_agent::tools::head_tail(tail.trim_end(), SENT_CHARS);
     (shown.clone(), format!("{shown}\n\n```\n{body}\n```"))
 }

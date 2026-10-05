@@ -3,8 +3,9 @@
 //! - Between steps, [`Harness::before_step`] returns a stuck nudge when the
 //!   turn is looping (confirmed one repeat early by the JEV judge if present).
 //! - When the model stops, [`Harness::continuation`] returns a nudge for one
-//!   more pass (leaked call, unverified edits, nothing done on a change
-//!   request), at most [`MAX_CONTINUATIONS`] times per turn.
+//!   more pass (leaked call, unverified edits, a failed last check, nothing
+//!   done on a change request, open plan steps), at most
+//!   [`MAX_CONTINUATIONS`] times per turn.
 //! - Tool-call arguments and names are repaired in [`args`].
 
 pub mod args;
@@ -23,8 +24,9 @@ use guard::WATCHDOG_NUDGE;
 use jev::JevClient;
 use jev::NoulQuestion;
 
-/// Extra passes the harness may request per turn.
-pub const MAX_CONTINUATIONS: u32 = 2;
+/// Extra passes the harness may request per turn: room for each finish rule
+/// to fire once (leaked call, verify, failed check, watchdog or open plan).
+pub const MAX_CONTINUATIONS: u32 = 4;
 /// JEV requests per turn: a judgment is a nudge, not a conversation.
 pub const JEV_MAX_CALLS_PER_TURN: u32 = 6;
 const JEV_STUCK_NUDGE_THRESHOLD: f64 = 0.6;
@@ -70,6 +72,16 @@ impl Harness {
     ) {
         self.guard
             .record_tool_result(name, kind, args, output, exit_code, success);
+    }
+
+    /// A message the user sent while the turn was running.
+    pub fn add_user_message(&mut self, text: &str) {
+        self.guard.add_user_message(text);
+    }
+
+    /// The model's latest `update_plan`: the steps still open.
+    pub fn record_plan(&mut self, open: Vec<String>) {
+        self.guard.record_plan(open);
     }
 
     async fn judge(&mut self, state: Value, name: &str, question: NoulQuestion) -> Option<f64> {
@@ -121,7 +133,8 @@ impl Harness {
                 if let Some(p_verified) = self.judge(state, "verified", jev::VERIFY_QUESTION).await
                 {
                     if p_verified >= JEV_VERIFY_NUDGE_THRESHOLD {
-                        return None;
+                        self.guard.mark_nudged(FinishCheck::Verify);
+                        return self.guard.factual_finish();
                     }
                     self.guard.mark_nudged(FinishCheck::Verify);
                     return Some((NudgeReason::Verify, VERIFY_NUDGE.to_string()));
@@ -133,7 +146,8 @@ impl Harness {
                     self.judge(state, "watchdog", jev::WATCHDOG_QUESTION).await
                 {
                     if p_needs_edits < JEV_WATCHDOG_NUDGE_THRESHOLD {
-                        return None;
+                        self.guard.mark_nudged(FinishCheck::Watchdog);
+                        return self.guard.factual_finish();
                     }
                     self.guard.mark_nudged(FinishCheck::Watchdog);
                     return Some((NudgeReason::Watchdog, WATCHDOG_NUDGE.to_string()));

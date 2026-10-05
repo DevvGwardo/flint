@@ -20,10 +20,13 @@ fn parses_clean_and_empty_arguments() {
 }
 
 #[test]
-fn drops_nulls_and_expands_encoded_arrays() {
+fn preserves_nulls_and_encoded_strings() {
     assert_eq!(
         repair_tool_args(r#"{"path":"a.rs","limit":null,"paths":"[\"a\",\"b\"]"}"#),
-        ok(json!({"path": "a.rs", "paths": ["a", "b"]}), true)
+        ok(
+            json!({"path": "a.rs", "limit": null, "paths": "[\"a\",\"b\"]"}),
+            false
+        )
     );
 }
 
@@ -34,10 +37,23 @@ fn fixes_trailing_commas_and_truncation() {
         repair_tool_args(r#"{"command":"ls -la","items":[1,2"#),
         ok(json!({"command": "ls -la", "items": [1, 2]}), true)
     );
-    assert_eq!(
+    assert!(matches!(
         repair_tool_args(r#"{"content":"hello, world"#),
-        ok(json!({"content": "hello, world"}), true)
-    );
+        RepairedArgs::Invalid { .. }
+    ));
+}
+
+#[test]
+fn never_guesses_unfinished_mutation_strings() {
+    for raw in [r#"{"command":"rm innocent"#, r#"{"content":"x\""#] {
+        assert!(matches!(
+            repair_tool_args(raw),
+            RepairedArgs::Invalid { .. }
+        ));
+    }
+    let value = json!({"content": "{\"nested\":null}", "new_string": "[1,2]",
+                       "mcp": {"text": "{\"x\":1}", "nullable": null}});
+    assert_eq!(repair_tool_args(&value.to_string()), ok(value, false));
 }
 
 #[test]

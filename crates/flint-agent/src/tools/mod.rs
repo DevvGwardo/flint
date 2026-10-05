@@ -4,8 +4,11 @@
 
 mod command;
 mod diff;
+pub mod fetch;
 mod files;
+pub mod sandbox;
 mod search;
+pub(crate) mod tracker;
 
 use std::path::Component;
 use std::path::Path;
@@ -18,6 +21,8 @@ use tokio_util::sync::CancellationToken;
 
 pub use command::head_tail;
 pub use diff::file_diff;
+pub use tracker::FileTracker;
+pub use tracker::UndoReport;
 
 use crate::protocol::FileDiff;
 use crate::protocol::ToolKind;
@@ -30,15 +35,19 @@ pub const LIST_DIR: &str = "list_dir";
 pub const GREP: &str = "grep";
 pub const SPAWN_AGENT: &str = "spawn_agent";
 pub const LIST_MODELS: &str = "list_models";
+pub const UPDATE_PLAN: &str = "update_plan";
+pub const FETCH_URL: &str = "fetch_url";
 
 /// Names of every tool, in the order they are offered.
-pub const TOOL_NAMES: [&str; 8] = [
+pub const TOOL_NAMES: [&str; 10] = [
     RUN_COMMAND,
     READ_FILE,
     WRITE_FILE,
     EDIT_FILE,
     LIST_DIR,
     GREP,
+    FETCH_URL,
+    UPDATE_PLAN,
     SPAWN_AGENT,
     LIST_MODELS,
 ];
@@ -79,7 +88,7 @@ pub fn tool_kind(name: &str) -> ToolKind {
         RUN_COMMAND => ToolKind::Command,
         READ_FILE | LIST_DIR => ToolKind::Read,
         WRITE_FILE | EDIT_FILE => ToolKind::Edit,
-        GREP => ToolKind::Search,
+        GREP | FETCH_URL => ToolKind::Search,
         _ => ToolKind::Other,
     }
 }
@@ -103,13 +112,27 @@ pub fn summary(name: &str, args: &Map<String, Value>) -> String {
             .unwrap_or_default()
             .to_string(),
         READ_FILE => match (int_arg(args, "offset"), int_arg(args, "limit")) {
-            (Some(offset), Some(limit)) => format!("{path}:{offset}-{}", offset + limit - 1),
+            (Some(offset), Some(limit)) => format!(
+                "{path}:{offset}-{}",
+                offset.saturating_add(limit.saturating_sub(1))
+            ),
             (Some(offset), None) => format!("{path}:{offset}"),
             (None, Some(limit)) => format!("{path}:1-{limit}"),
             (None, None) => path.to_string(),
         },
         GREP => format!("{} in {path}", str_arg(args, "pattern").unwrap_or_default()),
+        FETCH_URL => str_arg(args, "url").unwrap_or_default().trim().to_string(),
         SPAWN_AGENT => str_arg(args, "label").unwrap_or("Subagent").to_string(),
+        UPDATE_PLAN => match parse_plan(args) {
+            Ok(plan) => {
+                let done = plan
+                    .iter()
+                    .filter(|s| s.status == StepStatus::Completed)
+                    .count();
+                format!("Plan: {done}/{} done", plan.len())
+            }
+            Err(_) => "Plan".to_string(),
+        },
         WRITE_FILE | EDIT_FILE | LIST_DIR => path.to_string(),
         _ => serde_json::to_string(args).unwrap_or_default(),
     };
@@ -201,6 +224,39 @@ pub fn tool_specs() -> Vec<Value> {
             &["pattern"],
         ),
         spec(
+            FETCH_URL,
+            "Fetch a web page or file over http(s) and return it as text (HTML is reduced to \
+             readable text, bounded). Use it for documentation, API references, changelogs and \
+             issues the task depends on. Not for downloading dependencies: use the package manager.",
+            json!({
+                "url": {"type": "string", "description": "The http:// or https:// URL."}
+            }),
+            &["url"],
+        ),
+        spec(
+            UPDATE_PLAN,
+            "Keep a short step-by-step plan for multi-step tasks. Send the whole plan each time, \
+             with exactly one step in_progress while you work. Mark steps completed as you finish \
+             them. Before you end the turn, every step must be completed, or dropped with the \
+             reason in your final message. Skip it for simple one-step tasks.",
+            json!({
+                "plan": {
+                    "type": "array",
+                    "description": "Every step, in order.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "step": {"type": "string", "description": "One short imperative sentence."},
+                            "status": {"type": "string", "enum": ["pending", "in_progress", "completed", "dropped"]}
+                        },
+                        "required": ["step", "status"],
+                        "additionalProperties": false
+                    }
+                }
+            }),
+            &["plan"],
+        ),
+        spec(
             SPAWN_AGENT,
             "Delegate a self-contained task to an isolated subagent in the same workspace. \
              It does not see your conversation: include all needed context in message. \
@@ -231,21 +287,157 @@ pub fn tool_specs() -> Vec<Value> {
     ]
 }
 
+/// One step of an [`UPDATE_PLAN`] plan.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlanStep {
+    pub step: String,
+    pub status: StepStatus,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StepStatus {
+    Pending,
+    InProgress,
+    Completed,
+    Dropped,
+}
+
+impl StepStatus {
+    fn parse(text: &str) -> Option<Self> {
+        match text
+            .trim()
+            .to_ascii_lowercase()
+            .replace([' ', '-'], "_")
+            .as_str()
+        {
+            "pending" | "todo" => Some(Self::Pending),
+            "in_progress" | "active" | "doing" => Some(Self::InProgress),
+            "completed" | "complete" | "done" => Some(Self::Completed),
+            "dropped" | "skipped" | "cancelled" | "canceled" => Some(Self::Dropped),
+            _ => None,
+        }
+    }
+
+    fn mark(self) -> &'static str {
+        match self {
+            Self::Pending => "[ ]",
+            Self::InProgress => "[>]",
+            Self::Completed => "[x]",
+            Self::Dropped => "[-]",
+        }
+    }
+
+    /// Whether the step still needs work.
+    pub fn is_open(self) -> bool {
+        matches!(self, Self::Pending | Self::InProgress)
+    }
+}
+
+/// The plan in [`UPDATE_PLAN`] arguments.
+pub fn parse_plan(args: &Map<String, Value>) -> Result<Vec<PlanStep>, String> {
+    let items = match args.get("plan") {
+        Some(Value::Array(items)) => items,
+        // Cheap models sometimes send the array as a JSON string.
+        Some(Value::String(text)) => {
+            return match serde_json::from_str::<Value>(text) {
+                Ok(Value::Array(items)) => {
+                    let mut map = Map::new();
+                    map.insert("plan".into(), Value::Array(items));
+                    parse_plan(&map)
+                }
+                _ => Err("`plan` must be an array of {step, status}.".into()),
+            };
+        }
+        _ => return Err("`plan` must be an array of {step, status}.".into()),
+    };
+    let mut plan = Vec::with_capacity(items.len());
+    for item in items {
+        let step = item
+            .get("step")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or("Every plan item needs a non-empty `step`.")?;
+        let status = item
+            .get("status")
+            .and_then(Value::as_str)
+            .and_then(StepStatus::parse)
+            .ok_or("`status` must be pending, in_progress, completed or dropped.")?;
+        plan.push(PlanStep {
+            step: step.chars().take(300).collect(),
+            status,
+        });
+    }
+    if plan.len() > 50 {
+        return Err("Keep the plan to 50 steps or fewer.".into());
+    }
+    Ok(plan)
+}
+
+/// The plan as the model sees it back.
+pub fn render_plan(plan: &[PlanStep]) -> String {
+    let done = plan.iter().filter(|s| !s.status.is_open()).count();
+    let mut out = format!("Plan updated ({done}/{} closed):", plan.len());
+    for step in plan {
+        out.push_str(&format!("\n{} {}", step.status.mark(), step.step));
+    }
+    out
+}
+
+/// What one agent's tools work with.
+#[derive(Debug)]
+pub struct ToolContext {
+    /// Canonical workspace directory.
+    pub workspace: PathBuf,
+    /// What this agent has read or written of each file.
+    pub seen: FileTracker,
+    /// The `sandbox-exec` policy for commands; `None` runs them unconfined.
+    pub sandbox: Option<String>,
+}
+
+impl ToolContext {
+    /// A context for `workspace`, sandboxing commands when `sandbox` is set
+    /// and the platform supports it.
+    pub fn new(workspace: PathBuf, sandbox: bool) -> Self {
+        let sandbox = sandbox.then(|| sandbox::profile(&workspace)).flatten();
+        let seen = FileTracker::for_workspace(&workspace);
+        Self {
+            workspace,
+            seen,
+            sandbox,
+        }
+    }
+
+    /// The context for a subagent: same workspace, sandbox and undo journal,
+    /// its own record of what it has read.
+    pub fn child(&self) -> Self {
+        Self {
+            workspace: self.workspace.clone(),
+            seen: self.seen.child(),
+            sandbox: self.sandbox.clone(),
+        }
+    }
+}
+
 /// Runs one tool call. `on_output` receives streamed command output.
 pub async fn execute(
-    workspace: &Path,
+    ctx: &ToolContext,
     name: &str,
     args: &Map<String, Value>,
     on_output: &(dyn Fn(String) + Send + Sync),
     cancel: &CancellationToken,
 ) -> ToolOutcome {
+    let (workspace, seen) = (ctx.workspace.as_path(), &ctx.seen);
     match name {
-        RUN_COMMAND => command::run_command(workspace, args, on_output, cancel).await,
-        READ_FILE => files::read_file(workspace, args).await,
-        WRITE_FILE => files::write_file(workspace, args).await,
-        EDIT_FILE => files::edit_file(workspace, args).await,
+        RUN_COMMAND => {
+            command::run_command(workspace, args, ctx.sandbox.as_deref(), on_output, cancel).await
+        }
+        READ_FILE => files::read_file(workspace, args, seen, cancel).await,
+        WRITE_FILE => files::write_file(workspace, args, seen, cancel).await,
+        EDIT_FILE => files::edit_file(workspace, args, seen, cancel).await,
         LIST_DIR => files::list_dir(workspace, args).await,
         GREP => search::grep(workspace, args, cancel).await,
+        FETCH_URL => fetch::fetch_url(args, cancel).await,
         _ => ToolOutcome::error(format!(
             "unknown tool `{name}`. Available tools: {}",
             TOOL_NAMES.join(", ")
@@ -293,14 +485,42 @@ fn resolve(workspace: &Path, path: &str) -> Result<PathBuf, String> {
             }
         }
     }
-    if normalized.starts_with(workspace) {
-        Ok(normalized)
-    } else {
-        Err(format!(
+    let outside = || {
+        format!(
             "path `{path}` is outside the workspace {}",
             workspace.display()
-        ))
+        )
+    };
+    if !normalized.starts_with(workspace) {
+        return Err(outside());
     }
+    // A symlink inside the workspace may point outside it: check where the
+    // deepest existing part of the path really is. A dangling link can't be
+    // resolved, so it is refused (writing through it would create its target).
+    if let Ok(root) = workspace.canonicalize() {
+        for part in normalized
+            .ancestors()
+            .take_while(|p| p.starts_with(workspace))
+        {
+            if part.symlink_metadata().is_err() {
+                continue;
+            }
+            match part.canonicalize() {
+                Ok(real) if real.starts_with(&root) => {
+                    // Canonicalize the existing identity, including directory
+                    // aliases; append only the not-yet-existing suffix.
+                    let suffix = normalized.strip_prefix(part).unwrap_or(Path::new(""));
+                    return Ok(if suffix.as_os_str().is_empty() {
+                        real
+                    } else {
+                        real.join(suffix)
+                    });
+                }
+                Ok(_) | Err(_) => return Err(outside()),
+            }
+        }
+    }
+    Ok(normalized)
 }
 
 /// Workspace-relative display form of an absolute path.

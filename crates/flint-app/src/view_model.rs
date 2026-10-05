@@ -54,6 +54,11 @@ pub enum Item {
         decision: Option<ApprovalDecision>,
     },
     Error(String),
+    /// An undo restored these files and left the skipped ones alone.
+    Reverted {
+        restored: Vec<String>,
+        skipped: Vec<String>,
+    },
     TurnSummary {
         reason: TurnEndReason,
         duration: Duration,
@@ -71,19 +76,30 @@ pub struct ToolCall {
     pub args: serde_json::Value,
     /// Live output while running; replaced by the final output when finished.
     pub output: String,
+    /// Incremental count, so each delta only scans newly received output.
+    pub(crate) live_output_newlines: usize,
     /// The agent's own terminal for this command, when it reported one; it
     /// has a read-only tab in the terminal dock.
     pub terminal_id: Option<String>,
-    pub subagent: Option<SubagentView>,
+    pub subagent: Option<SubagentLink>,
     pub started: Duration,
     pub result: Option<ToolResult>,
     pub expanded: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct SubagentLink {
+    pub session_id: String,
+    pub model: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct SubagentView {
     pub session_id: String,
     pub model: String,
+    pub label: String,
+    pub queued: bool,
+    pub unread: bool,
     pub view: SessionView,
 }
 
@@ -124,6 +140,8 @@ pub struct Change {
     pub appended: Range<usize>,
     /// Existing rows whose content changed.
     pub updated: Vec<usize>,
+    /// Ordered changes to independently virtualized child conversations.
+    pub children: Vec<(String, Change)>,
 }
 
 impl Change {
@@ -131,6 +149,7 @@ impl Change {
         Self {
             appended: 0..0,
             updated: vec![ix],
+            children: Vec::new(),
         }
     }
 }
@@ -148,6 +167,10 @@ pub struct SessionView {
     pub usage: Usage,
     /// Usage summed over every finished turn.
     pub session_usage: Usage,
+    /// Characters the running turn has streamed (text, reasoning, tool
+    /// arguments), to estimate output tokens before usage arrives. ACP agents
+    /// report usage only when the turn ends.
+    pub streamed_chars: usize,
     pub changes: Vec<ChangedFile>,
     pub(crate) changes_revision: u64,
     pub pending_approvals: usize,
@@ -156,6 +179,15 @@ pub struct SessionView {
     /// The turn each item belongs to, parallel to `items`.
     pub turn_of: Vec<Option<usize>>,
     pub current_turn: Option<usize>,
+    /// How the last turn ended; `None` before the first one finishes.
+    pub last_reason: Option<TurnEndReason>,
+    /// An error reported while no turn ran (e.g. the engine failed to
+    /// start); cleared when a turn starts. Errors inside a turn that still
+    /// completes are notices, not failures.
+    pub idle_error: Option<String>,
+    /// One conversation per child id, in creation order. Delegation cards
+    /// reference these instead of owning a fresh transcript on every resume.
+    pub subagents: Vec<SubagentView>,
 }
 
 impl SessionView {
@@ -168,7 +200,8 @@ impl SessionView {
         let mut agent = None;
         let call = self.items.iter().find_map(|item| match item {
             Item::Tool(call) if call.call_id == call_id => Some(call.as_ref()),
-            Item::Tool(call) => call.subagent.as_ref().and_then(|child| {
+            Item::Tool(call) => call.subagent.as_ref().and_then(|link| {
+                let child = self.subagent(&link.session_id)?;
                 let found = child.view.items.iter().find_map(|item| match item {
                     Item::Tool(tool) if tool.call_id == call_id => Some(tool.as_ref()),
                     _ => None,
@@ -231,12 +264,15 @@ impl SessionView {
 
     pub fn fold(&mut self, event: AgentEvent, now: Duration) -> Change {
         match event {
+            AgentEvent::SteeringAccepted { .. } => Change::default(),
             AgentEvent::TurnStarted { turn_id } => {
                 self.turn_id = turn_id;
                 self.running = true;
                 self.step = 0;
                 self.turn_started = Some(now);
                 self.usage = Usage::default();
+                self.streamed_chars = 0;
+                self.idle_error = None;
                 self.begin_turn();
                 Change::default()
             }
@@ -244,8 +280,14 @@ impl SessionView {
                 self.step = step;
                 self.close_streams(now)
             }
-            AgentEvent::ReasoningDelta(delta) => self.reasoning_delta(&delta, now),
-            AgentEvent::TextDelta(delta) => self.text_delta(&delta, now),
+            AgentEvent::ReasoningDelta(delta) => {
+                self.streamed_chars += delta.chars().count();
+                self.reasoning_delta(&delta, now)
+            }
+            AgentEvent::TextDelta(delta) => {
+                self.streamed_chars += delta.chars().count();
+                self.text_delta(&delta, now)
+            }
             AgentEvent::ToolCallStarted {
                 call_id,
                 name,
@@ -253,6 +295,7 @@ impl SessionView {
                 args,
                 summary,
             } => {
+                self.streamed_chars += serialized_chars(&args);
                 let mut change = self.close_streams(now);
                 let pushed = self.push(Item::Tool(Box::new(ToolCall {
                     call_id,
@@ -261,6 +304,7 @@ impl SessionView {
                     summary,
                     args,
                     output: String::new(),
+                    live_output_newlines: 0,
                     terminal_id: None,
                     subagent: None,
                     started: now,
@@ -275,8 +319,10 @@ impl SessionView {
                     return Change::default();
                 };
                 if let Item::Tool(call) = &mut self.items[ix] {
-                    call.output.push_str(&chunk);
-                    keep_tail_lines(&mut call.output, MAX_LIVE_OUTPUT_LINES);
+                    if call.result.is_some() {
+                        return Change::default();
+                    }
+                    call.append_live_output(&chunk);
                 }
                 Change::updated(ix)
             }
@@ -297,6 +343,7 @@ impl SessionView {
                 }
                 if let Item::Tool(call) = &mut self.items[ix] {
                     call.output = output;
+                    call.live_output_newlines = 0;
                     call.result = Some(ToolResult {
                         exit_code,
                         success,
@@ -314,18 +361,41 @@ impl SessionView {
                 let Some(ix) = self.tool_index(&call_id) else {
                     return Change::default();
                 };
-                if let Item::Tool(call) = &mut self.items[ix] {
-                    let mut view = SessionView::default();
-                    if let Some(message) = call.args["message"].as_str() {
-                        view.push_user(message.to_string());
-                    }
-                    call.subagent = Some(SubagentView {
-                        session_id,
-                        model,
-                        view,
-                    });
+                let Item::Tool(call) = &mut self.items[ix] else {
+                    return Change::default();
+                };
+                if call.subagent.is_some() {
+                    return Change::default();
                 }
-                Change::updated(ix)
+                let message = call.args["message"].as_str().map(str::to_owned);
+                let label = call.summary.clone();
+                call.subagent = Some(SubagentLink {
+                    session_id: session_id.clone(),
+                    model: model.clone(),
+                });
+                let child_ix = self
+                    .subagents
+                    .iter()
+                    .position(|child| child.session_id == session_id);
+                let child_ix = child_ix.unwrap_or_else(|| {
+                    self.subagents.push(SubagentView {
+                        session_id: session_id.clone(),
+                        model,
+                        label,
+                        queued: false,
+                        unread: false,
+                        view: SessionView::default(),
+                    });
+                    self.subagents.len() - 1
+                });
+                let child = &mut self.subagents[child_ix];
+                child.queued = true;
+                let child_change = message
+                    .map(|message| child.view.push_user(message))
+                    .unwrap_or_default();
+                let mut change = Change::updated(ix);
+                change.children.push((session_id, child_change));
+                change
             }
             AgentEvent::SubagentEvent { call_id, event } => {
                 let Some(ix) = self.tool_index(&call_id) else {
@@ -338,12 +408,28 @@ impl SessionView {
                     self.record_change(diff);
                     self.note_turn_file(diff);
                 }
-                if let Item::Tool(call) = &mut self.items[ix]
-                    && let Some(child) = &mut call.subagent
+                let mut change = Change::updated(ix);
+                if let Item::Tool(call) = &self.items[ix]
+                    && let Some(link) = &call.subagent
+                    && let Some(child) = self
+                        .subagents
+                        .iter_mut()
+                        .find(|child| child.session_id == link.session_id)
                 {
-                    child.view.fold(*event, now);
+                    if matches!(
+                        event.as_ref(),
+                        AgentEvent::TurnStarted { .. } | AgentEvent::TurnFinished { .. }
+                    ) {
+                        child.queued = false;
+                    }
+                    if matches!(event.as_ref(), AgentEvent::TurnFinished { .. }) {
+                        child.unread = true;
+                    }
+                    change
+                        .children
+                        .push((child.session_id.clone(), child.view.fold(*event, now)));
                 }
-                Change::updated(ix)
+                change
             }
             AgentEvent::ApprovalRequested {
                 call_id,
@@ -376,6 +462,7 @@ impl SessionView {
                 Change::default()
             }
             AgentEvent::TurnFinished { reason, .. } => {
+                self.last_reason = Some(reason.clone());
                 let mut change = self.close_streams(now);
                 // Interrupted approvals must not remain actionable.
                 for (ix, item) in self.items.iter_mut().enumerate() {
@@ -385,18 +472,21 @@ impl SessionView {
                         *decision = Some(ApprovalDecision::Deny);
                         change.updated.push(ix);
                     }
-                    if let Item::Tool(call) = item
-                        && let Some(child) = &mut call.subagent
-                        && child.view.running
-                    {
-                        child.view.fold(
+                }
+                for child in &mut self.subagents {
+                    if child.view.running || child.queued {
+                        child.queued = false;
+                        child.unread = true;
+                        let child_change = child.view.fold(
                             AgentEvent::TurnFinished {
                                 turn_id: child.view.turn_id,
                                 reason: TurnEndReason::Interrupted,
                             },
                             now,
                         );
-                        change.updated.push(ix);
+                        change
+                            .children
+                            .push((child.session_id.clone(), child_change));
                     }
                 }
                 self.pending_approvals = 0;
@@ -420,7 +510,26 @@ impl SessionView {
                 change.updated.extend(self.end_turn(duration));
                 change
             }
-            AgentEvent::Error(message) => self.push(Item::Error(message)),
+            AgentEvent::Error(message) => {
+                // A message that never got a turn: the engine failed to start.
+                if !self.running
+                    && (matches!(self.items.last(), Some(Item::User(_)))
+                        || self.idle_error.is_some()
+                            && matches!(self.items.last(), Some(Item::Error(_))))
+                {
+                    self.idle_error = Some(message.clone());
+                }
+                self.push(Item::Error(message))
+            }
+            AgentEvent::FilesReverted { diffs, skipped, .. } => {
+                for diff in &diffs {
+                    self.record_change(diff);
+                }
+                self.push(Item::Reverted {
+                    restored: diffs.into_iter().map(|d| d.path).collect(),
+                    skipped,
+                })
+            }
             AgentEvent::SessionStopped { .. } => Change::default(),
             AgentEvent::ContextCompacted {
                 before_tokens,
@@ -504,6 +613,15 @@ impl SessionView {
         Change::updated(ix)
     }
 
+    /// Output tokens for the running (or last) turn: the reported count, or
+    /// an estimate from what has streamed (about 4 characters a token) while
+    /// that is higher, as it is until the agent reports usage.
+    pub fn output_tokens(&self) -> u64 {
+        let reported = self.usage.output_tokens + self.usage.reasoning_tokens;
+        let estimated = u64::try_from(self.streamed_chars / 4).unwrap_or(u64::MAX);
+        reported.max(estimated)
+    }
+
     /// Seconds the running turn has taken so far, or the last turn's length.
     pub fn elapsed(&self, now: Duration) -> Option<Duration> {
         match self.turn_started {
@@ -519,6 +637,7 @@ impl SessionView {
         Change {
             appended: ix..ix + 1,
             updated: Vec::new(),
+            children: Vec::new(),
         }
     }
 
@@ -613,20 +732,79 @@ impl SessionView {
 
 /// Live command output kept per card; older lines are dropped from the front.
 pub const MAX_LIVE_OUTPUT_LINES: usize = 2_000;
+/// A newline-free stream must not bypass the line-based retention limit.
+pub const MAX_LIVE_OUTPUT_BYTES: usize = 256 * 1024;
 
-/// Trims `output` to its last `max_lines` lines. Cheap for short output: the
-/// newline count is only taken once the text could exceed the limit.
-fn keep_tail_lines(output: &mut String, max_lines: usize) {
-    if output.len() <= max_lines * 8 {
-        return;
+impl ToolCall {
+    fn append_live_output(&mut self, chunk: &str) {
+        // Bound before copying: draining after appending a huge delta leaves
+        // its entire allocation resident, even when only a small tail survives.
+        let mut suffix = &chunk[tail_start(chunk, MAX_LIVE_OUTPUT_BYTES)..];
+        let mut newlines = suffix.bytes().filter(|&b| b == b'\n').count();
+        if newlines > MAX_LIVE_OUTPUT_LINES {
+            let cut = suffix
+                .match_indices('\n')
+                .nth(newlines - MAX_LIVE_OUTPUT_LINES - 1)
+                .expect("counted newline")
+                .0
+                + 1;
+            suffix = &suffix[cut..];
+            newlines = MAX_LIVE_OUTPUT_LINES;
+        }
+        if suffix.len() != chunk.len() {
+            self.output.clear();
+            self.live_output_newlines = 0;
+        } else {
+            let mut cut = tail_start(&self.output, MAX_LIVE_OUTPUT_BYTES - suffix.len());
+            self.live_output_newlines -= self.output[..cut].bytes().filter(|&b| b == b'\n').count();
+            let excess =
+                (self.live_output_newlines + newlines).saturating_sub(MAX_LIVE_OUTPUT_LINES);
+            if excess > 0 {
+                cut += self.output[cut..]
+                    .match_indices('\n')
+                    .nth(excess - 1)
+                    .expect("counted retained newline")
+                    .0
+                    + 1;
+                self.live_output_newlines -= excess;
+            }
+            self.output.drain(..cut);
+        }
+        self.output.push_str(suffix);
+        self.live_output_newlines += newlines;
     }
-    let newlines = output.matches('\n').count();
-    if newlines <= max_lines {
-        return;
+}
+
+fn tail_start(text: &str, budget: usize) -> usize {
+    let mut cut = text.len().saturating_sub(budget);
+    while !text.is_char_boundary(cut) {
+        cut += 1;
     }
-    let skip = newlines - max_lines;
-    if let Some((cut, _)) = output.match_indices('\n').nth(skip - 1) {
-        output.drain(..=cut);
+    cut
+}
+
+fn serialized_chars(value: &serde_json::Value) -> usize {
+    let mut count = CharacterCount(0);
+    serde_json::to_writer(&mut count, value).expect("JSON values serialize to a counting writer");
+    count.0
+}
+
+struct CharacterCount(usize);
+
+impl std::io::Write for CharacterCount {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        // Each UTF-8 scalar starts with a non-continuation byte. This also
+        // works when a writer splits a scalar across separate writes.
+        self.0 += if bytes.is_ascii() {
+            bytes.len()
+        } else {
+            bytes.iter().filter(|&&byte| byte & 0xc0 != 0x80).count()
+        };
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
     }
 }
 
@@ -639,11 +817,12 @@ fn add_usage(total: &mut Usage, turn: &Usage) {
 
 /// First line of the first message, trimmed to a sidebar-friendly length.
 pub fn title_from(text: &str) -> String {
-    let line = text.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
-    let line = line.trim();
-    let mut title: String = line.chars().take(48).collect();
-    if line.chars().count() > 48 {
-        title = format!("{}…", title.trim_end());
+    let mut line = text.trim_start().chars().take_while(|&ch| ch != '\n');
+    let mut title: String = line.by_ref().take(48).collect();
+    title.truncate(title.trim_end().len());
+    // Trailing whitespace alone does not mean visible text was omitted.
+    if line.any(|ch| !ch.is_whitespace()) {
+        title.push('…');
     }
     if title.is_empty() {
         "New session".to_string()

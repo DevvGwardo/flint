@@ -1,6 +1,7 @@
 //! flint's agent engine: a Chat Completions agent loop with local tools and
 //! the harness (loop detection, verify-before-done, zero-edit watchdog,
-//! tool-call repair, optional JEV judge). No UI code lives here.
+//! tool-call repair, optional JEV judge), MCP tools and a command sandbox.
+//! No UI code lives here.
 
 mod approvals;
 #[cfg(test)]
@@ -8,6 +9,7 @@ mod bench_tests;
 pub mod config;
 mod context;
 pub mod harness;
+pub mod mcp;
 mod persist;
 pub mod prompt;
 pub mod protocol;

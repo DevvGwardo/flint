@@ -24,6 +24,9 @@ pub enum Message {
     },
     /// A harness nudge: sent as a user message, but not the start of a turn.
     Nudge(String),
+    /// What compaction removed: the requests and outcomes of dropped turns.
+    /// Sent as a user message near the top; not the start of a turn.
+    Summary(String),
     Assistant {
         content: String,
         /// Kept for DeepSeek thinking mode, which expects it back on
@@ -62,7 +65,7 @@ impl Serialize for WireMessage<'_> {
                 map.serialize_entry("role", "system")?;
                 map.serialize_entry("content", text)?;
             }
-            Message::User(text) | Message::Nudge(text) => {
+            Message::User(text) | Message::Nudge(text) | Message::Summary(text) => {
                 map.serialize_entry("role", "user")?;
                 map.serialize_entry("content", text)?;
             }
@@ -170,7 +173,10 @@ impl ChatRequest<'_> {
                 .messages
                 .iter()
                 .map(|m| match m {
-                    Message::System(t) | Message::User(t) | Message::Nudge(t) => t.len(),
+                    Message::System(t)
+                    | Message::User(t)
+                    | Message::Nudge(t)
+                    | Message::Summary(t) => t.len(),
                     Message::UserWithImages { text, images } => {
                         text.len() + images.iter().map(|i| i.data.len() + 100).sum::<usize>()
                     }

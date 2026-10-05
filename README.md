@@ -43,12 +43,26 @@
 
 ## Features
 
+- **General-agent mode.** Open Flint without a folder and ask questions, write,
+  plan, or work on general tasks. No Git repository or project setup is needed.
+  Created files live in the private `~/.flint/agent-workspace/` folder
+  (`$FLINT_HOME/agent-workspace/` with a custom home). The native agent uses
+  general-purpose instructions, with the existing approvals and sandbox rules.
+  Choose **+ → General agent (no project)** to leave project mode, or open a
+  folder when you need project files. Existing project conversations stay intact.
 - **Its own agent.** A Chat Completions agent loop with tools: shell, read,
   write, edit and grep. It works with any OpenAI-compatible endpoint.
 - **Subagents.** Flint's native agent can delegate independent tasks to isolated,
   resumable child sessions, with up to four running in parallel. Choose a
   different default model in Settings, or let the agent select a model per task.
-  Expand a delegation card to inspect the child's activity.
+  Open **Subagents** beneath its parent in the sidebar to inspect a full,
+  read-only conversation, including earlier work and resumed turns. Each child
+  shows its model, live status and unread results, with independent scrolling.
+  Search finds child tasks and models, including collapsed entries. Approvals
+  still go through the parent, and **Back to parent** (or **Escape**) restores
+  its draft. **⌘L** returns to the parent's composer. Expanded delegation cards
+  also link to the child conversation. Direct child messaging and ACP child
+  conversation discovery are not supported yet.
 - **Harness guard rules** that help cheaper models finish the job: loop
   detection, test-before-done checks, a watchdog for turns that edit nothing,
   and tool-call repair. An optional [JEV judge](#optional-jev-judge) can confirm
@@ -785,6 +799,11 @@ flowchart TD
 
 Set `TYPESAFE_API_KEY` to have the guard ask a Typesafe "JEV" judge to confirm
 loop and verification suspicions instead of relying on heuristics alone.
+The desktop app also reads `~/.flint/keys/typesafe.key` (or
+`$FLINT_HOME/keys/typesafe.key`) when that environment variable is absent.
+Keep the `keys` directory private (`chmod 700`) and the key file at `chmod 600`.
+The key is never displayed in Settings and is only used for the JEV judge,
+not as a fallback for the main model's credential.
 `TYPESAFE_BASE_URL` and `JEV_MODEL` override its endpoint and model. Without
 the key the harness uses its heuristics; flint works fine either way.
 

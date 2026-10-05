@@ -60,6 +60,25 @@ impl FlintApp {
     /// ⌃` and the header button: show (starting a shell if there is none)
     /// or hide the dock.
     pub fn toggle_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.session_workspace.tiled() {
+            let uid = self.session().uid;
+            let mode = self
+                .session_workspace
+                .panes
+                .get(&uid)
+                .map_or(crate::session_workspace::PaneMode::Both, |pane| pane.mode);
+            self.set_session_pane_mode(
+                uid,
+                if mode == crate::session_workspace::PaneMode::Chat {
+                    crate::session_workspace::PaneMode::Both
+                } else {
+                    crate::session_workspace::PaneMode::Chat
+                },
+                window,
+                cx,
+            );
+            return;
+        }
         self.terminal.open = !self.terminal.open;
         if self.terminal.open {
             if self.terminal.tabs.is_empty() {
@@ -85,7 +104,28 @@ impl FlintApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let cwd = cwd.unwrap_or_else(|| self.session().workspace.clone());
+        let uid = self.session().uid;
+        if self.session_workspace.tiled()
+            && let Some(pane) = self.session_workspace.panes.get_mut(&uid)
+            && pane.mode == crate::session_workspace::PaneMode::Chat
+        {
+            pane.mode = crate::session_workspace::PaneMode::Both;
+        }
+        self.new_terminal_for_session(self.session().uid, cwd, typed, window, cx);
+    }
+
+    pub(crate) fn new_terminal_for_session(
+        &mut self,
+        uid: u64,
+        cwd: Option<PathBuf>,
+        typed: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(ix) = self.session_index(uid) else {
+            return;
+        };
+        let cwd = cwd.unwrap_or_else(|| self.sessions[ix].workspace.clone());
         let spawned = Terminal::spawn(SpawnConfig {
             cwd: cwd.clone(),
             command: self.options.terminal_command.clone(),
@@ -95,7 +135,6 @@ impl FlintApp {
         let terminal = match spawned {
             Ok(terminal) => terminal,
             Err(err) => {
-                let ix = self.active;
                 self.apply_event(
                     ix,
                     flint_agent::AgentEvent::Error(format!("Couldn't start a shell: {err:#}")),
@@ -106,6 +145,7 @@ impl FlintApp {
         };
         let poll = self.options.terminal_poll;
         let view = cx.new(|cx| TermView::new(terminal, cwd, false, poll, cx));
+        view.update(cx, |view, _| view.session_uid = Some(uid));
         if let Some(text) = typed {
             view.read(cx).type_text(&text);
         }
@@ -119,9 +159,18 @@ impl FlintApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.watch_terminal_links(&view, cx);
         cx.observe(&view, |_, _, cx| cx.notify()).detach();
         let focus = view.read(cx).focus.clone();
         self.terminal.tabs.push(view);
+        let view = self.terminal.tabs.last().expect("new terminal").clone();
+        self.remember_pane_terminal(&view, cx);
+        if let Some(uid) = self.terminal_owner(&view, cx)
+            && let Some(pane) = self.session_workspace.panes.get_mut(&uid)
+        {
+            pane.follow_commands = false;
+            pane.terminal_shown = true;
+        }
         self.terminal.active = self.terminal.tabs.len() - 1;
         self.terminal.open = true;
         window.focus(&focus, cx);
@@ -132,9 +181,37 @@ impl FlintApp {
     /// Appends a tab and makes it the active one, without taking focus or
     /// opening the dock (an agent's command tab appears when the dock does).
     fn push_terminal_tab(&mut self, view: Entity<TermView>, cx: &mut Context<Self>) {
+        self.watch_terminal_links(&view, cx);
         cx.observe(&view, |_, _, cx| cx.notify()).detach();
+        if let Some(uid) = self.terminal_owner(&view, cx) {
+            let follow = self
+                .session_workspace
+                .panes
+                .get(&uid)
+                .is_some_and(|pane| pane.follow_commands)
+                || self
+                    .pane_terminal(uid)
+                    .is_none_or(|old| old.read(cx).read_only && old.read(cx).exited.is_some());
+            if follow {
+                self.remember_pane_terminal(&view, cx);
+                if let Some(pane) = self.session_workspace.panes.get_mut(&uid) {
+                    pane.follow_commands = true;
+                }
+            }
+        }
         self.terminal.tabs.push(view);
         self.terminal.active = self.terminal.tabs.len() - 1;
+    }
+
+    fn watch_terminal_links(&mut self, view: &Entity<TermView>, cx: &mut Context<Self>) {
+        cx.subscribe(
+            view,
+            |app, view, event: &crate::term_view::LinkClicked, cx| {
+                let cwd = view.read(cx).cwd.clone();
+                app.open_link(&event.0, &cwd, cx);
+            },
+        )
+        .detach();
     }
 
     /// Mirrors a command an agent started as a read-only tab, once per
@@ -215,6 +292,9 @@ impl FlintApp {
             return false;
         };
         self.terminal.open = true;
+        if self.session_workspace.tiled() {
+            self.set_session_pane_mode(uid, crate::session_workspace::PaneMode::Both, window, cx);
+        }
         self.select_terminal_tab(ix, window, cx);
         true
     }
@@ -243,9 +323,25 @@ impl FlintApp {
         }
     }
 
-    /// Sends the active terminal's text to the session's agent as a message.
+    /// Sends the terminal's text only to the session that owns it.
     pub(crate) fn send_terminal_to_agent(&mut self, cx: &mut Context<Self>) {
-        let Some(view) = self.terminal.active_view() else {
+        let view = if self.session_workspace.tiled() {
+            self.pane_terminal(self.session().uid)
+        } else {
+            self.terminal.active_view()
+        };
+        let Some(view) = view else {
+            return;
+        };
+        let Some(ix) = self
+            .terminal_owner(view, cx)
+            .and_then(|uid| self.session_index(uid))
+        else {
+            self.store_error = Some(
+                "This terminal has no active session. Open a terminal from the session you want to message."
+                    .into(),
+            );
+            cx.notify();
             return;
         };
         let (text, label) = {
@@ -256,12 +352,21 @@ impl FlintApp {
             return;
         }
         let (shown, message) = crate::turns::terminal_message(&label, &text);
-        let ix = self.active;
         self.send_message(ix, shown, message, cx);
     }
 
     pub fn select_terminal_tab(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(view) = self.terminal.tabs.get(ix) {
+        if let Some(view) = self.terminal.tabs.get(ix).cloned() {
+            if self.session_workspace.tiled()
+                && let Some(uid) = self.terminal_owner(&view, cx)
+            {
+                self.focus_session_pane(uid, false, window, cx);
+                self.remember_pane_terminal(&view, cx);
+                if let Some(pane) = self.session_workspace.panes.get_mut(&uid) {
+                    pane.follow_commands = false;
+                    pane.terminal_shown = true;
+                }
+            }
             let focus = view.read(cx).focus.clone();
             self.terminal.active = ix;
             window.focus(&focus, cx);
@@ -274,7 +379,39 @@ impl FlintApp {
         if ix >= self.terminal.tabs.len() {
             return;
         }
-        self.terminal.tabs.remove(ix);
+        let removed = self.terminal.tabs.remove(ix);
+        let owner = self.terminal_owner(&removed, cx);
+        if let Some(uid) = owner {
+            let next = self
+                .terminal
+                .tabs
+                .iter()
+                .rev()
+                .find(|view| self.terminal_owner(view, cx) == Some(uid))
+                .cloned();
+            if let Some(pane) = self.session_workspace.panes.get_mut(&uid)
+                && pane.terminal == Some(removed.entity_id())
+            {
+                pane.terminal = next.as_ref().map(Entity::entity_id);
+            }
+        }
+        if self.session_workspace.tiled()
+            && let Some(uid) = owner
+        {
+            self.terminal.active = self
+                .terminal
+                .active
+                .min(self.terminal.tabs.len().saturating_sub(1));
+            if let Some(view) = self.pane_terminal(uid)
+                && let Some(ix) = self.terminal.tabs.iter().position(|tab| tab == view)
+            {
+                self.select_terminal_tab(ix, window, cx);
+            } else if let Some(pane) = self.session_workspace.panes.get(&uid) {
+                pane.focus.clone().focus(window, cx);
+            }
+            cx.notify();
+            return;
+        }
         if self.terminal.tabs.is_empty() {
             self.terminal.open = false;
             self.terminal.active = 0;
@@ -291,7 +428,7 @@ impl FlintApp {
 
     /// Whether keyboard focus is in a terminal (app shortcuts step aside).
     pub fn terminal_focused(&self, window: &Window, cx: &App) -> bool {
-        self.terminal.open
+        (self.terminal.open || self.session_workspace.tiled())
             && self
                 .terminal
                 .tabs
@@ -325,6 +462,7 @@ pub fn render(app: &FlintApp, cx: &mut Context<FlintApp>) -> Option<AnyElement> 
             div()
                 .id(("terminal-tab", n))
                 .h(px(26.))
+                .overflow_hidden()
                 .pl(px(10.))
                 .pr(px(4.))
                 .rounded(px(7.))
@@ -348,11 +486,13 @@ pub fn render(app: &FlintApp, cx: &mut Context<FlintApp>) -> Option<AnyElement> 
                 ))
                 .child(
                     div()
+                        .id(("terminal-tab-summary", n))
                         .max_w(px(220.))
                         .truncate()
                         .text_size(px(size::SM))
                         .text_color(if active { p.text } else { p.text_muted })
-                        .child(view.read(cx).label()),
+                        .child(view.read(cx).label())
+                        .test_support(),
                 )
                 .child(
                     div()
@@ -418,7 +558,7 @@ pub fn render(app: &FlintApp, cx: &mut Context<FlintApp>) -> Option<AnyElement> 
                 bar.child(
                     small_button("terminal-send", IconName::Send)
                         .tooltip(|window, cx| {
-                            Tooltip::new("Send this terminal to the agent").build(window, cx)
+                            Tooltip::new("Send output to this terminal's session").build(window, cx)
                         })
                         .on_click(cx.listener(|this, _, _, cx| this.send_terminal_to_agent(cx)))
                         .test_support(),

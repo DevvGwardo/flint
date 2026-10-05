@@ -13,6 +13,8 @@ mod launch;
 mod live;
 mod mapper;
 mod options;
+mod output;
+mod process;
 mod runner;
 mod saved;
 #[cfg(test)]
@@ -32,7 +34,7 @@ use std::sync::Mutex;
 use flint_agent::AgentEvent;
 use flint_agent::ApprovalMode;
 use flint_agent::SessionHandle;
-use tokio::io::AsyncBufReadExt;
+use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 use tokio_util::compat::TokioAsyncReadCompatExt;
 use tokio_util::compat::TokioAsyncWriteCompatExt;
@@ -40,7 +42,7 @@ use tokio_util::compat::TokioAsyncWriteCompatExt;
 pub use launch::AcpAgent;
 
 /// Adapter stderr kept for error messages.
-const STDERR_TAIL_CHARS: usize = 4_000;
+const STDERR_TAIL_BYTES: usize = 4_000;
 
 /// Where and how an ACP session runs.
 #[derive(Debug, Clone)]
@@ -57,6 +59,9 @@ pub struct AcpConfig {
     /// Claude Code's adapter then sends command output only that way, which
     /// flint also shows on the tool card.
     pub agent_terminals: bool,
+    /// Model/provider defaults for a genuinely new conversation. Existing
+    /// saved sessions keep their own settings.
+    pub preferred_options: std::collections::BTreeMap<String, String>,
 }
 
 /// Starts the agent's ACP adapter in the workspace and returns the session's
@@ -140,6 +145,8 @@ async fn run_process(
             return;
         }
     };
+    let pid = child.id();
+    let mut group = process::GroupGuard::new(pid);
     let (Some(stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
         let _ = events.try_send(AgentEvent::Error(format!(
             "{} started without stdio pipes",
@@ -148,24 +155,17 @@ async fn run_process(
         return;
     };
     let stderr_tail = Arc::new(Mutex::new(String::new()));
-    if let Some(stderr) = child.stderr.take() {
+    let stderr_task = child.stderr.take().map(|stderr| {
         let tail = Arc::clone(&stderr_tail);
-        tokio::spawn(async move {
-            let mut lines = tokio::io::BufReader::new(stderr).lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                if let Ok(mut tail) = tail.lock() {
-                    push_tail(&mut tail, &line);
-                }
-            }
-        });
-    }
-    let pid = child.id();
+        tokio::spawn(capture_stderr(stderr, tail))
+    });
     let context = runner::RunContext {
         agent: agent.clone(),
         workspace: config.workspace,
         session_dir: config.session_dir,
         approval: config.approval,
         agent_terminals: config.agent_terminals,
+        preferred_options: config.preferred_options,
         ops,
         events: events.clone(),
         stderr: Arc::clone(&stderr_tail),
@@ -173,31 +173,58 @@ async fn run_process(
     runner::run(stdout.compat(), stdin.compat_write(), context).await;
     // The session is over (shutdown or the agent went away): stop the
     // adapter and anything it started.
-    #[cfg(unix)]
-    if let Some(pid) = pid {
-        let _ = std::process::Command::new("kill")
-            .arg("-TERM")
-            .arg(format!("-{pid}"))
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
+    process::stop(&mut child, pid, std::time::Duration::from_secs(2)).await;
+    group.disarm();
+    if let Some(mut task) = stderr_task
+        && tokio::time::timeout(process::DRAIN_GRACE, &mut task)
+            .await
+            .is_err()
+    {
+        task.abort();
+        let _ = task.await;
     }
-    #[cfg(not(unix))]
-    let _ = pid;
-    let _ = tokio::time::timeout(std::time::Duration::from_secs(2), child.wait()).await;
-    let _ = child.kill().await;
 }
 
-/// Appends a stderr line, keeping only the last [`STDERR_TAIL_CHARS`].
-fn push_tail(tail: &mut String, line: &str) {
-    tail.push_str(line);
-    tail.push('\n');
-    if tail.len() > STDERR_TAIL_CHARS {
-        let cut = tail.len() - STDERR_TAIL_CHARS;
-        let cut = (cut..tail.len())
-            .find(|i| tail.is_char_boundary(*i))
-            .unwrap_or(0);
-        tail.drain(..cut);
+async fn capture_stderr(mut stderr: impl tokio::io::AsyncRead + Unpin, tail: Arc<Mutex<String>>) {
+    let mut buf = [0u8; 4096];
+    let mut decoder = output::Utf8Decoder::default();
+    loop {
+        let n = stderr.read(&mut buf).await.unwrap_or(0);
+        let text = decoder.decode(&buf[..n], n == 0);
+        if let Ok(mut tail) = tail.lock() {
+            output::append_tail(&mut tail, &text, STDERR_TAIL_BYTES);
+        }
+        if n == 0 {
+            break;
+        }
+    }
+}
+
+#[cfg(test)]
+mod stderr_tests {
+    use super::*;
+    use tokio::io::AsyncWriteExt;
+
+    #[tokio::test]
+    async fn stderr_without_newlines_is_captured_before_eof_with_a_byte_bound() {
+        let (mut writer, reader) = tokio::io::duplex(1024);
+        let tail = Arc::new(Mutex::new(String::new()));
+        let task = tokio::spawn(capture_stderr(reader, Arc::clone(&tail)));
+        writer.write_all(&vec![b'x'; 32 * 1024]).await.unwrap();
+        {
+            let captured = tail.lock().unwrap();
+            assert!(
+                !captured.is_empty(),
+                "no newline or EOF is needed for capture"
+            );
+            assert!(captured.len() <= STDERR_TAIL_BYTES);
+        }
+        writer.write_all("界".as_bytes()).await.unwrap();
+        writer.shutdown().await.unwrap();
+        task.await.unwrap();
+        let captured = tail.lock().unwrap();
+        assert_eq!(captured.len(), STDERR_TAIL_BYTES);
+        assert!(captured.ends_with('界'));
     }
 }
 

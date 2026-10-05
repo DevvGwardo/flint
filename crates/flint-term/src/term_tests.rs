@@ -7,6 +7,9 @@ use super::*;
 use crate::palette::Rgb8;
 use crate::snapshot::CursorShape;
 
+#[path = "snapshot_reference_tests.rs"]
+mod snapshot_reference;
+
 fn size(cols: u16, rows: u16) -> Size {
     Size {
         cols,
@@ -14,6 +17,98 @@ fn size(cols: u16, rows: u16) -> Size {
         cell_width: 8,
         cell_height: 16,
     }
+}
+
+#[test]
+#[ignore = "manual release-mode performance probe"]
+fn terminal_snapshot_perf_probe() {
+    for case in ["blank", "ascii", "wide_combining", "alternating_style"] {
+        let term = Terminal::detached(size(160, 48));
+        let body = match case {
+            "blank" => String::new(),
+            "ascii" => "x".repeat(160),
+            "wide_combining" => "e\u{301}界".repeat(53),
+            _ => "\x1b[31mx\x1b[32mx".repeat(80),
+        };
+        if !body.is_empty() {
+            for row in 1..=48 {
+                term.feed(format!("\x1b[{row};1H{body}").as_bytes());
+            }
+        }
+        let start = Instant::now();
+        for _ in 0..100 {
+            std::hint::black_box(std::hint::black_box(&term).snapshot());
+        }
+        eprintln!(
+            "terminal_snapshot_{case}_100_runs_ms={:.3}",
+            start.elapsed().as_secs_f64() * 1000.
+        );
+    }
+}
+
+#[test]
+fn snapshots_match_frozen_builder_across_unicode_styles_and_view_changes() {
+    let mut comparisons = 0;
+    for cols in [10, 40] {
+        for rows in [3, 8] {
+            for body in [
+                "",
+                "plain text\r\nnext   ",
+                "e\u{301}界🙂\x1b[31mx\x1b[0m\r\n界e\u{301}",
+                "\x1b[1;3;4;9;31mstyled\x1b[0m\x1b[2m dim\x1b[7m inverse\x1b[8m hidden",
+                "\x1b[48;2;1;2;3m  \x1b[0m\x1b[4m   \x1b[0m ",
+                "\x1b[?1h\x1b[?2004h\x1b[?25l\x1b[2;4Hgap",
+            ] {
+                let mut term = Terminal::detached(size(cols, rows));
+                term.feed(body.as_bytes());
+                for phase in 0..4 {
+                    match phase {
+                        1 => {
+                            term.start_selection(0, 0, false, 1);
+                            term.update_selection(1, 4, true);
+                        }
+                        2 => {
+                            term.feed("scroll 界e\u{301}\r\n".repeat(20).as_bytes());
+                            term.scroll(3);
+                        }
+                        3 => term.resize(size(cols + 7, rows + 2)),
+                        _ => {}
+                    }
+                    let expected = snapshot_reference::build(&term.term.lock(), &term.palette);
+                    assert_eq!(
+                        term.snapshot(),
+                        expected,
+                        "cols={cols}, rows={rows}, phase={phase}, body={body:?}"
+                    );
+                    comparisons += 1;
+                }
+            }
+        }
+    }
+    assert_eq!(comparisons, 96);
+}
+
+#[test]
+fn merged_terminal_runs_keep_combining_marks_styles_and_snapshot_ownership() {
+    let term = Terminal::detached(size(40, 3));
+    term.feed("ae\u{301}界🙂\x1b[31mred\u{301}\x1b[0mend".as_bytes());
+    let snapshot = term.snapshot();
+    assert_eq!(snapshot.lines[0].len(), 3);
+    assert_eq!(
+        (
+            snapshot.lines[0][0].text.as_str(),
+            snapshot.lines[0][0].width
+        ),
+        ("ae\u{301}界🙂", 6)
+    );
+    assert_eq!(
+        (snapshot.lines[0][1].text.as_str(), snapshot.lines[0][1].col),
+        ("red\u{301}", 6)
+    );
+    let original = snapshot.clone();
+    let mut changed = snapshot;
+    changed.lines[0][0].text.clear();
+    assert_eq!(term.snapshot(), original);
 }
 
 #[test]
@@ -49,6 +144,18 @@ fn escape_sequences_land_in_the_grid_with_colours() {
 }
 
 #[test]
+fn bare_newlines_return_to_the_first_column() {
+    let term = Terminal::detached(size(20, 4));
+    term.feed(b"cli.rs\nclock.rs\r\ncolor.rs\n");
+    let snap = term.snapshot();
+    assert_eq!(
+        snap.text_lines(),
+        vec!["cli.rs", "clock.rs", "color.rs", ""]
+    );
+    assert_eq!((snap.cursor.row, snap.cursor.col), (3, 0));
+}
+
+#[test]
 fn wide_characters_take_two_columns() {
     let term = Terminal::detached(size(10, 2));
     term.feed("a界b".as_bytes());
@@ -56,6 +163,17 @@ fn wide_characters_take_two_columns() {
     let run = &snap.lines[0][0];
     assert_eq!((run.text.as_str(), run.width), ("a界b", 4));
     assert_eq!(snap.cursor.col, 4);
+}
+
+#[test]
+fn styled_wide_and_combining_runs_use_cell_endpoints() {
+    let term = Terminal::detached(size(20, 3));
+    term.feed("界\x1b[31mx\x1b[0m\n".as_bytes());
+    term.feed("e\u{301}\x1b[32mx\x1b[0m\x1b[2Cy".as_bytes());
+    assert_eq!(
+        term.snapshot().text_lines(),
+        vec!["界x", "e\u{301}x  y", ""]
+    );
 }
 
 #[test]
@@ -132,6 +250,42 @@ fn wakeups_are_coalesced_until_acknowledged() {
     term.acknowledge_wakeup();
     term.feed(b"y");
     assert_eq!(events.try_recv(), Ok(TermEvent::Wakeup));
+}
+
+#[test]
+fn title_and_bell_floods_are_bounded_and_keep_the_latest_title_and_exit() {
+    let term = Terminal::detached(size(10, 2));
+    let events = term.events();
+    // Include a control event: coalescing must never discard it.
+    term.listener.send_event(Event::ChildExit({
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt;
+            std::process::ExitStatus::from_raw(3 << 8)
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::ExitStatusExt;
+            std::process::ExitStatus::from_raw(3)
+        }
+    }));
+    for i in 0..10_000 {
+        term.feed(format!("\x1b]2;title {i}\x07\x07").as_bytes());
+    }
+    assert!(events.len() <= 4);
+    let mut drained = Vec::new();
+    while let Ok(event) = events.try_recv() {
+        drained.push(event);
+    }
+    assert!(drained.contains(&TermEvent::Title("title 9999".into())));
+    assert!(drained.contains(&TermEvent::Exited(Some(3))));
+    assert_eq!(
+        drained
+            .iter()
+            .filter(|e| matches!(e, TermEvent::Bell))
+            .count(),
+        1
+    );
 }
 
 #[test]

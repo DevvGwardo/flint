@@ -31,6 +31,15 @@ pub(crate) struct Fake {
 }
 
 impl Fake {
+    pub async fn closed(&mut self) {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            // Dropping an SDK request may send $/cancel_request before EOF.
+            while self.lines.next_line().await.expect("read").is_some() {}
+        })
+        .await
+        .expect("connection closes in time");
+    }
+
     pub async fn recv(&mut self) -> Value {
         let line = tokio::time::timeout(Duration::from_secs(10), self.lines.next_line())
             .await
@@ -176,6 +185,15 @@ pub(crate) fn start_agent(
     approval: ApprovalMode,
     session_dir: Option<&str>,
 ) -> (Harness, Fake) {
+    start_agent_with_preferences(agent, approval, session_dir, Default::default())
+}
+
+pub(crate) fn start_agent_with_preferences(
+    agent: AcpAgent,
+    approval: ApprovalMode,
+    session_dir: Option<&str>,
+    preferred_options: std::collections::BTreeMap<String, String>,
+) -> (Harness, Fake) {
     let dir = tempfile::tempdir().expect("tempdir");
     let workspace = dir.path().canonicalize().expect("canonical");
     let (client_side, agent_side) = tokio::io::duplex(1 << 20);
@@ -190,6 +208,7 @@ pub(crate) fn start_agent(
         session_dir: session_dir.map(|d| workspace.join(d)),
         approval,
         agent_terminals: true,
+        preferred_options,
         ops: ops_rx,
         events: events_tx,
         stderr: Arc::clone(&stderr),

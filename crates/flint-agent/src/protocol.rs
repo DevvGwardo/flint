@@ -21,6 +21,8 @@ pub struct AgentConfig {
     pub api_key: String,
     /// Directory the agent works in; tools resolve relative paths against it.
     pub workspace: PathBuf,
+    /// General-purpose assistance rather than assuming a coding project.
+    pub general: bool,
     pub approval: ApprovalMode,
     /// Optional JEV judge; `None` keeps the harness on its heuristics.
     pub jev: Option<JevConfig>,
@@ -33,6 +35,24 @@ pub struct AgentConfig {
     pub context_budget_tokens: u64,
     /// Sent as `reasoning_effort`; `None` leaves the provider default.
     pub reasoning_effort: Option<ReasoningEffort>,
+    /// Run shell commands in a sandbox that only lets them write inside the
+    /// workspace, temp directories and build caches (macOS; ignored where
+    /// unsupported).
+    pub sandbox: bool,
+    /// MCP servers whose tools the agent may call.
+    pub mcp_servers: Vec<McpServerConfig>,
+}
+
+/// A Model Context Protocol server started over stdio.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct McpServerConfig {
+    /// Short name; its tools are offered as `mcp__<name>__<tool>`.
+    pub name: String,
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub env: Vec<(String, String)>,
 }
 
 /// Default for [`AgentConfig::context_budget_tokens`]: `0` sizes the budget
@@ -87,11 +107,17 @@ impl std::fmt::Debug for AgentConfig {
             .field("subagent_model", &self.subagent_model)
             .field("api_key", &"<redacted>")
             .field("workspace", &self.workspace)
+            .field("general", &self.general)
             .field("approval", &self.approval)
             .field("jev", &self.jev)
             .field("session_dir", &self.session_dir)
             .field("context_budget_tokens", &self.context_budget_tokens)
             .field("reasoning_effort", &self.reasoning_effort)
+            .field("sandbox", &self.sandbox)
+            .field(
+                "mcp_servers",
+                &self.mcp_servers.iter().map(|s| &s.name).collect::<Vec<_>>(),
+            )
             .finish()
     }
 }
@@ -116,6 +142,13 @@ pub enum Op {
         text: String,
         images: Vec<ImageAttachment>,
     },
+    /// Add a user instruction at the next safe model boundary. Native only;
+    /// SteeringAccepted acknowledges when it enters the conversation.
+    SteerMessage {
+        id: u64,
+        text: String,
+        images: Vec<ImageAttachment>,
+    },
     /// Stop the running turn as soon as possible.
     Interrupt,
     /// Answer an [`AgentEvent::ApprovalRequested`].
@@ -125,6 +158,10 @@ pub enum Op {
     },
     /// Change the reasoning effort for later model calls (`None` = provider default).
     SetReasoningEffort(Option<ReasoningEffort>),
+    /// Restore the files the agent changed in its most recent turn with
+    /// changes (flint's own engine; queued behind a running turn). Answered
+    /// by [`AgentEvent::FilesReverted`] or an [`AgentEvent::Error`].
+    UndoLastTurn,
     /// Set one of the agent's [`SessionOption`]s to one of its choices.
     SetSessionOption {
         id: String,
@@ -144,8 +181,11 @@ pub struct ImageAttachment {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ApprovalDecision {
     Approve,
-    /// Approve this, all pending parent/child calls and future calls in the
-    /// shared native engine. ACP agents implement their own permissions.
+    /// Approve this and all pending parent/child calls, and from now on the
+    /// native engine's calls like it: every edit after an edit, or commands
+    /// with the same program and subcommand after a command (exact matches
+    /// only for chained commands and risky programs). ACP agents implement
+    /// their own permissions.
     ApproveAlways,
     Deny,
 }
@@ -154,6 +194,10 @@ pub enum ApprovalDecision {
 /// `TurnStarted` and `TurnFinished` with the same `turn_id`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum AgentEvent {
+    /// A native steering instruction entered the agent's conversation.
+    SteeringAccepted {
+        id: u64,
+    },
     /// Native engine shutdown, after parent and child history writers finish.
     SessionStopped {
         history_saved: bool,
@@ -233,6 +277,13 @@ pub enum AgentEvent {
     },
     /// A non-fatal problem worth showing (provider error, bad config, ...).
     Error(String),
+    /// Files an undo restored (one diff each, current -> restored) and files
+    /// it left alone with the reason.
+    FilesReverted {
+        turn_id: u64,
+        diffs: Vec<FileDiff>,
+        skipped: Vec<String>,
+    },
     /// The agent's adjustable settings (model, reasoning, mode, …), sent
     /// when the session is ready and whenever they change. An ACP session
     /// always sends this once it is ready, even if the list is empty.

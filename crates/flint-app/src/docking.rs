@@ -115,7 +115,10 @@ impl Node {
                         [None, Some(b)] => width - b,
                         [None, None] => width / 2.,
                     }
-                    .clamp(100., (width - 100.).max(100.))
+                    .clamp(
+                        first.minimum(*axis, app),
+                        (width - second.minimum(*axis, app)).max(first.minimum(*axis, app)),
+                    )
                 } else {
                     width
                 };
@@ -254,10 +257,12 @@ impl Node {
     fn minimum(&self, axis: SplitAxis, app: &FlintApp) -> f32 {
         match self {
             Self::Panel { panel } => {
-                if visible(app, *panel) {
-                    100.
-                } else {
+                if !visible(app, *panel) {
                     0.
+                } else if *panel == Panel::Sidebar && axis == SplitAxis::Horizontal {
+                    crate::sidebar::MIN_WIDTH + crate::layout::SIDEBAR_INSET * 2.
+                } else {
+                    100.
                 }
             }
             Self::Split {
@@ -365,6 +370,16 @@ impl Layout {
 
 impl FlintApp {
     pub(crate) fn chat_width(&self, window_width: f32) -> f32 {
+        if self.session_workspace.tiled()
+            && let Some(pane) = self.session_workspace.panes.get(&self.session().uid)
+            && let Some(bounds) = pane.bounds.get()
+        {
+            return f32::from(bounds.size.width);
+        }
+        self.chat_panel_width(window_width)
+    }
+
+    pub(crate) fn chat_panel_width(&self, window_width: f32) -> f32 {
         self.dock_layout
             .root
             .panel_width(Panel::Chat, window_width, self)
@@ -523,7 +538,7 @@ fn visible(app: &FlintApp, panel: Panel) -> bool {
         Panel::Chat => true,
         Panel::Sidebar => app.sidebar_visible,
         Panel::Changes => app.changes_open,
-        Panel::Terminal => app.terminal.open,
+        Panel::Terminal => app.terminal.open && !app.session_workspace.tiled(),
     }
 }
 
@@ -545,6 +560,9 @@ fn render_node(
                     .bg(palette().window_tint)
                     .child(crate::sidebar::render(app, cx))
                     .into_any_element(),
+                Panel::Chat if app.session_workspace.tiled() => {
+                    crate::session_workspace::render(app, window, cx)
+                }
                 Panel::Chat => div()
                     .id("main-column")
                     .size_full()
@@ -559,6 +577,18 @@ fn render_node(
                             .child(crate::transcript::render_main(app, window, cx))
                             // The room composer popovers must stay inside.
                             .child(crate::popover::probe(&app.popover_room, |room| &room.area)),
+                    )
+                    .when(
+                        app.session_workspace
+                            .dragging
+                            .is_some_and(|uid| uid != app.session().uid)
+                            && cx.has_active_drag(),
+                        |column| {
+                            column.relative().child(
+                                deferred(crate::session_workspace::targets(app.session().uid, cx))
+                                    .with_priority(5),
+                            )
+                        },
                     )
                     .into_any_element(),
                 Panel::Changes => crate::changes_panel::render(app, cx).into_any_element(),

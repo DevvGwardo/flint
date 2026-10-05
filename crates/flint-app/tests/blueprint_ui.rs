@@ -21,7 +21,901 @@ use gpui_kit::{
     ScrollDelta, TestAppContext, Window, WindowBounds, WindowOptions, point, px, size,
 };
 use serde_json::json;
+#[path = "blueprint_ui/command_preview.rs"]
+mod command_preview_ui;
+#[path = "blueprint_ui/composer_refresh.rs"]
+mod composer_refresh_ui;
+#[path = "blueprint_ui/event_logging.rs"]
+mod event_logging_ui;
+#[path = "blueprint_ui/failure_status.rs"]
+mod failure_status_ui;
+#[path = "blueprint_ui/file_preview.rs"]
+mod file_preview_ui;
+#[path = "blueprint_ui/general.rs"]
+mod general_ui;
 mod local_provider;
+#[path = "blueprint_ui/menu_overflow.rs"]
+mod menu_overflow_ui;
+#[path = "blueprint_ui/prompt_queue.rs"]
+mod prompt_queue_ui;
+#[path = "blueprint_ui/selection_retention.rs"]
+mod selection_retention_ui;
+#[path = "blueprint_ui/sidebar.rs"]
+mod sidebar_ui;
+#[path = "blueprint_ui/subagents.rs"]
+mod subagent_ui;
+#[path = "blueprint_ui/terminal_snapshot.rs"]
+mod terminal_snapshot_ui;
+#[path = "blueprint_ui/tool_detail.rs"]
+mod tool_detail_ui;
+#[path = "blueprint_ui/unicode_mention.rs"]
+mod unicode_mention_ui;
+#[path = "blueprint_ui/worktrees.rs"]
+mod worktree_ui;
+
+fn session_pane_fixture(cx: &mut TestAppContext, count: usize) -> (Ui, Vec<(u64, Engine)>) {
+    let ui = open_with(cx, terminal_options());
+    let mut sessions = Vec::new();
+    for ix in 0..count {
+        if ix > 0 {
+            ui.press(cx, "cmd-n");
+        }
+        let engine = ui.engine(cx);
+        ui.input(cx, &format!("Pane {ix}"));
+        ui.press(cx, "enter");
+        engine.sent();
+        engine.send(
+            cx,
+            AgentEvent::TerminalStarted {
+                terminal_id: "same-id".into(),
+                call_id: None,
+                label: format!("Terminal {ix}"),
+                cwd: None,
+            },
+        );
+        sessions.push((ui.read(cx, |app, _| app.session().uid), engine));
+    }
+    ui.with(cx, |window, cx| {
+        ui.app
+            .update(cx, |app, cx| app.select_session(0, window, cx))
+    });
+    (ui, sessions)
+}
+
+fn drag_session_pane(
+    ui: &Ui,
+    cx: &mut TestAppContext,
+    uid: u64,
+    target: u64,
+    edge: flint_app::docking::Edge,
+) {
+    use flint_app::docking::Edge;
+    let ix = ui.read(cx, |app, _| {
+        app.sessions
+            .iter()
+            .position(|session| session.uid == uid)
+            .unwrap()
+    });
+    ui.with(cx, |window, cx| {
+        window.render_frame(cx);
+        let from = window.find(("session", ix)).bounds().center();
+        let bounds = window
+            .try_find(ElementId::Name(format!("session-pane-{target}").into()))
+            .map(|element| element.bounds())
+            .unwrap_or_else(|| {
+                window
+                    .find(ElementId::Name("dock-panel-chat".into()))
+                    .bounds()
+            });
+        let center = bounds.center();
+        let to = match edge {
+            Edge::Left => point(bounds.left() + px(12.), center.y),
+            Edge::Right => point(bounds.right() - px(12.), center.y),
+            Edge::Top => point(center.x, bounds.top() + px(12.)),
+            Edge::Bottom => point(center.x, bounds.bottom() - px(12.)),
+        };
+        window.drag(from, to, cx);
+    });
+    settle(cx);
+}
+
+fn session_pane_bounds(ui: &Ui, cx: &mut TestAppContext, uid: u64) -> Bounds<gpui_kit::Pixels> {
+    ui.with(cx, |window, cx| {
+        window.render_frame(cx);
+        window
+            .find(ElementId::Name(format!("session-pane-{uid}").into()))
+            .bounds()
+    })
+}
+
+#[gpui_kit::test]
+fn session_panes_drag_actual_sessions_and_keep_two_terminals_live(cx: &mut TestAppContext) {
+    use flint_app::docking::Edge;
+    let (ui, sessions) = session_pane_fixture(cx, 2);
+    let ids = ui.read(cx, |app, _| {
+        app.terminal
+            .tabs
+            .iter()
+            .map(Entity::entity_id)
+            .collect::<Vec<_>>()
+    });
+    drag_session_pane(&ui, cx, sessions[1].0, sessions[0].0, Edge::Right);
+    assert!(has(&ui, cx, "session-workspace"));
+    assert!(!has(&ui, cx, "dock-panel-terminal"));
+    for (uid, engine) in &sessions {
+        assert!(has(&ui, cx, &format!("session-pane-{uid}")));
+        ui.click(
+            cx,
+            ElementId::Name(format!("session-pane-mode-{uid}-terminal").into()),
+        );
+        engine.send(
+            cx,
+            AgentEvent::TerminalOutput {
+                terminal_id: "same-id".into(),
+                data: format!("output from {uid}\n"),
+                replace: false,
+            },
+        );
+    }
+    let left = session_pane_bounds(&ui, cx, sessions[0].0);
+    let right = session_pane_bounds(&ui, cx, sessions[1].0);
+    assert!(left.right() <= right.left() + px(2.));
+    assert_eq!(
+        ui.read(cx, |app, _| app
+            .terminal
+            .tabs
+            .iter()
+            .map(Entity::entity_id)
+            .collect::<Vec<_>>()),
+        ids
+    );
+    for (uid, _) in &sessions {
+        let text = ui.read(cx, |app, cx| {
+            app.pane_terminal(*uid)
+                .unwrap()
+                .read(cx)
+                .terminal
+                .buffer_text()
+        });
+        assert!(text.contains(&format!("output from {uid}")), "{text:?}");
+        assert_eq!(
+            ui.read(cx, |app, cx| app
+                .pane_terminal(*uid)
+                .unwrap()
+                .read(cx)
+                .session_uid),
+            Some(*uid)
+        );
+    }
+}
+
+#[gpui_kit::test]
+fn session_panes_split_without_spawning_shells(cx: &mut TestAppContext) {
+    use flint_app::docking::Edge;
+    let ui = open_with(cx, terminal_options());
+    let mut uids = Vec::new();
+    for ix in 0..2 {
+        if ix > 0 {
+            ui.press(cx, "cmd-n");
+        }
+        let engine = ui.engine(cx);
+        ui.input(cx, &format!("Pane {ix}"));
+        ui.press(cx, "enter");
+        engine.sent();
+        uids.push(ui.read(cx, |app, _| app.session().uid));
+    }
+    ui.with(cx, |window, cx| {
+        ui.app
+            .update(cx, |app, cx| app.select_session(0, window, cx))
+    });
+    let tabs = ui.read(cx, |app, _| app.terminal.tabs.len());
+    drag_session_pane(&ui, cx, uids[1], uids[0], Edge::Right);
+    assert!(has(&ui, cx, "session-workspace"));
+    assert_eq!(ui.read(cx, |app, _| app.terminal.tabs.len()), tabs);
+    for uid in &uids {
+        // An empty terminal half collapses to a strip that opens one on demand.
+        assert!(has(&ui, cx, &format!("session-terminal-collapsed-{uid}")));
+        assert!(!has(&ui, cx, &format!("session-terminal-{uid}")));
+    }
+}
+
+#[gpui_kit::test]
+fn session_panes_keep_agent_command_terminals_collapsed_until_asked(cx: &mut TestAppContext) {
+    use flint_app::docking::Edge;
+    let (ui, sessions) = session_pane_fixture(cx, 2);
+    drag_session_pane(&ui, cx, sessions[1].0, sessions[0].0, Edge::Right);
+    let started = AgentEvent::TerminalStarted {
+        terminal_id: "later-command".into(),
+        call_id: None,
+        label: "later-command".into(),
+        cwd: None,
+    };
+    sessions[0].1.send(cx, started);
+    for (uid, _) in &sessions {
+        assert!(ui.read(cx, |app, _| app.pane_terminal(*uid).is_some()));
+        assert!(has(&ui, cx, &format!("session-terminal-collapsed-{uid}")));
+        assert!(!has(&ui, cx, &format!("session-terminal-{uid}")));
+    }
+    let uid = sessions[0].0;
+    ui.click(
+        cx,
+        ElementId::Name(format!("session-terminal-collapsed-{uid}").into()),
+    );
+    assert!(has(&ui, cx, &format!("session-terminal-{uid}")));
+    assert!(!has(
+        &ui,
+        cx,
+        &format!("session-terminal-{}", sessions[1].0)
+    ));
+}
+
+#[gpui_kit::test]
+fn session_panes_arrange_four_sessions_into_an_even_grid(cx: &mut TestAppContext) {
+    use flint_app::docking::Edge;
+    let (ui, sessions) = session_pane_fixture(cx, 4);
+    for ix in 1..4 {
+        drag_session_pane(&ui, cx, sessions[ix].0, sessions[ix - 1].0, Edge::Right);
+    }
+    for (uid, _) in &sessions {
+        ui.click(
+            cx,
+            ElementId::Name(format!("session-pane-mode-{uid}-terminal").into()),
+        );
+    }
+    ui.click(cx, "session-grid");
+    let panes: Vec<_> = sessions
+        .iter()
+        .map(|(uid, _)| session_pane_bounds(&ui, cx, *uid))
+        .collect();
+    assert!(panes[0].right() <= panes[1].left() + px(2.));
+    assert!(panes[0].bottom() <= panes[2].top() + px(2.));
+    assert!(panes[2].right() <= panes[3].left() + px(2.));
+    assert!(
+        (panes[0].size.width - panes[1].size.width).abs() < px(4.),
+        "{panes:?}"
+    );
+    assert!(
+        (panes[0].size.height - panes[2].size.height).abs() < px(4.),
+        "{panes:?}"
+    );
+    let chat = panel_bounds(&ui, cx, flint_app::docking::Panel::Chat);
+    for pane in panes {
+        assert!(pane.left() >= chat.left() && pane.right() <= chat.right());
+        assert!(
+            pane.top() >= chat.top() && pane.bottom() <= chat.bottom(),
+            "{pane:?} outside {chat:?}"
+        );
+    }
+}
+
+#[gpui_kit::test]
+fn session_panes_keep_drafts_and_route_messages_to_the_focused_engine(cx: &mut TestAppContext) {
+    use flint_app::docking::Edge;
+    let (ui, sessions) = session_pane_fixture(cx, 2);
+    ui.input(cx, "first draft");
+    let first_composer = ui.read(cx, |app, _| app.composer.entity_id());
+    drag_session_pane(&ui, cx, sessions[1].0, sessions[0].0, Edge::Right);
+    assert_eq!(ui.composer_text(cx), "");
+    ui.input(cx, "second draft");
+    let second_composer = ui.read(cx, |app, _| app.composer.entity_id());
+    assert_ne!(first_composer, second_composer);
+    ui.click(
+        cx,
+        ElementId::Name(format!("session-pane-compose-{}", sessions[0].0).into()),
+    );
+    assert_eq!(ui.composer_text(cx), "first draft");
+    assert_eq!(
+        ui.read(cx, |app, _| app.composer.entity_id()),
+        first_composer
+    );
+    ui.press(cx, "enter");
+    assert!(sessions[0].1.sent().is_empty());
+    assert_eq!(
+        ui.read(cx, |app, _| app.sessions[0].prompt_queue.items[0]
+            .text
+            .clone()),
+        "first draft"
+    );
+    sessions[0]
+        .1
+        .send(cx, AgentEvent::TurnStarted { turn_id: 1 });
+    sessions[0].1.send(
+        cx,
+        AgentEvent::TurnFinished {
+            turn_id: 1,
+            reason: TurnEndReason::Completed,
+        },
+    );
+    let sent = sessions[0].1.sent();
+    assert!(
+        matches!(sent.as_slice(), [Op::UserMessage(text)] if text == "first draft"),
+        "sent {sent:?}; state {:?}",
+        ui.read(cx, |app, cx| (
+            app.session().uid,
+            app.composer.read(cx).value().to_string(),
+            app.session().view.running,
+            app.store_error.clone()
+        ))
+    );
+    assert!(sessions[1].1.sent().is_empty());
+    ui.click(
+        cx,
+        ElementId::Name(format!("session-pane-compose-{}", sessions[1].0).into()),
+    );
+    assert_eq!(ui.composer_text(cx), "second draft");
+    assert_eq!(
+        ui.read(cx, |app, _| app.composer.entity_id()),
+        second_composer
+    );
+}
+
+#[gpui_kit::test]
+fn compact_eight_pane_composer_keeps_lower_options_reachable(cx: &mut TestAppContext) {
+    use flint_app::docking::Edge;
+    use flint_app::session_workspace::{Node, PaneMode};
+    fn equal_splits(node: &mut Node<u64>) {
+        if let Node::Split {
+            sizes,
+            first,
+            second,
+            ..
+        } = node
+        {
+            *sizes = [None, None];
+            equal_splits(first);
+            equal_splits(second);
+        }
+    }
+    let (ui, sessions) = session_pane_fixture(cx, 8);
+    for (_, engine) in &sessions {
+        engine.send(
+            cx,
+            AgentEvent::TurnFinished {
+                turn_id: 1,
+                reason: TurnEndReason::Completed,
+            },
+        );
+    }
+    ui.with(cx, |window, cx| {
+        ui.app.update(cx, |app, cx| {
+            for ix in 1..sessions.len() {
+                assert!(app.split_session_pane(
+                    sessions[ix].0,
+                    sessions[ix - 1].0,
+                    Edge::Right,
+                    window,
+                    cx,
+                ));
+            }
+            for (uid, _) in &sessions {
+                app.set_session_pane_mode(*uid, PaneMode::Chat, window, cx);
+            }
+            app.arrange_session_grid(cx);
+            // An accepted restored layout can contain equal nested splits,
+            // yielding a compact upper-left tile instead of uniform cells.
+            equal_splits(app.session_workspace.layout.root.as_mut().unwrap());
+            app.session_workspace.revision += 1;
+            app.effort_supported = true;
+            app.focus_session_pane(sessions[0].0, true, window, cx);
+        });
+    });
+    settle(cx);
+    ui.with(cx, |window, cx| {
+        for _ in 0..3 {
+            window.render_frame(cx);
+        }
+        window.scroll(
+            "composer-options",
+            ScrollDelta::Pixels(point(px(0.), px(-200.))),
+            cx,
+        );
+    });
+    settle(cx);
+    ui.with(cx, |window, cx| {
+        window.render_frame(cx);
+        let card = ui.app.read(cx).popover_room.anchor.get().unwrap();
+        let option = window.find("approval-hint").bounds();
+        let send = window.find("send").bounds();
+        let body = window.find("composer-body").bounds();
+        assert!(
+            body.size.height >= px(44.),
+            "the input is crushed by wrapped controls: {body:?}"
+        );
+        assert!(
+            option.top() >= card.top() && option.bottom() <= card.bottom(),
+            "lower option remains clipped: {option:?} outside {card:?}"
+        );
+        assert!(send.top() >= card.top() && send.bottom() <= card.bottom());
+        let uid = ui.app.read(cx).session().uid;
+        let pane = window
+            .find(ElementId::Name(format!("session-pane-{uid}").into()))
+            .bounds();
+        assert!(card.top() >= pane.top() && card.bottom() <= pane.bottom());
+    });
+}
+
+#[gpui_kit::test]
+fn one_two_four_and_eight_sessions_keep_concurrent_chat_and_terminal_output_separate(
+    cx: &mut TestAppContext,
+) {
+    use flint_app::docking::Edge;
+    for count in [1, 2, 4, 8] {
+        let (ui, sessions) = session_pane_fixture(cx, count);
+        for ix in 1..count {
+            ui.with(cx, |window, cx| {
+                ui.app.update(cx, |app, cx| {
+                    assert!(app.split_session_pane(
+                        sessions[ix].0,
+                        sessions[ix - 1].0,
+                        Edge::Right,
+                        window,
+                        cx,
+                    ));
+                });
+            });
+        }
+        if count > 1 {
+            ui.click(cx, "session-grid");
+        }
+        for (uid, engine) in &sessions {
+            engine
+                .events
+                .try_send(AgentEvent::TurnStarted { turn_id: 1 })
+                .unwrap();
+            for _ in 0..40 {
+                for event in [
+                    AgentEvent::TextDelta(format!("chat-{uid} 界 ")),
+                    AgentEvent::TerminalOutput {
+                        terminal_id: "same-id".into(),
+                        data: format!("terminal-{uid} 🙂\r\n"),
+                        replace: false,
+                    },
+                ] {
+                    engine.events.try_send(event).unwrap();
+                }
+            }
+            engine
+                .events
+                .try_send(AgentEvent::TurnFinished {
+                    turn_id: 1,
+                    reason: TurnEndReason::Completed,
+                })
+                .unwrap();
+        }
+        cx.run_until_parked();
+        ui.press(cx, "cmd-l");
+        ui.input(cx, "independent active draft");
+        settle(cx);
+        assert_eq!(
+            ui.composer_text(cx),
+            "independent active draft",
+            "{count} panes"
+        );
+        for (uid, engine) in &sessions {
+            assert!(engine.sent().is_empty());
+            assert!(ui.read(cx, |app, cx| {
+                let session = app
+                    .sessions
+                    .iter()
+                    .find(|session| session.uid == *uid)
+                    .unwrap();
+                let chat = format!("chat-{uid} 界 ").repeat(40);
+                assert!(!session.view.running);
+                assert!(
+                    session
+                        .view
+                        .items
+                        .iter()
+                        .any(|item| matches!(item, Item::Assistant { text, .. } if text == &chat),)
+                );
+                let terminal = app
+                    .terminal
+                    .tabs
+                    .iter()
+                    .find(|view| view.read(cx).session_uid == Some(*uid))
+                    .unwrap()
+                    .read(cx)
+                    .terminal
+                    .buffer_text();
+                terminal.contains(&format!("terminal-{uid} 🙂"))
+                    && sessions.iter().all(|(other, _)| {
+                        *other == *uid || !terminal.contains(&format!("terminal-{other} 🙂"))
+                    })
+            }));
+            if count > 1 {
+                let bounds = session_pane_bounds(&ui, cx, *uid);
+                assert!(bounds.size.width > px(100.) && bounds.size.height > px(100.));
+            }
+        }
+    }
+}
+
+#[gpui_kit::test]
+fn session_panes_close_without_stopping_sessions_and_preserve_the_remaining_draft(
+    cx: &mut TestAppContext,
+) {
+    use flint_app::docking::Edge;
+    let (ui, sessions) = session_pane_fixture(cx, 2);
+    ui.input(cx, "keep first draft");
+    drag_session_pane(&ui, cx, sessions[1].0, sessions[0].0, Edge::Right);
+    let terminal_ids = ui.read(cx, |app, _| {
+        app.terminal
+            .tabs
+            .iter()
+            .map(Entity::entity_id)
+            .collect::<Vec<_>>()
+    });
+    ui.click(
+        cx,
+        ElementId::Name(format!("session-pane-close-{}", sessions[1].0).into()),
+    );
+    assert!(!has(&ui, cx, "session-workspace"));
+    assert_eq!(ui.read(cx, |app, _| app.session().uid), sessions[0].0);
+    assert_eq!(ui.composer_text(cx), "keep first draft");
+    assert_eq!(ui.read(cx, |app, _| app.sessions.len()), 2);
+    assert_eq!(
+        ui.read(cx, |app, _| app
+            .terminal
+            .tabs
+            .iter()
+            .map(Entity::entity_id)
+            .collect::<Vec<_>>()),
+        terminal_ids
+    );
+    for (_, engine) in sessions {
+        assert!(
+            engine.sent().is_empty(),
+            "closing a pane sent an engine operation"
+        );
+    }
+}
+
+#[gpui_kit::test]
+fn session_panes_restore_saved_session_ids_modes_and_focus(cx: &mut TestAppContext) {
+    use flint_app::docking::Edge;
+    let (ui, sessions) = session_pane_fixture(cx, 2);
+    let home = ui.read(cx, |app, _| app.home.clone());
+    drag_session_pane(&ui, cx, sessions[1].0, sessions[0].0, Edge::Right);
+    ui.click(
+        cx,
+        ElementId::Name(format!("session-pane-mode-{}-terminal", sessions[1].0).into()),
+    );
+    let saved: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(home.join("session-layout.json")).unwrap()).unwrap();
+    assert_eq!(saved["version"], 1);
+    let active_id = saved["active"].as_str().unwrap();
+    let options = Options {
+        home: Some(home),
+        ..terminal_options()
+    };
+    let restored = open_with(cx, options);
+    assert!(has(&restored, cx, "session-workspace"));
+    let restored_uid = restored.read(cx, |app, _| {
+        assert_eq!(
+            app.session()
+                .dir
+                .as_ref()
+                .unwrap()
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            active_id
+        );
+        app.session().uid
+    });
+    assert!(has(
+        &restored,
+        cx,
+        &format!("session-terminal-{restored_uid}")
+    ));
+    assert!(!has(
+        &restored,
+        cx,
+        &format!("session-transcript-{restored_uid}")
+    ));
+}
+
+#[gpui_kit::test]
+fn session_panes_resize_dividers_and_restore_their_proportions(cx: &mut TestAppContext) {
+    use flint_app::docking::Edge;
+    let (ui, sessions) = session_pane_fixture(cx, 2);
+    let home = ui.read(cx, |app, _| app.home.clone());
+    drag_session_pane(&ui, cx, sessions[1].0, sessions[0].0, Edge::Right);
+    let before = session_pane_bounds(&ui, cx, sessions[0].0);
+    ui.with(cx, |window, cx| {
+        let from = point(before.right() + px(1.), before.center().y);
+        window.drag(from, from + point(px(110.), px(0.)), cx);
+    });
+    settle(cx);
+    let after = session_pane_bounds(&ui, cx, sessions[0].0);
+    assert!(
+        after.size.width > before.size.width + px(80.),
+        "{before:?} -> {after:?}"
+    );
+    let saved: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(home.join("session-layout.json")).unwrap()).unwrap();
+    assert!(
+        saved["root"]["sizes"][0].as_f64().unwrap() > saved["root"]["sizes"][1].as_f64().unwrap()
+    );
+    let again = open_with(
+        cx,
+        Options {
+            home: Some(home),
+            ..terminal_options()
+        },
+    );
+    let first = again.read(cx, |app, _| {
+        app.sessions
+            .iter()
+            .find(|session| session.title() == "Pane 0")
+            .unwrap()
+            .uid
+    });
+    let restored = session_pane_bounds(&again, cx, first);
+    assert!(
+        (restored.size.width - after.size.width).abs() <= px(3.),
+        "{after:?} -> {restored:?}"
+    );
+}
+
+#[gpui_kit::test]
+fn session_panes_sidebar_selection_replaces_only_the_focused_pane(cx: &mut TestAppContext) {
+    use flint_app::docking::Edge;
+    let (ui, sessions) = session_pane_fixture(cx, 3);
+    drag_session_pane(&ui, cx, sessions[1].0, sessions[0].0, Edge::Right);
+    ui.click(cx, ("session", 2usize));
+    assert_eq!(ui.read(cx, |app, _| app.session().uid), sessions[2].0);
+    assert!(has(&ui, cx, &format!("session-pane-{}", sessions[0].0)));
+    assert!(has(&ui, cx, &format!("session-pane-{}", sessions[2].0)));
+    assert!(!has(&ui, cx, &format!("session-pane-{}", sessions[1].0)));
+    assert!(ui.read(cx, |app, _| app.pane_terminal(sessions[2].0).is_some()));
+    ui.click(cx, ("session", 0usize));
+    assert!(has(&ui, cx, &format!("session-pane-{}", sessions[2].0)));
+    assert_eq!(ui.read(cx, |app, _| app.session().uid), sessions[0].0);
+}
+
+#[gpui_kit::test]
+fn session_panes_escape_cancels_sidebar_drag_without_interrupting_work(cx: &mut TestAppContext) {
+    use gpui_kit::{InputEvent as _, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent};
+    let (ui, sessions) = session_pane_fixture(cx, 2);
+    sessions[0]
+        .1
+        .send(cx, AgentEvent::TurnStarted { turn_id: 1 });
+    ui.with(cx, |window, cx| {
+        window.render_frame(cx);
+        let from = window.find(("session", 1usize)).bounds().center();
+        window.dispatch_event(
+            MouseDownEvent {
+                button: MouseButton::Left,
+                position: from,
+                modifiers: Default::default(),
+                click_count: 1,
+                first_mouse: false,
+            }
+            .to_platform_input(),
+            cx,
+        );
+        window.render_frame(cx);
+        let to = from + point(px(30.), px(30.));
+        window.dispatch_event(
+            MouseMoveEvent {
+                position: to,
+                pressed_button: Some(MouseButton::Left),
+                modifiers: Default::default(),
+            }
+            .to_platform_input(),
+            cx,
+        );
+        window.render_frame(cx);
+        assert!(cx.has_active_drag());
+        assert!(
+            window
+                .try_find(ElementId::Name(
+                    format!("session-drop-{}-right", sessions[0].0).into()
+                ))
+                .is_some()
+        );
+        window.press("escape", cx);
+        assert!(!cx.has_active_drag());
+        window.dispatch_event(
+            MouseUpEvent {
+                button: MouseButton::Left,
+                position: to,
+                modifiers: Default::default(),
+                click_count: 1,
+            }
+            .to_platform_input(),
+            cx,
+        );
+    });
+    settle(cx);
+    assert!(!has(&ui, cx, "session-workspace"));
+    assert!(ui.read(cx, |app, _| app.session().view.running));
+    assert!(sessions[0].1.sent().is_empty());
+}
+
+#[gpui_kit::test]
+fn session_panes_archiving_prunes_the_removed_pane(cx: &mut TestAppContext) {
+    use flint_app::docking::Edge;
+    let (ui, sessions) = session_pane_fixture(cx, 2);
+    drag_session_pane(&ui, cx, sessions[1].0, sessions[0].0, Edge::Right);
+    ui.with(cx, |window, cx| {
+        ui.app
+            .update(cx, |app, cx| app.delete_session(1, window, cx))
+    });
+    assert!(matches!(sessions[1].1.sent().as_slice(), [Op::Shutdown]));
+    sessions[1].1.send(
+        cx,
+        AgentEvent::SessionStopped {
+            history_saved: true,
+        },
+    );
+    sessions[1].1.events.close();
+    settle(cx);
+    ui.with(cx, |window, cx| {
+        ui.app
+            .update(cx, |app, cx| app.delete_session(1, window, cx))
+    });
+    settle(cx);
+    assert!(!has(&ui, cx, "session-workspace"));
+    assert_eq!(ui.read(cx, |app, _| app.sessions.len()), 1);
+    assert_eq!(ui.read(cx, |app, _| app.session().uid), sessions[0].0);
+    assert!(ui.read(cx, |app, _| app.pane_terminal(sessions[1].0).is_none()));
+    assert!(sessions[0].1.sent().is_empty());
+}
+
+#[gpui_kit::test]
+fn session_panes_can_move_an_existing_session_to_a_vertical_split(cx: &mut TestAppContext) {
+    use flint_app::docking::Edge;
+    let (ui, sessions) = session_pane_fixture(cx, 2);
+    let ids = ui.read(cx, |app, _| {
+        app.terminal
+            .tabs
+            .iter()
+            .map(Entity::entity_id)
+            .collect::<Vec<_>>()
+    });
+    drag_session_pane(&ui, cx, sessions[1].0, sessions[0].0, Edge::Right);
+    drag_session_pane(&ui, cx, sessions[1].0, sessions[0].0, Edge::Bottom);
+    let top = session_pane_bounds(&ui, cx, sessions[0].0);
+    let bottom = session_pane_bounds(&ui, cx, sessions[1].0);
+    assert!(top.bottom() <= bottom.top() + px(2.));
+    assert!((top.size.width - bottom.size.width).abs() < px(3.));
+    assert_eq!(
+        ui.read(cx, |app, _| app
+            .terminal
+            .tabs
+            .iter()
+            .map(Entity::entity_id)
+            .collect::<Vec<_>>()),
+        ids
+    );
+}
+
+#[gpui_kit::test]
+fn session_panes_closing_a_terminal_does_not_focus_another_sessions_terminal(
+    cx: &mut TestAppContext,
+) {
+    use flint_app::docking::Edge;
+    let (ui, sessions) = session_pane_fixture(cx, 2);
+    drag_session_pane(&ui, cx, sessions[1].0, sessions[0].0, Edge::Right);
+    ui.click(
+        cx,
+        ElementId::Name(format!("session-terminal-collapsed-{}", sessions[0].0).into()),
+    );
+    ui.click(
+        cx,
+        ElementId::Name(format!("session-terminal-close-{}-0", sessions[0].0).into()),
+    );
+    assert_eq!(ui.read(cx, |app, _| app.session().uid), sessions[0].0);
+    assert!(ui.read(cx, |app, _| app.pane_terminal(sessions[0].0).is_none()));
+    assert!(ui.read(cx, |app, _| app.pane_terminal(sessions[1].0).is_some()));
+}
+
+#[gpui_kit::test]
+fn session_panes_project_switch_replaces_the_focused_pane_and_keeps_its_draft(
+    cx: &mut TestAppContext,
+) {
+    use flint_app::docking::Edge;
+    let (ui, sessions) = session_pane_fixture(cx, 2);
+    drag_session_pane(&ui, cx, sessions[1].0, sessions[0].0, Edge::Right);
+    ui.input(cx, "keep second project's draft");
+    let workspace = temp_dir("pane-project");
+    ui.app
+        .update(cx, |app, cx| app.set_project_folder(workspace, cx));
+    let new = ui.read(cx, |app, _| app.session().uid);
+    assert!(has(&ui, cx, &format!("session-pane-{new}")));
+    assert!(has(&ui, cx, &format!("session-pane-{}", sessions[0].0)));
+    assert!(!has(&ui, cx, &format!("session-pane-{}", sessions[1].0)));
+    assert_eq!(ui.composer_text(cx), "");
+    ui.click(cx, ("session", 1usize));
+    assert_eq!(ui.composer_text(cx), "keep second project's draft");
+}
+
+#[gpui_kit::test]
+fn session_panes_route_keyboard_input_to_two_independent_shells(cx: &mut TestAppContext) {
+    use flint_app::docking::Edge;
+    let (ui, sessions) = session_pane_fixture(cx, 2);
+    drag_session_pane(&ui, cx, sessions[1].0, sessions[0].0, Edge::Right);
+    for (uid, _) in &sessions {
+        ui.click(
+            cx,
+            ElementId::Name(format!("session-pane-mode-{uid}-terminal").into()),
+        );
+        ui.click(
+            cx,
+            ElementId::Name(format!("session-terminal-new-{uid}").into()),
+        );
+        assert_eq!(ui.read(cx, |app, _| app.session().uid), *uid);
+        ui.input(cx, &format!("printf 'shell-{uid}\\n'"));
+        ui.press(cx, "enter");
+        let output = wait_for_terminal(&ui, cx, |line| line == format!("shell-{uid}"));
+        assert!(
+            output.iter().any(|line| line == &format!("shell-{uid}")),
+            "{output:?}"
+        );
+    }
+    for (uid, engine) in sessions {
+        let text = ui.read(cx, |app, cx| {
+            let view = app.pane_terminal(uid).unwrap().read(cx);
+            assert!(!view.read_only);
+            view.terminal.buffer_text()
+        });
+        assert!(text.contains(&format!("shell-{uid}")), "{text:?}");
+        assert!(engine.sent().is_empty(), "shell input reached the agent");
+    }
+}
+
+#[gpui_kit::test]
+fn session_panes_follow_agent_commands_without_overriding_a_selected_tab(cx: &mut TestAppContext) {
+    use flint_app::docking::Edge;
+    let (ui, sessions) = session_pane_fixture(cx, 2);
+    drag_session_pane(&ui, cx, sessions[1].0, sessions[0].0, Edge::Right);
+    let uid = sessions[0].0;
+    let engine = &sessions[0].1;
+    let started = |id: &str| AgentEvent::TerminalStarted {
+        terminal_id: id.into(),
+        call_id: None,
+        label: id.into(),
+        cwd: None,
+    };
+    engine.send(cx, started("second-command"));
+    assert_eq!(
+        ui.read(cx, |app, cx| app
+            .pane_terminal(uid)
+            .unwrap()
+            .read(cx)
+            .label()),
+        "second-command"
+    );
+    ui.click(
+        cx,
+        ElementId::Name(format!("session-terminal-collapsed-{uid}").into()),
+    );
+    ui.click(
+        cx,
+        ElementId::Name(format!("session-terminal-tab-{uid}-0").into()),
+    );
+    engine.send(cx, started("third-command"));
+    assert_eq!(
+        ui.read(cx, |app, cx| app
+            .pane_terminal(uid)
+            .unwrap()
+            .read(cx)
+            .label()),
+        "Terminal 0"
+    );
+    let selected = ui.read(cx, |app, _| app.pane_terminal(uid).unwrap().entity_id());
+    ui.click(
+        cx,
+        ElementId::Name(format!("session-terminal-close-{uid}-2").into()),
+    );
+    assert_eq!(
+        ui.read(cx, |app, _| app.pane_terminal(uid).unwrap().entity_id()),
+        selected
+    );
+}
 
 struct Ui {
     window: AnyWindowHandle,
@@ -288,6 +1182,151 @@ fn empty_input_does_not_send(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
+fn ordinary_session_switching_keeps_drafts_and_attachments_independent(cx: &mut TestAppContext) {
+    let (ui, sessions) = session_pane_fixture(cx, 2);
+    ui.input(cx, "first session's draft");
+    ui.app
+        .update(cx, |app, _| app.attachments.push("first.rs".into()));
+    ui.with(cx, |window, cx| {
+        ui.app
+            .update(cx, |app, cx| app.select_session(1, window, cx));
+    });
+    assert_eq!(ui.composer_text(cx), "");
+    assert!(ui.read(cx, |app, _| app.attachments.is_empty()));
+    ui.input(cx, "second session's draft");
+    ui.with(cx, |window, cx| {
+        ui.app
+            .update(cx, |app, cx| app.select_session(0, window, cx));
+    });
+    assert_eq!(ui.composer_text(cx), "first session's draft");
+    assert_eq!(ui.read(cx, |app, _| app.attachments.clone()), ["first.rs"]);
+    assert!(sessions.iter().all(|(_, engine)| engine.sent().is_empty()));
+}
+
+#[gpui_kit::test]
+fn terminal_output_returns_only_to_its_own_session_outside_tiled_mode(cx: &mut TestAppContext) {
+    let (ui, sessions) = session_pane_fixture(cx, 2);
+    ui.app.update(cx, |app, cx| {
+        let uid = sessions[0].0;
+        let cwd = app.sessions[0].workspace.clone();
+        let terminal = cx.new(|cx| {
+            flint_app::term_view::TermView::new(
+                flint_term::Terminal::detached(flint_term::Size {
+                    cols: 80,
+                    rows: 16,
+                    cell_width: 8,
+                    cell_height: 18,
+                }),
+                cwd,
+                false,
+                true,
+                cx,
+            )
+        });
+        terminal.update(cx, |view, _| {
+            view.session_uid = Some(uid);
+            view.terminal.feed(b"controlled first-session output\r\n");
+        });
+        app.terminal.tabs.push(terminal);
+        app.terminal.active = app.terminal.tabs.len() - 1;
+        app.terminal.open = true;
+    });
+    ui.with(cx, |window, cx| {
+        ui.app
+            .update(cx, |app, cx| app.select_session(1, window, cx));
+    });
+    ui.click(cx, "terminal-send");
+    assert!(sessions[0].1.sent().is_empty());
+    assert!(ui.read(cx, |app, _| {
+        app.sessions[0].prompt_queue.items[0]
+            .message
+            .contains("controlled first-session output")
+    }));
+    sessions[0]
+        .1
+        .send(cx, AgentEvent::TurnStarted { turn_id: 1 });
+    sessions[0].1.send(
+        cx,
+        AgentEvent::TurnFinished {
+            turn_id: 1,
+            reason: TurnEndReason::Completed,
+        },
+    );
+    assert!(
+        sessions[1].1.sent().is_empty(),
+        "another session received terminal contents"
+    );
+    assert!(matches!(sessions[0].1.sent().as_slice(),
+        [Op::UserMessage(message)] if message.contains("controlled first-session output")));
+}
+
+#[gpui_kit::test]
+fn acp_option_changes_wait_for_ack_and_closed_channels_keep_confirmed_values(
+    cx: &mut TestAppContext,
+) {
+    let (ui, engine) = acp_session(cx);
+    ui.app
+        .update(cx, |app, cx| app.set_session_option("model", "opus", cx));
+    assert_eq!(
+        ui.read(cx, |app, _| app.session_slots().model.unwrap().current),
+        "default"
+    );
+    assert!(
+        matches!(engine.sent().as_slice(), [Op::SetSessionOption { value, .. }] if value == "opus")
+    );
+    engine.ops.close();
+    ui.app.update(cx, |app, cx| {
+        app.set_session_option("mode", "acceptEdits", cx)
+    });
+    assert_eq!(
+        ui.read(cx, |app, _| app.session_slots().mode.unwrap().current),
+        "default"
+    );
+    assert!(ui.read(cx, |app, _| {
+        app.store_error
+            .as_ref()
+            .is_some_and(|error| error.contains("setting"))
+    }));
+}
+
+#[gpui_kit::test]
+fn flooded_engine_yields_to_typing_between_ordered_batches(cx: &mut TestAppContext) {
+    let ui = open(cx);
+    let engine = ui.engine(cx);
+    engine
+        .events
+        .try_send(AgentEvent::TurnStarted { turn_id: 1 })
+        .unwrap();
+    for _ in 0..600 {
+        engine
+            .events
+            .try_send(AgentEvent::TextDelta("界".into()))
+            .unwrap();
+    }
+    engine
+        .events
+        .try_send(AgentEvent::TurnFinished {
+            turn_id: 1,
+            reason: TurnEndReason::Completed,
+        })
+        .unwrap();
+    cx.run_until_parked();
+    assert!(
+        ui.read(cx, |app, _| app.session().view.running),
+        "a flooded queue must yield before consuming the entire turn"
+    );
+    ui.input(cx, "typing stays independent");
+    assert_eq!(ui.composer_text(cx), "typing stays independent");
+    settle(cx);
+    assert!(!ui.read(cx, |app, _| app.session().view.running));
+    assert!(ui.read(cx, |app, _| {
+        app.session().view.items.iter().any(
+            |item| matches!(item, Item::Assistant { text, streaming: false } if text == &"界".repeat(600)),
+        )
+    }));
+}
+
+#[gpui_kit::test]
 fn image_only_message_reaches_engine_and_is_visible(cx: &mut TestAppContext) {
     let ui = open(cx);
     let engine = ui.engine(cx);
@@ -502,7 +1541,13 @@ fn delayed_clipboard_image_does_not_attach_to_another_session(cx: &mut TestAppCo
     settle(cx);
     assert!(ui.read(cx, |app, _| app.image_attachments.is_empty()));
     assert_eq!(ui.read(cx, |app, _| app.pending_image_pastes), 0);
+    assert_eq!(ui.composer_text(cx), "");
+    ui.with(cx, |window, cx| {
+        ui.app
+            .update(cx, |app, cx| app.select_session(0, window, cx));
+    });
     assert_eq!(ui.composer_text(cx), "draft");
+    assert!(ui.read(cx, |app, _| app.image_attachments.is_empty()));
 }
 
 #[gpui_kit::test]
@@ -707,6 +1752,133 @@ fn clicking_a_tool_row_expands_its_output(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
+fn multiline_command_rows_do_not_overlap_and_expand_the_full_command(cx: &mut TestAppContext) {
+    for success in [true, false] {
+        let ui = open(cx);
+        let engine = running_turn(&ui, cx);
+        let command = "cat <<'END'\nfirst line\nsecond line\nEND";
+        for (id, text) in [
+            ("before", "echo before"),
+            ("multi", command),
+            ("after", "echo after"),
+        ] {
+            engine.send(cx, tool_started(id, ToolKind::Command, text));
+            engine.send(
+                cx,
+                AgentEvent::ToolCallFinished {
+                    call_id: id.into(),
+                    output: "result".into(),
+                    exit_code: Some(if success { 0 } else { 1 }),
+                    success,
+                    diff: None,
+                    duration_ms: 1,
+                },
+            );
+        }
+        let indices = ui.read(cx, |app, _| {
+            app.session()
+                .view
+                .items
+                .iter()
+                .enumerate()
+                .filter_map(|(ix, item)| matches!(item, Item::Tool(_)).then_some(ix))
+                .collect::<Vec<_>>()
+        });
+        ui.with(cx, |window, cx| {
+            window.render_frame(cx);
+            for pair in indices.windows(2) {
+                let before = window.find(("tool", pair[0])).bounds();
+                let after = window.find(("tool", pair[1])).bounds();
+                assert!(
+                    before.bottom() <= after.top(),
+                    "{before:?} overlaps {after:?}"
+                );
+            }
+            for ix in &indices {
+                let header = window.find(("tool-header", *ix)).bounds();
+                let summary = window.find(("tool-summary", *ix)).bounds();
+                assert!(summary.size.height <= px(26.), "{summary:?}");
+                assert!(
+                    summary.bottom() <= header.bottom(),
+                    "{summary:?} overflows {header:?}"
+                );
+            }
+            assert!(window.try_find(("tool-command", indices[1])).is_none());
+        });
+        ui.click(cx, ("tool", indices[1]));
+        ui.with(cx, |window, cx| {
+            window.render_frame(cx);
+            let command = window.find(("tool-command", indices[1])).bounds();
+            assert!(command.size.height >= px(4. * 21.), "{command:?}");
+        });
+        assert!(
+            ui.read(cx, |app, _| matches!(&app.session().view.items[indices[1]],
+            Item::Tool(call) if call.summary == command))
+        );
+    }
+}
+
+#[gpui_kit::test]
+fn multiline_running_command_stays_inside_the_compact_task_tray(cx: &mut TestAppContext) {
+    let ui = open_with(
+        cx,
+        Options {
+            window_size: Some((900., 560.)),
+            ..test_options()
+        },
+    );
+    let engine = running_turn(&ui, cx);
+    let command = "cat <<'END'\nfirst line\nsecond line\nEND";
+    engine.send(cx, tool_started("multi", ToolKind::Command, command));
+    ui.with(cx, |window, cx| {
+        window.render_frame(cx);
+        let row = window.find("running-command-multi").bounds();
+        let summary = window.find("running-command-summary-multi").bounds();
+        assert!(summary.size.height <= px(26.), "{summary:?}");
+        assert!(
+            summary.bottom() <= row.bottom(),
+            "{summary:?} overflows {row:?}"
+        );
+        assert!(
+            summary.right() <= row.right(),
+            "{summary:?} overflows {row:?}"
+        );
+    });
+    assert!(
+        !ui.read(cx, |app, _| app.session().activity())
+            .contains('\n')
+    );
+    assert!(ui.read(cx, |app, _| {
+        app.session()
+            .view
+            .items
+            .iter()
+            .any(|item| matches!(item, Item::Tool(call) if call.summary == command))
+    }));
+}
+
+#[gpui_kit::test]
+fn multiline_approval_summary_stays_in_its_header(cx: &mut TestAppContext) {
+    let ui = open(cx);
+    let engine = running_turn(&ui, cx);
+    let command = "cat <<'END'\nfirst line\nsecond line\nEND";
+    engine.send(cx, tool_started("multi", ToolKind::Command, command));
+    engine.send(
+        cx,
+        AgentEvent::ApprovalRequested {
+            call_id: "multi".into(),
+            kind: ToolKind::Command,
+            summary: command.into(),
+        },
+    );
+    ui.with(cx, |window, cx| {
+        window.render_frame(cx);
+        let summary = window.find("approval-summary").bounds();
+        assert!(summary.size.height <= px(26.), "{summary:?}");
+    });
+}
+
+#[gpui_kit::test]
 fn review_opens_the_changes_panel_on_that_file(cx: &mut TestAppContext) {
     let ui = open(cx);
     let engine = ui.engine(cx);
@@ -779,6 +1951,18 @@ fn transcript_follows_output_until_scrolled_up(cx: &mut TestAppContext) {
     });
     cx.run_until_parked();
     assert!(ui.read(cx, |app, _| !app.session().list.is_following_tail()));
+    let latest = format!(
+        "transcript-latest-{}",
+        ui.read(cx, |app, _| app.session().uid)
+    );
+    assert!(has(&ui, cx, &latest));
+    engine.send(
+        cx,
+        AgentEvent::TextDelta("New output respects scrolling".into()),
+    );
+    assert!(ui.read(cx, |app, _| !app.session().list.is_following_tail()));
+    ui.click(cx, ElementId::Name(latest.into()));
+    assert!(ui.read(cx, |app, _| app.session().list.is_following_tail()));
 }
 
 // ---- Part B fixes -------------------------------------------------------
@@ -874,6 +2058,60 @@ fn cmd_enter_approves_the_pending_request(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
+fn large_pending_approval_preserves_requests_and_keyboard_routes_oldest(cx: &mut TestAppContext) {
+    for window_size in [(1440., 900.), (1000., 560.)] {
+        let ui = open_with(
+            cx,
+            Options {
+                window_size: Some(window_size),
+                ..test_options()
+            },
+        );
+        let engine = running_turn(&ui, cx);
+        let summary = format!("{}\nORIGINAL_BODY", "界🙂".repeat(4096));
+        engine.send(
+            cx,
+            AgentEvent::ApprovalRequested {
+                call_id: "first-borrowed".into(),
+                kind: ToolKind::Command,
+                summary: summary.clone(),
+            },
+        );
+        approval_requested(&engine, cx, "second-borrowed");
+        ui.input(cx, "wait, why");
+        assert!(engine.sent().is_empty());
+        assert_eq!(ui.composer_text(cx), "wait, why");
+        ui.with(cx, |window, cx| {
+            window.render_frame(cx);
+            let card = window.find("approval-card").bounds();
+            let header = window.find("approval-summary").bounds();
+            assert!(header.left() >= card.left() && header.right() <= card.right());
+        });
+        ui.press(cx, "cmd-enter");
+        assert!(matches!(engine.sent().as_slice(),
+            [Op::Approval { call_id, decision: ApprovalDecision::Approve }] if call_id == "first-borrowed"));
+        ui.read(cx, |app, _| {
+            assert!(app.session().view.items.iter().any(|item| matches!(item,
+                Item::Approval {summary: stored, decision: Some(ApprovalDecision::Approve), ..} if stored == &summary)));
+            assert_eq!(app.session().view.pending_approval().unwrap().0, "second-borrowed");
+        });
+        ui.press(cx, "cmd-enter");
+        assert!(matches!(engine.sent().as_slice(),
+            [Op::Approval { call_id, decision: ApprovalDecision::Approve }] if call_id == "second-borrowed"));
+        ui.read(cx, |app, _| {
+            assert!(app.session().view.pending_approval().is_none());
+            assert!(
+                app.session()
+                    .prompt_queue
+                    .items
+                    .iter()
+                    .any(|prompt| prompt.text == "wait, why")
+            );
+        });
+    }
+}
+
+#[gpui_kit::test]
 fn background_approval_shows_needs_approval_in_the_sidebar(cx: &mut TestAppContext) {
     let ui = open(cx);
     let engine = running_turn(&ui, cx);
@@ -892,6 +2130,73 @@ fn mention_workspace() -> std::path::PathBuf {
     std::fs::write(ws.join(".gitignore"), "secret.txt\n").unwrap();
     std::fs::write(ws.join("secret.txt"), "password\n").unwrap();
     ws
+}
+
+#[gpui_kit::test]
+fn mention_indexing_yields_and_ignores_a_changed_workspace(cx: &mut TestAppContext) {
+    let source = mention_workspace();
+    let destination = temp_dir("mention-destination");
+    std::fs::write(destination.join("destination.rs"), "fn destination() {}\n").unwrap();
+    let ui = open_with(
+        cx,
+        Options {
+            workspace: Some(source),
+            ..test_options()
+        },
+    );
+    ui.with(cx, |window, cx| {
+        ui.app.update(cx, |app, cx| {
+            app.open_mention_picker(window, cx);
+            assert!(
+                app.mention.as_ref().unwrap().results.is_empty(),
+                "indexing must yield instead of walking the filesystem on the UI thread"
+            );
+            app.set_project_folder(destination.clone(), cx);
+        });
+    });
+    settle(cx);
+    assert!(
+        ui.read(cx, |app, _| app.mention.is_none()),
+        "a project change closes the old picker; late results must not reopen it"
+    );
+    ui.with(cx, |window, cx| {
+        ui.app
+            .update(cx, |app, cx| app.open_mention_picker(window, cx));
+    });
+    settle(cx);
+    assert_eq!(
+        ui.read(cx, |app, _| app.mention.as_ref().unwrap().results.clone()),
+        vec!["destination.rs".to_string()]
+    );
+}
+
+#[gpui_kit::test]
+fn changing_project_after_a_turn_keeps_the_previous_sessions_draft(cx: &mut TestAppContext) {
+    let ui = open(cx);
+    let _engine = running_turn(&ui, cx);
+    ui.input(cx, "old session draft");
+    ui.with(cx, |_, cx| {
+        ui.app
+            .update(cx, |app, _| app.attachments.push("old.rs".into()));
+    });
+    let destination = temp_dir("draft-project-destination");
+    ui.with(cx, |_, cx| {
+        ui.app
+            .update(cx, |app, cx| app.set_project_folder(destination, cx));
+    });
+    settle(cx);
+    assert_eq!(ui.composer_text(cx), "");
+    assert!(ui.read(cx, |app, _| app.attachments.is_empty()));
+    ui.with(cx, |window, cx| {
+        ui.app
+            .update(cx, |app, cx| app.select_session(0, window, cx));
+    });
+    settle(cx);
+    assert_eq!(ui.composer_text(cx), "old session draft");
+    assert_eq!(
+        ui.read(cx, |app, _| app.attachments.clone()),
+        vec!["old.rs".to_string()]
+    );
 }
 
 #[gpui_kit::test]
@@ -1123,7 +2428,7 @@ fn subagent_cards_expand_child_activity_and_route_approvals(cx: &mut TestAppCont
         session.view.items.iter().any(|item| {
             matches!(item, Item::Tool(call)
                 if call.subagent.as_ref().is_some_and(|child|
-                    child.model == "child-model" && !child.view.running)
+                    child.model == "child-model" && session.view.subagent(&child.session_id).is_some_and(|child| !child.view.running))
             )
         })
     })));
@@ -1668,6 +2973,7 @@ fn sidebar_archive_scrollbar_keeps_restore_and_navigation_reachable(cx: &mut Tes
                 created_at: ix,
                 updated_at: ix,
                 agent: flint_agent::AgentKind::Flint,
+                general: false,
             },
         )
         .unwrap();
@@ -1697,10 +3003,12 @@ fn sidebar_archive_scrollbar_keeps_restore_and_navigation_reachable(cx: &mut Tes
         assert!(sessions.bottom() <= archive.top());
         assert!(archive.bottom() <= settings.top());
         assert!(settings.bottom() <= sidebar.bottom());
-        for ix in 0..16usize {
+        // Archives list a page at a time; "Show more" holds back the rest.
+        for ix in 0..10usize {
             let row = window.find(("restore-archive", ix)).bounds();
             assert!(row.right() <= archive.right() - px(12.));
         }
+        assert!(window.try_find(("restore-archive", 10usize)).is_none());
         window.scroll(
             "archive-list",
             ScrollDelta::Pixels(point(px(0.), px(-34.))),
@@ -1723,6 +3031,18 @@ fn sidebar_archive_scrollbar_keeps_restore_and_navigation_reachable(cx: &mut Tes
         ui.read(cx, |app, _| app.sidebar_scroll.offset()),
         sessions_offset
     );
+    ui.with(cx, |window, cx| {
+        let scroll = ui.app.read(cx).archive_scroll.clone();
+        scroll.scroll_to_bottom();
+        window.render_frame(cx);
+    });
+    ui.with(cx, |window, cx| {
+        let scroll = ui.app.read(cx).archive_scroll.clone();
+        scroll.scroll_to_bottom();
+        window.render_frame(cx);
+    });
+    ui.click(cx, "show-more-archives");
+    assert!(!has(&ui, cx, "show-more-archives"));
     ui.with(cx, |window, cx| {
         let scroll = ui.app.read(cx).archive_scroll.clone();
         scroll.scroll_to_bottom();
@@ -1784,6 +3104,7 @@ fn sidebar_long_workspace_titles_and_statuses_stay_inside_the_panel(cx: &mut Tes
 #[gpui_kit::test]
 fn sidebar_search_and_empty_filters_recover_and_reset_scroll(cx: &mut TestAppContext) {
     use flint_app::app::SessionFilter;
+    use flint_app::session::Bucket;
     let ui = open(cx);
     seed_sidebar_sessions(&ui, cx, 30);
     ui.with(cx, |window, cx| {
@@ -1806,8 +3127,9 @@ fn sidebar_search_and_empty_filters_recover_and_reset_scroll(cx: &mut TestAppCon
     assert!(ui.with(cx, |window, cx| {
         ui.app.read(cx).search.focus_handle(cx).is_focused(window)
     }));
-    ui.click(cx, "filter");
-    assert_eq!(ui.read(cx, |app, _| app.filter), SessionFilter::Running);
+    ui.app.update(cx, |app, cx| {
+        app.set_filter(SessionFilter::Only(Bucket::Working), cx)
+    });
     assert!(has(&ui, cx, "session-list-empty"));
     ui.click(cx, "reset-session-filter");
     assert_eq!(ui.read(cx, |app, _| app.filter), SessionFilter::All);
@@ -1815,7 +3137,9 @@ fn sidebar_search_and_empty_filters_recover_and_reset_scroll(cx: &mut TestAppCon
     let workspace = ui.read(cx, |app, _| app.workspace.to_string_lossy().to_uppercase());
     ui.input(cx, &format!("  {workspace}  "));
     assert_eq!(ui.read(cx, |app, cx| app.visible_sessions(cx).len()), 30);
-    ui.click(cx, "filter");
+    ui.app.update(cx, |app, cx| {
+        app.set_filter(SessionFilter::Only(Bucket::Ready), cx)
+    });
     ui.press(cx, "cmd-n");
     assert_eq!(ui.read(cx, |app, _| app.filter), SessionFilter::All);
     assert_eq!(
@@ -1826,17 +3150,195 @@ fn sidebar_search_and_empty_filters_recover_and_reset_scroll(cx: &mut TestAppCon
 }
 
 #[gpui_kit::test]
-fn sidebar_running_filter_includes_work_waiting_for_approval(cx: &mut TestAppContext) {
+fn sidebar_needs_you_filter_holds_work_waiting_for_approval(cx: &mut TestAppContext) {
     use flint_app::app::SessionFilter;
+    use flint_app::session::Bucket;
     let ui = open(cx);
     let engine = running_turn(&ui, cx);
     ui.press(cx, "cmd-n");
     approval_requested(&engine, cx, "sidebar-approval");
-    ui.click(cx, "filter");
-    assert_eq!(ui.read(cx, |app, _| app.filter), SessionFilter::Running);
+    // Waiting on an approval is "Needs you", not "Working".
+    let counts = ui.read(cx, |app, cx| app.bucket_counts(cx));
+    assert_eq!(counts.of(SessionFilter::Only(Bucket::NeedsYou)), 1);
+    assert_eq!(counts.of(SessionFilter::Only(Bucket::Working)), 0);
+    assert_eq!(counts.of(SessionFilter::All), 2);
+    ui.click(cx, ("session-filter", 1usize));
+    assert_eq!(
+        ui.read(cx, |app, _| app.filter),
+        SessionFilter::Only(Bucket::NeedsYou)
+    );
     assert_eq!(ui.read(cx, |app, cx| app.visible_sessions(cx)), vec![0]);
     ui.click(cx, ("session", 0usize));
     assert!(ui.read(cx, |app, _| app.session().view.pending_approvals == 1));
+}
+
+#[gpui_kit::test]
+fn sidebar_search_matches_the_last_message(cx: &mut TestAppContext) {
+    let ui = open(cx);
+    seed_sidebar_sessions(&ui, cx, 3);
+    ui.app.update(cx, |app, cx| {
+        let change = app.sessions[2]
+            .view
+            .push_user("Where did the Zebra config go?".to_string());
+        app.sessions[2].apply(change);
+        cx.notify();
+    });
+    ui.click(cx, "session-search");
+    ui.input(cx, "zebra");
+    assert_eq!(ui.read(cx, |app, cx| app.visible_sessions(cx)), vec![2]);
+}
+
+#[gpui_kit::test]
+fn sidebar_groups_by_project_status_or_agent_and_counts_hidden_sessions(cx: &mut TestAppContext) {
+    use flint_app::app::{SessionFilter, SessionGrouping};
+    use flint_app::session::Bucket;
+    use flint_app::session_groups::GroupKey;
+    let ui = open(cx);
+    seed_sidebar_sessions(&ui, cx, 4);
+    ui.app.update(cx, |app, cx| {
+        app.sessions[1].agent = flint_agent::AgentKind::ClaudeCode;
+        app.sessions[2].agent = flint_agent::AgentKind::ClaudeCode;
+        app.sessions[3].unread = true;
+        let change = app.sessions[0].view.push_user("active".to_string());
+        app.sessions[0].apply(change);
+        cx.notify();
+    });
+    let groups =
+        |ui: &Ui, cx: &mut TestAppContext| ui.read(cx, |app, cx| app.session_groups(cx).groups);
+    // One workspace: one project group, with every session in it.
+    let by_project = groups(&ui, cx);
+    assert_eq!(by_project.len(), 1);
+    assert_eq!(by_project[0].rows.len(), 4);
+    assert!(matches!(by_project[0].key, GroupKey::Project(..)));
+
+    ui.click(cx, "session-grouping");
+    assert_eq!(ui.read(cx, |app, _| app.grouping), SessionGrouping::Status);
+    let by_status = groups(&ui, cx);
+    let labels: Vec<_> = by_status.iter().map(|g| g.label.as_str()).collect();
+    // Unread work sorts under "Needs you", ahead of the rest.
+    assert_eq!(labels, ["Needs you", "Inactive"]);
+    assert_eq!(by_status[0].rows, vec![3]);
+
+    ui.click(cx, "session-grouping");
+    assert_eq!(ui.read(cx, |app, _| app.grouping), SessionGrouping::Agent);
+    let by_agent = groups(&ui, cx);
+    let mut sizes: Vec<_> = by_agent
+        .iter()
+        .map(|g| (g.label.clone(), g.rows.len()))
+        .collect();
+    sizes.sort();
+    assert_eq!(
+        sizes,
+        [("Claude Code".to_string(), 2), ("flint".to_string(), 2)]
+    );
+
+    // A filter that hides part of a heading says so in the heading's count.
+    ui.app.update(cx, |app, cx| {
+        app.set_filter(SessionFilter::Only(Bucket::NeedsYou), cx)
+    });
+    let filtered = groups(&ui, cx);
+    assert_eq!(filtered.len(), 1);
+    assert_eq!((filtered[0].rows.len(), filtered[0].total), (1, 2));
+
+    ui.press(cx, "cmd-shift-g");
+    assert_eq!(ui.read(cx, |app, _| app.grouping), SessionGrouping::Project);
+}
+
+#[gpui_kit::test]
+fn sidebar_groups_every_worktree_of_a_repository_together(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    let linked = tmp.path().join("repo-feature");
+    let other = tmp.path().join("other");
+    let admin = repo.join(".git/worktrees/repo-feature");
+    std::fs::create_dir_all(&admin).unwrap();
+    std::fs::create_dir_all(&linked).unwrap();
+    std::fs::create_dir_all(&other).unwrap();
+    std::fs::write(admin.join("commondir"), "../..\n").unwrap();
+    std::fs::write(repo.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+    std::fs::write(admin.join("HEAD"), "ref: refs/heads/feature\n").unwrap();
+    std::fs::write(
+        linked.join(".git"),
+        format!("gitdir: {}\n", admin.display()),
+    )
+    .unwrap();
+    let ui = open(cx);
+    seed_sidebar_sessions(&ui, cx, 4);
+    ui.app.update(cx, |app, cx| {
+        app.sessions[0].workspace = repo.clone();
+        app.sessions[1].workspace = linked.clone();
+        app.sessions[2].workspace = other.clone();
+        app.sessions[3].workspace = repo.clone();
+        cx.notify();
+    });
+    let groups = ui.read(cx, |app, cx| app.session_groups(cx).groups);
+    let mut labels: Vec<_> = groups
+        .iter()
+        .map(|g| (g.label.clone(), g.rows.len()))
+        .collect();
+    labels.sort();
+    assert_eq!(labels, [("other".to_string(), 1), ("repo".to_string(), 3)]);
+    // The row for the worktree shows its own branch.
+    assert!(ui.with(cx, |window, cx| {
+        window.render_frame(cx);
+        window.try_find(("sidebar-details", 1usize)).is_some()
+    }));
+    assert_eq!(
+        flint_app::project::branch(&linked).as_deref(),
+        Some("feature")
+    );
+}
+
+#[gpui_kit::test]
+fn sidebar_lists_a_page_of_sessions_then_shows_more(cx: &mut TestAppContext) {
+    use flint_app::app::SESSION_PAGE;
+    let ui = open(cx);
+    seed_sidebar_sessions(&ui, cx, SESSION_PAGE + 15);
+    let groups = ui.read(cx, |app, cx| app.session_groups(cx));
+    let shown: usize = groups.groups.iter().map(|g| g.rows.len()).sum();
+    assert_eq!((shown, groups.more), (SESSION_PAGE, 15));
+    assert_eq!(groups.groups[0].total, SESSION_PAGE + 15);
+    // Searching still reaches a session on a later page.
+    ui.click(cx, "session-search");
+    ui.input(cx, "sidebar task 6");
+    assert_eq!(
+        ui.read(cx, |app, cx| app.visible_sessions(cx).len()),
+        // 6 and 60..=64
+        6
+    );
+    ui.press(cx, "cmd-a");
+    ui.press(cx, "backspace");
+    assert!(has(&ui, cx, "show-more-sessions"));
+    ui.with(cx, |window, cx| {
+        let scroll = ui.app.read(cx).sidebar_scroll.clone();
+        scroll.scroll_to_bottom();
+        window.render_frame(cx);
+    });
+    ui.click(cx, "show-more-sessions");
+    let groups = ui.read(cx, |app, cx| app.session_groups(cx));
+    assert_eq!(groups.more, 0);
+    assert_eq!(
+        groups.groups.iter().map(|g| g.rows.len()).sum::<usize>(),
+        SESSION_PAGE + 15
+    );
+    assert!(!has(&ui, cx, "show-more-sessions"));
+}
+
+#[gpui_kit::test]
+fn sidebar_paging_always_keeps_the_active_session_listed(cx: &mut TestAppContext) {
+    use flint_app::app::SESSION_PAGE;
+    let ui = open(cx);
+    seed_sidebar_sessions(&ui, cx, SESSION_PAGE + 5);
+    // Make the active session the oldest, so recency alone would page it out.
+    ui.app.update(cx, |app, cx| {
+        app.sessions[0].touched = std::time::UNIX_EPOCH;
+        cx.notify();
+    });
+    let groups = ui.read(cx, |app, cx| app.session_groups(cx));
+    let rows: Vec<usize> = groups.groups.iter().flat_map(|g| g.rows.clone()).collect();
+    assert!(rows.contains(&0));
+    assert_eq!(rows.len(), SESSION_PAGE + 1);
+    assert_eq!(groups.more, 4);
 }
 
 #[gpui_kit::test]
@@ -2145,7 +3647,9 @@ fn sidebar_tab_navigation_scrolls_offscreen_sessions_into_view(cx: &mut TestAppC
     let ui = open(cx);
     seed_sidebar_sessions(&ui, cx, 40);
     ui.click(cx, "session-search");
-    for _ in 0..41 {
+    // Only the filter strip's "All" chip precedes the list; grouping is
+    // beside Settings in the footer.
+    for _ in 0..42 {
         ui.press(cx, "tab");
         ui.with(cx, |window, cx| {
             window.render_frame(cx);
@@ -2568,6 +4072,74 @@ fn archiving_running_work_needs_confirmation(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
+fn collapsed_sidebar_reopens_docked_below_the_window_buttons(cx: &mut TestAppContext) {
+    let ui = open(cx);
+    for _ in 0..2 {
+        ui.click(cx, "hide-sidebar");
+        assert!(ui.read(cx, |app, _| !app.sidebar_open && !app.sidebar_visible));
+        ui.with(cx, |window, _| {
+            assert!(window.find("sessions-control").bounds().top() >= px(36.));
+        });
+        ui.click(cx, "sessions-control");
+        assert!(ui.read(cx, |app, _| {
+            app.sidebar_open && app.sidebar_visible && !app.session_drawer
+        }));
+        ui.with(cx, |window, _| {
+            assert!(window.find("hide-sidebar").bounds().top() >= px(36.));
+            assert!(window.try_find("sessions-drawer").is_none());
+        });
+    }
+}
+
+#[gpui_kit::test]
+fn collapsed_sidebar_reopens_docked_in_tiled_sessions(cx: &mut TestAppContext) {
+    use flint_app::docking::Edge;
+    let (ui, sessions) = session_pane_fixture(cx, 2);
+    drag_session_pane(&ui, cx, sessions[1].0, sessions[0].0, Edge::Right);
+    ui.click(cx, "hide-sidebar");
+    ui.with(cx, |window, _| {
+        assert!(window.find("session-workspace-sidebar").bounds().top() >= px(36.));
+    });
+    ui.click(cx, "session-workspace-sidebar");
+    assert!(ui.read(cx, |app, _| {
+        app.sidebar_open && app.sidebar_visible && !app.session_drawer
+    }));
+    assert!(has(&ui, cx, "session-workspace"));
+}
+
+#[gpui_kit::test]
+fn compact_sessions_drawer_stays_below_the_window_buttons(cx: &mut TestAppContext) {
+    let ui = open_with(
+        cx,
+        Options {
+            window_size: Some((900., 560.)),
+            ..test_options()
+        },
+    );
+    ui.click(cx, "sessions-control");
+    ui.with(cx, |window, _| {
+        for id in [
+            "sessions-drawer-backdrop",
+            "sessions-drawer",
+            "hide-sidebar",
+        ] {
+            let bounds = window.find(id).bounds();
+            assert!(bounds.top() >= px(36.), "{id}: {bounds:?}");
+            assert!(bounds.bottom() <= px(560.), "{id}: {bounds:?}");
+        }
+    });
+    ui.click(cx, "hide-sidebar");
+    assert!(ui.read(cx, |app, _| !app.session_drawer));
+    ui.click(cx, "sessions-control");
+    assert!(ui.read(cx, |app, _| app.session_drawer));
+    ui.press(cx, "escape");
+    assert!(ui.read(cx, |app, _| !app.session_drawer));
+    assert!(ui.with(cx, |window, cx| {
+        gpui_kit::base::active_focus_trap(window, cx).is_none()
+    }));
+}
+
+#[gpui_kit::test]
 fn sessions_remain_reachable_at_narrow_window_sizes(cx: &mut TestAppContext) {
     for (width, height) in [(900., 560.), (1000., 700.), (1440., 900.)] {
         let ui = open_with(
@@ -2951,6 +4523,7 @@ fn combined_changes_survive_restart_continued_edits_and_archive_recovery(cx: &mu
             created_at: 1,
             updated_at: 2,
             agent: flint_agent::AgentKind::Flint,
+            general: false,
         },
     )
     .unwrap();
@@ -3111,7 +4684,9 @@ fn the_changes_panel_lists_files_only_when_there_are_several(cx: &mut TestAppCon
     assert!(ui.with(cx, |window, _| {
         window.try_find(("change", 0usize)).is_none()
     }));
-    assert!(ui.with(cx, |window, _| window.try_find("open-in-editor").is_some()));
+    assert!(ui.with(cx, |window, _| {
+        window.try_find("open-file-preview").is_some()
+    }));
     engine.send(cx, tool_started("e1", ToolKind::Edit, "y.rs"));
     engine.send(cx, edit(1, "y.rs"));
     assert!(ui.with(cx, |window, _| {
@@ -3906,7 +5481,13 @@ fn droid_is_selectable_and_its_options_and_session_survive_restart(cx: &mut Test
     let engine = ui.engine(cx);
     ui.input(cx, "Droid task");
     ui.press(cx, "enter");
-    assert!(matches!(engine.sent().as_slice(), [Op::UserMessage(text)] if text == "Droid task"));
+    let sent = engine.sent();
+    assert!(
+        matches!(sent.as_slice(), [Op::UserMessage(text)] if text == "Droid task"),
+        "sent {sent:?}; draft {:?}; error {:?}",
+        ui.composer_text(cx),
+        ui.read(cx, |app, _| app.store_error.clone())
+    );
     engine.send(cx, agent_options("default"));
     assert!(has(&ui, cx, "option-model"));
     ui.click(cx, "option-model");
@@ -4158,6 +5739,17 @@ fn long_option_dropdown_scrolls_to_current_and_keyboard_selected_rows(cx: &mut T
         matches!(engine.sent().as_slice(), [Op::SetSessionOption { id, value }]
         if id == "model" && value == "model-39")
     );
+    assert_eq!(
+        ui.read(cx, |app, _| app.session().options[0].current.clone()),
+        "model-30",
+        "a request is not a confirmed setting"
+    );
+    let confirmed = ui.read(cx, |app, _| {
+        let mut options = app.session().options.clone();
+        options[0].current = "model-39".into();
+        options
+    });
+    engine.send(cx, AgentEvent::SessionOptions(confirmed));
     ui.click(cx, "option-model");
     visible(&ui, cx, 39usize);
     for _ in 0..39 {
@@ -4372,11 +5964,13 @@ fn plus_menu_lists_folders_and_picking_one_sets_the_workspace(cx: &mut TestAppCo
         vec![
             ProjectItem::OpenFolder,
             ProjectItem::Recent(other.clone()),
+            ProjectItem::Worktrees,
+            ProjectItem::General,
             ProjectItem::AttachImage,
             ProjectItem::AttachFile,
         ]
     );
-    for n in 0..4usize {
+    for n in 0..5usize {
         assert!(ui.with(cx, move |w, _| w.try_find(("project-item", n)).is_some()));
     }
     // An unstarted session moves to the chosen folder.
@@ -4662,6 +6256,19 @@ fn a_command_card_sends_its_output_to_the_agent(cx: &mut TestAppContext) {
     engine.send(cx, tool_finished("c1", "2 tests failed\n", None));
     engine.sent();
     ui.click(cx, ("tool-send", row));
+    assert!(engine.sent().is_empty());
+    assert!(ui.read(cx, |app, _| {
+        app.session().prompt_queue.items[0]
+            .message
+            .contains("2 tests failed")
+    }));
+    engine.send(
+        cx,
+        AgentEvent::TurnFinished {
+            turn_id: 1,
+            reason: TurnEndReason::Completed,
+        },
+    );
     assert!(
         matches!(
             engine.sent().as_slice(),
@@ -4735,6 +6342,63 @@ fn an_agents_command_mirrors_into_a_read_only_tab(cx: &mut TestAppContext) {
             .unwrap_or_default()
     });
     assert_eq!(label, "claude: npm test (exit 1)");
+}
+
+#[gpui_kit::test]
+fn multiline_agent_terminal_tabs_preserve_the_command_without_header_overflow(
+    cx: &mut TestAppContext,
+) {
+    let ui = open_with(cx, terminal_options());
+    let engine = ui.engine(cx);
+    let command = "cat <<'END'\nfirst line\nsecond line\nEND";
+    running_command(&ui, cx, &engine, command);
+    let label = format!("droid: {command}");
+    engine.send(
+        cx,
+        AgentEvent::TerminalStarted {
+            terminal_id: "multi".into(),
+            call_id: Some("c1".into()),
+            label: label.clone(),
+            cwd: None,
+        },
+    );
+    ui.click(cx, "terminal");
+    ui.with(cx, |window, cx| {
+        window.render_frame(cx);
+        let tab = window.find(("terminal-tab", 0usize)).bounds();
+        let summary = window.find(("terminal-tab-summary", 0usize)).bounds();
+        assert!(summary.size.height <= px(26.), "{summary:?}");
+        assert!(
+            summary.bottom() <= tab.bottom(),
+            "{summary:?} overflows {tab:?}"
+        );
+    });
+    assert_eq!(
+        ui.read(cx, |app, cx| app
+            .terminal
+            .active_view()
+            .unwrap()
+            .read(cx)
+            .fixed_label
+            .clone()),
+        Some(label)
+    );
+    engine.send(
+        cx,
+        AgentEvent::TerminalExited {
+            terminal_id: "multi".into(),
+            exit_code: Some(7),
+        },
+    );
+    assert_eq!(
+        ui.read(cx, |app, cx| app
+            .terminal
+            .active_view()
+            .unwrap()
+            .read(cx)
+            .label()),
+        "droid: cat <<'END' … (exit 7)"
+    );
 }
 
 #[gpui_kit::test]
@@ -5068,4 +6732,87 @@ fn docking_nested_splits_keep_every_panel_reachable_after_resizing(cx: &mut Test
         previous = Some(bounds.right());
         assert!(has(&ui, cx, &format!("dock-handle-{}", panel.id())));
     }
+}
+
+#[gpui_kit::test]
+fn sidebar_rows_hold_still_while_streaming_and_track_progress(cx: &mut TestAppContext) {
+    let ui = open(cx);
+    let engine = running_turn(&ui, cx);
+    let touched = ui.read(cx, |app, _| app.session().touched);
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    engine.send(cx, AgentEvent::ReasoningDelta("planning".into()));
+    engine.send(cx, AgentEvent::TextDelta("streaming".into()));
+    // Streaming doesn't count as new activity: rows don't reorder per token.
+    assert_eq!(ui.read(cx, |app, _| app.session().touched), touched);
+    let line = ui.read(cx, |app, _| app.session().status_line(app.now()).0);
+    assert!(line.starts_with("Writing… · "), "{line}");
+    assert!(ui.with(cx, |window, cx| {
+        window.render_frame(cx);
+        window.try_find(("sidebar-when", 0usize)).is_some()
+    }));
+    engine.send(
+        cx,
+        AgentEvent::TurnFinished {
+            turn_id: 1,
+            reason: TurnEndReason::Failed("provider returned 500".into()),
+        },
+    );
+    assert!(ui.read(cx, |app, _| app.session().touched) > touched);
+    assert_eq!(
+        ui.read(cx, |app, _| app.session().status()),
+        flint_app::session::Status::Failed { seen: true }
+    );
+}
+
+#[gpui_kit::test]
+fn sidebar_grouping_is_remembered_across_launches(cx: &mut TestAppContext) {
+    use flint_app::app::SessionGrouping;
+    let options = test_options();
+    let ui = open_with(cx, options.clone());
+    assert_eq!(ui.read(cx, |app, _| app.grouping), SessionGrouping::Project);
+    ui.app
+        .update(cx, |app, cx| app.set_grouping(SessionGrouping::Agent, cx));
+    let again = open_with(cx, options);
+    assert_eq!(
+        again.read(cx, |app, _| app.grouping),
+        SessionGrouping::Agent
+    );
+}
+
+#[gpui_kit::test]
+fn a_hidden_sidebar_still_shows_sessions_that_need_you(cx: &mut TestAppContext) {
+    let ui = open_with(
+        cx,
+        Options {
+            window_size: Some((900., 800.)),
+            ..test_options()
+        },
+    );
+    assert!(ui.read(cx, |app, _| !app.sidebar_visible));
+    let engine = running_turn(&ui, cx);
+    // Another session is on screen; the first one works in the background.
+    ui.press(cx, "cmd-n");
+    assert!(has(&ui, cx, "sessions-working"));
+    assert!(!has(&ui, cx, "sessions-waiting"));
+    approval_requested(&engine, cx, "background-approval");
+    assert!(has(&ui, cx, "sessions-waiting"));
+    assert!(!has(&ui, cx, "sessions-working"));
+}
+
+#[gpui_kit::test]
+fn sidebar_filter_chips_stay_in_place_when_counts_change(cx: &mut TestAppContext) {
+    let ui = open(cx);
+    seed_sidebar_sessions(&ui, cx, 3);
+    let chips = |ui: &Ui, cx: &mut TestAppContext| {
+        ui.with(cx, |window, cx| {
+            window.render_frame(cx);
+            (0..4usize)
+                .map(|ix| window.try_find(("session-filter", ix)).map(|e| e.bounds()))
+                .collect::<Vec<_>>()
+        })
+    };
+    let before = chips(&ui, cx);
+    assert!(before.iter().all(Option::is_some), "{before:?}");
+    let _engine = running_turn(&ui, cx);
+    assert_eq!(chips(&ui, cx), before);
 }

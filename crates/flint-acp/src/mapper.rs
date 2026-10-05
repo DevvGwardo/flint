@@ -10,6 +10,7 @@ use std::path::Path;
 use std::time::Instant;
 
 use agent_client_protocol::schema::v1::ContentBlock;
+use agent_client_protocol::schema::v1::CreateTerminalRequest;
 use agent_client_protocol::schema::v1::SessionUpdate;
 use agent_client_protocol::schema::v1::ToolCallContent;
 use agent_client_protocol::schema::v1::ToolCallStatus;
@@ -23,10 +24,13 @@ use flint_agent::tools::file_diff;
 use flint_agent::tools::head_tail;
 use serde_json::Value;
 
+use crate::output::append_tail;
 use crate::terminal_meta::TermMeta;
 
 /// Characters of tool output kept for a row.
 const OUTPUT_CHARS: usize = 8_000;
+/// Hard per-call storage cap, applied before the terminal status arrives.
+const OUTPUT_STORAGE_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug)]
 struct Call {
@@ -34,12 +38,15 @@ struct Call {
     title: String,
     started: Instant,
     output: String,
+    output_truncated: bool,
     diff: Option<FileDiff>,
     /// The diff came from our own fs write; the agent's copy is ignored.
     diff_from_write: bool,
     finished: bool,
     /// Exit code reported through the terminal extension.
     exit_code: Option<i32>,
+    args: Value,
+    terminal_error: Option<String>,
 }
 
 /// Mapping state for one session.
@@ -53,6 +60,7 @@ pub struct Mapper {
     calls: HashMap<String, Call>,
     order: Vec<String>,
     writes: u32,
+    terminal_errors: u32,
     /// Prefix for terminal tab labels ("claude: npm test").
     label_prefix: String,
     /// Terminals already announced, by id.
@@ -69,6 +77,7 @@ impl Mapper {
             calls: HashMap::new(),
             order: Vec::new(),
             writes: 0,
+            terminal_errors: 0,
             label_prefix: "agent".to_string(),
             terminals: HashMap::new(),
         }
@@ -194,10 +203,13 @@ impl Mapper {
                     title,
                     started: Instant::now(),
                     output: String::new(),
+                    output_truncated: false,
                     diff: None,
                     diff_from_write: false,
                     finished: false,
                     exit_code: None,
+                    args: fields.raw_input.clone().unwrap_or(Value::Null),
+                    terminal_error: None,
                 },
             );
             self.order.push(id.clone());
@@ -209,13 +221,17 @@ impl Mapper {
         if let Some(title) = fields.title {
             call.title = title;
         }
+        if let Some(args) = fields.raw_input {
+            call.args = args;
+        }
         if let Some(content) = fields.content {
             let mut text = String::new();
+            let mut truncated = false;
             for item in content {
                 match item {
                     ToolCallContent::Content(content) => {
                         if let Some(chunk) = text_of(&content.content) {
-                            text.push_str(&chunk);
+                            truncated |= append_tail(&mut text, &chunk, OUTPUT_STORAGE_BYTES);
                         }
                     }
                     ToolCallContent::Diff(diff) if !call.diff_from_write => {
@@ -229,12 +245,17 @@ impl Mapper {
             }
             if !text.is_empty() {
                 call.output = text;
+                call.output_truncated = truncated;
             }
         }
         if call.output.is_empty()
             && let Some(raw) = fields.raw_output.as_ref()
         {
-            call.output = raw_output_text(raw);
+            call.output_truncated = append_tail(
+                &mut call.output,
+                &raw_output_text(raw),
+                OUTPUT_STORAGE_BYTES,
+            );
         }
         if let Some(meta) = meta {
             self.terminal_meta(&id, meta, out);
@@ -294,10 +315,11 @@ impl Mapper {
                 TermMeta::Output { data, replace, .. } => {
                     if let Some(call) = self.calls.get_mut(call_id) {
                         if replace {
-                            call.output = data.clone();
-                        } else {
-                            call.output.push_str(&data);
+                            call.output.clear();
+                            call.output_truncated = false;
                         }
+                        call.output_truncated |=
+                            append_tail(&mut call.output, &data, OUTPUT_STORAGE_BYTES);
                     }
                     out.push(AgentEvent::TerminalOutput {
                         terminal_id,
@@ -362,6 +384,74 @@ impl Mapper {
         ]
     }
 
+    /// ACP terminal/create has no tool-call ID. Link only a unique exact
+    /// command/argv match; otherwise show a separate diagnostic tool row.
+    pub fn terminal_failed(
+        &mut self,
+        request: &CreateTerminalRequest,
+        reason: &str,
+    ) -> Vec<AgentEvent> {
+        let message = format!(
+            "This is a Flint terminal creation error, not evidence that the shell is broken.\n{}",
+            head_tail(reason, 2_000),
+        );
+        let matches: Vec<_> = self
+            .calls
+            .iter()
+            .filter_map(|(id, call)| {
+                let command = ["command", "cmd", "script"]
+                    .iter()
+                    .find_map(|key| call.args.get(*key).and_then(Value::as_str))
+                    .or_else(|| call.args.as_str())
+                    .unwrap_or(&call.title);
+                let args = call.args.get("args").and_then(Value::as_array);
+                let same_args = match args {
+                    Some(args) => {
+                        args.len() == request.args.len()
+                            && args
+                                .iter()
+                                .zip(&request.args)
+                                .all(|(a, b)| a.as_str() == Some(b.as_str()))
+                    }
+                    None => request.args.is_empty(),
+                };
+                (!call.finished
+                    && call.kind == ToolKind::Command
+                    && command == request.command
+                    && same_args)
+                    .then(|| id.clone())
+            })
+            .collect();
+        if let [id] = matches.as_slice() {
+            self.calls.get_mut(id).unwrap().terminal_error = Some(message.clone());
+            return vec![AgentEvent::ToolOutputDelta {
+                call_id: id.clone(),
+                chunk: format!("\n{message}\n"),
+            }];
+        }
+        self.terminal_errors += 1;
+        let id = format!("flint-terminal-error-{}", self.terminal_errors);
+        vec![
+            AgentEvent::ToolCallStarted {
+                call_id: id.clone(),
+                name: "terminal/create".into(),
+                kind: ToolKind::Command,
+                args: serde_json::json!({
+                    "command": request.command, "args": request.args, "cwd": request.cwd,
+                }),
+                summary: request.command.clone(),
+            },
+            AgentEvent::ToolCallFinished {
+                call_id: id,
+                output: message,
+                exit_code: None,
+                success: false,
+                diff: None,
+                duration_ms: 0,
+            },
+        ]
+    }
+
     /// A permission prompt: makes sure its call has a row first.
     pub fn approval(&mut self, id: &str, fields: ToolCallUpdateFields) -> Vec<AgentEvent> {
         let mut out = Vec::new();
@@ -409,9 +499,20 @@ impl Mapper {
 }
 
 fn finished_event(id: &str, call: &Call, success: bool) -> AgentEvent {
+    let mut output = if call.output_truncated {
+        format!(
+            "[earlier tool output truncated]\n{}",
+            head_tail(&call.output, OUTPUT_CHARS)
+        )
+    } else {
+        head_tail(&call.output, OUTPUT_CHARS)
+    };
+    if let Some(reason) = &call.terminal_error {
+        output.push_str(&format!("\n{reason}"));
+    }
     AgentEvent::ToolCallFinished {
         call_id: id.to_string(),
-        output: head_tail(&call.output, OUTPUT_CHARS),
+        output,
         exit_code: call.exit_code,
         success,
         diff: call.diff.clone(),

@@ -133,8 +133,9 @@ fn ctrl_byte(ch: char) -> Option<u8> {
 pub fn paste(text: &str, bracketed: bool) -> Vec<u8> {
     let normalized = text.replace("\r\n", "\r").replace('\n', "\r");
     if bracketed {
-        // A paste must not be able to end the bracket early.
-        let safe = normalized.replace("\x1b[201~", "");
+        // Removing one marker can synthesize another from nested fragments.
+        // No escape byte may remain in the payload, including after removal.
+        let safe = normalized.replace("\x1b[201~", "").replace('\x1b', "");
         format!("\x1b[200~{safe}\x1b[201~").into_bytes()
     } else {
         normalized.into_bytes()

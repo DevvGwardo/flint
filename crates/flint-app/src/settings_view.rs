@@ -282,6 +282,7 @@ fn segment(id: impl Into<ElementId>, label: &str, selected: bool) -> Stateful<Di
     let p = palette();
     div()
         .id(id)
+        .role(gpui_kit::Role::Button)
         .aria_label(label.to_string())
         .tab_index(0)
         .focus_visible(|style| style.border_2().border_color(p.accent))
@@ -347,11 +348,11 @@ pub fn render(
                 p.danger,
             ),
         };
-    let (jev_text, jev_color) = if settings::jev_key_set() {
-        ("On — TYPESAFE_API_KEY is set", p.success)
+    let (jev_text, jev_color) = if settings::jev_key_set(&app.key_sources) {
+        ("On — TypeSafe credential found", p.success)
     } else {
         (
-            "Off — optional; set TYPESAFE_API_KEY to enable",
+            "Off — set TYPESAFE_API_KEY or add ~/.flint/keys/typesafe.key",
             p.text_subtle,
         )
     };

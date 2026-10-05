@@ -24,9 +24,11 @@ const RECENT_START: usize = 1;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProjectItem {
     OpenFolder,
+    Worktrees,
     Recent(PathBuf),
     AttachFile,
     AttachImage,
+    General,
 }
 
 impl FlintApp {
@@ -38,19 +40,22 @@ impl FlintApp {
         let mut recent: Vec<PathBuf> = Vec::new();
         for session in sessions {
             let path = &session.workspace;
-            if path != current && !recent.contains(path) && path.is_dir() {
+            if !session.general && path != current && !recent.contains(path) && path.is_dir() {
                 recent.push(path.clone());
             }
         }
         recent.truncate(RECENT_FOLDERS);
         std::iter::once(ProjectItem::OpenFolder)
             .chain(recent.into_iter().map(ProjectItem::Recent))
+            .chain(std::iter::once(ProjectItem::Worktrees))
+            .chain(std::iter::once(ProjectItem::General))
             .chain(std::iter::once(ProjectItem::AttachImage))
             .chain(std::iter::once(ProjectItem::AttachFile))
             .collect()
     }
 
     pub fn toggle_project_menu(&mut self, cx: &mut Context<Self>) {
+        self.queue_popover = false;
         self.project_menu = match self.project_menu {
             Some(_) => None,
             None => Some(0),
@@ -67,6 +72,7 @@ impl FlintApp {
         self.project_menu = None;
         match self.project_items().into_iter().nth(ix) {
             Some(ProjectItem::OpenFolder) => self.open_workspace(cx),
+            Some(ProjectItem::Worktrees) => self.open_worktrees(window, cx),
             Some(ProjectItem::Recent(path)) => {
                 self.set_project_folder(path, cx);
                 self.composer
@@ -74,6 +80,11 @@ impl FlintApp {
             }
             Some(ProjectItem::AttachFile) => self.open_mention_picker(window, cx),
             Some(ProjectItem::AttachImage) => self.open_image_picker(cx),
+            Some(ProjectItem::General) => {
+                self.use_general_agent(cx);
+                self.composer
+                    .update(cx, |state, cx| state.focus(window, cx));
+            }
             None => {}
         }
         cx.notify();
@@ -115,10 +126,17 @@ impl FlintApp {
     /// no messages yet (restarting an agent that was started early), else a
     /// new session with the same agent in that folder.
     pub fn set_project_folder(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        let previous = self.session().uid;
+        let workspace_changed = self.session().workspace != path;
+        self.mention = None;
+        self.file_index_task = None;
         self.workspace = path.clone();
         let ix = self.active;
         let agent = self.sessions[ix].agent;
-        if self.sessions[ix].view.items.is_empty() {
+        self.inherit_agent_identity(agent);
+        if self.sessions[ix].view.items.is_empty()
+            && self.sessions[ix].prompt_queue.items.is_empty()
+        {
             let session = &mut self.sessions[ix];
             if let Some(ops) = session.ops.take() {
                 ops.try_send(Op::Shutdown).ok();
@@ -128,6 +146,7 @@ impl FlintApp {
             session.agent_ready = false;
             session.dir = None;
             session.workspace = path;
+            session.general = session.workspace == crate::general::workspace(&self.home);
             self.start_agent_early(ix, cx);
         } else {
             let mut session = self.new_session_value(path);
@@ -137,8 +156,25 @@ impl FlintApp {
             let ix = self.active;
             self.start_agent_early(ix, cx);
         }
+        if previous != self.session().uid {
+            self.session_workspace.pending_selection = Some((previous, self.session().uid));
+        } else if workspace_changed {
+            // These are workspace-relative paths, unlike image attachments.
+            self.attachments.clear();
+        }
         self.selected_change = None;
         cx.notify();
+    }
+
+    /// Leave existing project conversations running; attach only a fresh chat.
+    pub fn use_general_agent(&mut self, cx: &mut Context<Self>) {
+        match crate::general::prepare(&self.home) {
+            Ok(path) => self.set_project_folder(path, cx),
+            Err(error) => {
+                self.store_error = Some(format!("Couldn't prepare general-agent mode: {error}"));
+                cx.notify();
+            }
+        }
     }
 }
 
@@ -148,6 +184,11 @@ fn item_label(item: &ProjectItem) -> (IconName, String, Option<String>) {
             IconName::FolderOpen,
             "Open project folder…".to_string(),
             Some("⌘O".to_string()),
+        ),
+        ProjectItem::Worktrees => (
+            IconName::Folder,
+            "Git worktrees…".to_string(),
+            Some("Isolated checkouts".to_string()),
         ),
         ProjectItem::Recent(path) => (IconName::Folder, folder_name(path), Some(short_path(path))),
         ProjectItem::AttachFile => (
@@ -159,6 +200,11 @@ fn item_label(item: &ProjectItem) -> (IconName, String, Option<String>) {
             IconName::Paperclip,
             "Attach image…".to_string(),
             Some("PNG · JPEG · GIF · WebP".to_string()),
+        ),
+        ProjectItem::General => (
+            IconName::Flame,
+            "General agent (no project)".into(),
+            Some("Ask anything".into()),
         ),
     }
 }

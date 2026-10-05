@@ -9,6 +9,8 @@ use gpui_kit::component::command::CommandItem;
 use gpui_kit::component::command::CommandState;
 use gpui_kit::*;
 
+use crate::app::ArrangeSessionGrid;
+use crate::app::CycleSessionGrouping;
 use crate::app::DeleteSession;
 use crate::app::FlintApp;
 use crate::app::FocusComposer;
@@ -20,12 +22,15 @@ use crate::app::NewSession;
 use crate::app::OpenSettings;
 use crate::app::OpenTerminal;
 use crate::app::OpenWorkspace;
+use crate::app::OpenWorktrees;
 use crate::app::RenameSession;
 use crate::app::ResetPanelLayout;
+use crate::app::ResetSessionPanes;
 use crate::app::ToggleApproval;
 use crate::app::ToggleChanges;
 use crate::app::ToggleSidebar;
 use crate::app::ToggleTerminal;
+use crate::app::UndoLastTurn;
 use crate::theme::palette;
 
 fn item(label: &str, icon: IconName, action: Box<dyn Action>) -> CommandItem {
@@ -85,6 +90,11 @@ pub fn render(
                     Box::new(Interrupt),
                 ))
                 .item(item(
+                    "Undo the agent's file changes from its last turn",
+                    IconName::ArchiveRestore,
+                    Box::new(UndoLastTurn),
+                ))
+                .item(item(
                     "Rename session…",
                     IconName::Pencil,
                     Box::new(RenameSession),
@@ -109,6 +119,11 @@ pub fn render(
                     Box::new(OpenWorkspace),
                 ))
                 .item(item(
+                    "Git worktrees…",
+                    IconName::Folder,
+                    Box::new(OpenWorktrees),
+                ))
+                .item(item(
                     "Toggle changes panel",
                     IconName::PanelRight,
                     Box::new(ToggleChanges),
@@ -117,6 +132,11 @@ pub fn render(
                     "Toggle sidebar",
                     IconName::PanelLeft,
                     Box::new(ToggleSidebar),
+                ))
+                .item(item(
+                    "Group sessions by project, status or agent",
+                    IconName::Folder,
+                    Box::new(CycleSessionGrouping),
                 ))
                 .item(item(
                     "Toggle approval mode",
@@ -138,6 +158,16 @@ pub fn render(
                     "Reset panel layout",
                     IconName::PanelLeft,
                     Box::new(ResetPanelLayout),
+                ))
+                .item(item(
+                    "Arrange session panes in a grid",
+                    IconName::Grid2x2,
+                    Box::new(ArrangeSessionGrid),
+                ))
+                .item(item(
+                    "Show only the focused session",
+                    IconName::Maximize2,
+                    Box::new(ResetSessionPanes),
                 )),
         )
         .on_confirm(move |_, window, cx| {

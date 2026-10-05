@@ -80,6 +80,7 @@ impl FlintApp {
         let mut session = self.new_session_value(meta.workspace.clone());
         session.dir = Some(dir);
         session.agent = meta.agent;
+        session.general = meta.general;
         session.created = from_secs(meta.created_at);
         let mut clock = Duration::ZERO;
         for record in records {
@@ -118,6 +119,14 @@ impl FlintApp {
             session.view.title = meta.title;
         }
         session.touched = from_secs(meta.updated_at);
+        match crate::prompt_queue::Queue::load(session.dir.as_deref().unwrap()) {
+            Ok(queue) => session.prompt_queue = queue,
+            Err(error) => {
+                session.prompt_queue.paused = true;
+                session.prompt_queue.unreadable = true;
+                session.prompt_queue.error = Some(error);
+            }
+        }
         self.sessions.push(session);
     }
 
@@ -285,6 +294,17 @@ impl FlintApp {
             }
         }
         self.discard_rename();
+        if self.session_workspace.tiled()
+            && self.session().uid == uid
+            && let Some(next) = self
+                .session_workspace
+                .layout
+                .sessions()
+                .into_iter()
+                .find(|other| *other != uid)
+        {
+            self.focus_session_pane(next, true, window, cx);
+        }
         let session = self.sessions.remove(ix);
         // Its commands' read-only terminal tabs go with it.
         self.close_agent_terminals(session.uid, cx);
@@ -298,14 +318,15 @@ impl FlintApp {
         if self.active > ix || self.active >= self.sessions.len() {
             self.active = self.active.saturating_sub(1);
         }
+        self.prune_session_panes(window, cx);
         self.session_menu = None;
         self.selected_change = None;
-        self.composer
-            .update(cx, |state, cx| state.focus(window, cx));
+        self.focus_session_input(window, cx);
         cx.notify();
     }
 
     pub fn undo_archive(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let previous = self.session().uid;
         let Some((mut session, ix)) = self.archived_session.take() else {
             return;
         };
@@ -344,6 +365,8 @@ impl FlintApp {
         self.sessions.insert(ix, session);
         self.refresh_archives();
         self.active = ix;
+        self.follow_session_selection(previous, self.session().uid, window, cx);
+        self.save_session_layout();
         self.store_error = None;
         self.composer
             .update(cx, |state, cx| state.focus(window, cx));

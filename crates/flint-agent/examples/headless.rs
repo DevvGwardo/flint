@@ -8,8 +8,10 @@ use std::path::PathBuf;
 use flint_agent::AgentConfig;
 use flint_agent::AgentEvent;
 use flint_agent::Op;
+use flint_agent::TurnEndReason;
 
-fn main() -> anyhow::Result<()> {
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
     let mut args = std::env::args().skip(1);
     let (Some(dir), Some(prompt)) = (args.next(), args.next()) else {
         anyhow::bail!("usage: headless <dir> <prompt>");
@@ -22,10 +24,26 @@ fn main() -> anyhow::Result<()> {
         config.jev.is_some()
     );
     let handle = flint_agent::spawn_session(config);
-    handle.ops.send_blocking(Op::UserMessage(prompt))?;
+    handle.ops.send(Op::UserMessage(prompt)).await?;
     let mut in_text = false;
     let mut out = std::io::stdout();
-    while let Ok(event) = handle.events.recv_blocking() {
+    let mut shutdown_sent = false;
+    let mut completed = false;
+    let mut failure = None;
+    let mut deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(900);
+    loop {
+        let event = match tokio::time::timeout_at(deadline, handle.events.recv()).await {
+            Ok(Ok(event)) => event,
+            Ok(Err(_)) => anyhow::bail!("session event stream closed before SessionStopped"),
+            Err(_) if !shutdown_sent => {
+                failure = Some("turn exceeded the 900-second deadline".to_string());
+                handle.ops.send(Op::Shutdown).await?;
+                shutdown_sent = true;
+                deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+                continue;
+            }
+            Err(_) => anyhow::bail!("session did not acknowledge shutdown within 10 seconds"),
+        };
         let line = match &event {
             AgentEvent::TextDelta(text) => {
                 in_text = true;
@@ -35,6 +53,7 @@ fn main() -> anyhow::Result<()> {
             }
             AgentEvent::ReasoningDelta(_) | AgentEvent::ToolOutputDelta { .. } => continue,
             AgentEvent::TurnStarted { turn_id } => format!("── turn {turn_id}"),
+            AgentEvent::SteeringAccepted { id } => format!("steering accepted: {id}"),
             AgentEvent::StepStarted { step, .. } => format!("── step {step}"),
             AgentEvent::ToolCallStarted { name, summary, .. } => format!("▶ {name}: {summary}"),
             AgentEvent::ToolCallFinished {
@@ -69,6 +88,13 @@ fn main() -> anyhow::Result<()> {
                 format!("⇣ context compacted {before_tokens} -> {after_tokens} tokens")
             }
             AgentEvent::SessionOptions(options) => format!("options: {}", options.len()),
+            AgentEvent::FilesReverted { diffs, skipped, .. } => {
+                format!(
+                    "↶ reverted {} file(s), skipped {}",
+                    diffs.len(),
+                    skipped.len()
+                )
+            }
             AgentEvent::SessionStopped { history_saved } => {
                 format!("session stopped: history_saved={history_saved}")
             }
@@ -86,10 +112,24 @@ fn main() -> anyhow::Result<()> {
             in_text = false;
         }
         writeln!(out, "{line}")?;
-        if matches!(event, AgentEvent::TurnFinished { .. }) {
+        if let AgentEvent::TurnFinished { reason, .. } = &event
+            && !shutdown_sent
+        {
+            completed = matches!(reason, TurnEndReason::Completed);
+            if !completed {
+                failure = Some(format!("turn failed: {reason:?}"));
+            }
+            handle.ops.send(Op::Shutdown).await?;
+            shutdown_sent = true;
+            deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        }
+        if matches!(event, AgentEvent::SessionStopped { .. }) {
             break;
         }
     }
-    let _ = handle.ops.send_blocking(Op::Shutdown);
+    if let Some(failure) = failure {
+        anyhow::bail!(failure);
+    }
+    anyhow::ensure!(completed, "session stopped without a completed turn");
     Ok(())
 }

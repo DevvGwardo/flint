@@ -10,6 +10,7 @@ pub enum SlashCommand {
     Effort,
     Approval,
     Review,
+    Undo,
     Help,
 }
 
@@ -42,6 +43,11 @@ pub const COMMANDS: &[(SlashCommand, &str, &str)] = &[
         "Switch between auto-run and ask first",
     ),
     (SlashCommand::Review, "/review", "Open the changes panel"),
+    (
+        SlashCommand::Undo,
+        "/undo",
+        "Undo the agent's file changes from its last turn",
+    ),
     (SlashCommand::Help, "/help", "Shortcuts and commands"),
 ];
 
@@ -52,6 +58,15 @@ pub fn active_query(text: &str) -> Option<&str> {
 }
 
 pub fn matches(query: &str) -> Vec<(SlashCommand, &'static str, &'static str)> {
+    let max_len = COMMANDS
+        .iter()
+        .map(|(_, name, _)| name.len() - 1)
+        .max()
+        .unwrap_or(0);
+    // Lowercasing can change byte length, but does not remove characters.
+    if query.chars().nth(max_len).is_some() {
+        return Vec::new();
+    }
     let query = query.to_lowercase();
     let mut found: Vec<_> = COMMANDS
         .iter()
@@ -62,3 +77,7 @@ pub fn matches(query: &str) -> Vec<(SlashCommand, &'static str, &'static str)> {
     found.sort_by_key(|(_, name, _)| name[1..] != query);
     found
 }
+
+#[cfg(test)]
+#[path = "slash_tests.rs"]
+mod tests;

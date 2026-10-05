@@ -17,6 +17,8 @@ pub mod demo;
 pub mod diff;
 pub mod docking;
 pub mod engine;
+pub mod file_preview;
+pub mod general;
 pub mod header;
 mod image_attach;
 pub mod layout;
@@ -26,19 +28,28 @@ pub mod option_chips;
 pub mod palette;
 pub mod permission_choice;
 pub mod popover;
+pub mod project;
 pub mod project_menu;
+pub mod prompt_queue;
+pub mod queue_actions;
+pub mod queue_view;
 pub mod session;
+pub mod session_groups;
 pub mod session_options;
+pub mod session_workspace;
 pub mod settings;
 pub mod settings_view;
 pub mod sidebar;
 pub mod slash;
 pub mod store;
+pub mod subagent_ui;
 pub mod theme;
 pub mod transcript;
 pub mod turns;
 pub mod ui;
 pub mod view_model;
+pub mod worktree_picker;
+pub mod worktrees;
 
 pub mod automation;
 pub mod synthetic;
@@ -64,6 +75,7 @@ pub fn parse_options(args: impl IntoIterator<Item = String>) -> Options {
             "--open-terminal" => options.open_terminal = true,
             "--terminal-input" => options.terminal_input = args.next(),
             "--demo-instant" => options.demo_instant = true,
+            "--demo-queue" => options.demo_queue = true,
             "--demo-stop" => options.demo_stop = args.next().and_then(|n| n.parse().ok()),
             "--demo-approval" => options.demo_approval = true,
             "--demo-expand" => options.demo_expand = true,
@@ -104,6 +116,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("cmd-shift-p", TogglePalette, None),
         KeyBinding::new("cmd-j", ToggleChanges, None),
         KeyBinding::new("cmd-b", ToggleSidebar, None),
+        KeyBinding::new("cmd-shift-g", CycleSessionGrouping, None),
         KeyBinding::new("cmd-shift-a", ToggleApproval, None),
         KeyBinding::new("cmd-o", OpenWorkspace, None),
         KeyBinding::new("cmd-.", Interrupt, None),

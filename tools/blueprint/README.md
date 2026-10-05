@@ -1,6 +1,6 @@
 # flint blueprint harness
 
-Evidence for what flint promises its users. Every script records one
+Evidence for what flint promises its users. The shared `bp.Report` scripts record one
 `check(name, ok, detail)` per promise (named as the behaviour a user relies on,
 with the measured value in `detail`), writes
 `blueprint-out/data/report-<script>.json` (plus a per-tag copy
@@ -20,6 +20,7 @@ workspace when one is not supplied. First-run tests use genuinely empty homes.
 ```sh
 python3 tools/blueprint/sweep.py      # UI states: launch, size, pixels, memory, CPU
 python3 tools/blueprint/interact.py   # headless UI tests, one check per test
+python3 tools/blueprint/queue.py --bin target/release/flint # offline queue/composer captures
 python3 tools/blueprint/live.py       # real turns against your configured model endpoint
 python3 tools/blueprint/perf.py       # cold start, memory, CPU, frame cost, size, TTFT
 ```
@@ -33,6 +34,48 @@ release binary; `--tag before|after` labels the run (screenshots are
 `--target-dir DIR` to test another checkout (used for the baseline worktree).
 
 ## Scripts
+
+### `acp.py` — isolated native ACP execution and selection
+
+```sh
+python3 tools/blueprint/acp.py --bin target/release/flint --out target/acp-native-fresh
+```
+
+Requires macOS, Node/npm and a running Cua Driver service with Accessibility
+and Screen Recording permissions already granted. The output directory must
+not exist. This script has its own `report.json`, `peer.jsonl`, native PNG
+captures and Cua operation records under `--out`.
+
+It launches the compiled app through Cua Driver in a registered, disposable
+app bundle. Only that instance's PATH points `droid` at `acp_fixture.py`, an
+offline ACP peer. A fresh HOME/FLINT_HOME and removed credential variables keep
+the user's account and sessions untouched. It checks foreground echo/npm/
+heredocs, a symlinked cwd, real missing-binary diagnostics, native command
+expansion and model/provider picking, new session, `/clear`, compact approval/
+running states, and an isolated restart into another workspace. Every UI action
+uses a fresh Cua snapshot and is verified from native state or the peer trace.
+Successful runs close the fixture; failed runs retain it for diagnosis.
+
+These are native integration checks, not real Droid inference, a reproduction
+of a historical failing request, or permission to restart the user's active app.
+
+### `queue.py` — prompt queue and composer
+Uses an already-built binary to capture working, paused, compact-popover and
+empty-composer states. Checks isolated queue counts, paused fixtures, nonblank
+native captures and absence of panics. It also requires a completed composer
+paint: Send must fit; running scenes must show one live task and an unclipped
+Stop control; the capture window must not become key. `--demo-queue` adds two frozen demo
+prompts and opens the queue popover in short demo windows. This is offline,
+with disposable homes/workspaces and no activation or physical input. These
+captures do not prove VoiceOver or live ACP steering.
+
+Queue captures use `FLINT_BP_CAPTURE=1` and a timed state dump. The normal
+background window opens at the primary display's edge, avoiding a completely
+covered centered window whose macOS frame loop can stop. The dump waits for
+a completed paint instead of accepting an earlier background-demo completion.
+If the window is still covered, the script fails rather than accepting stale
+pixels. This mode is not used for performance measurements.
+Run the capture-check regressions with `python3 tools/blueprint/test_queue.py`.
 
 ### `sweep.py` — UI states
 Launches each state through CLI flags: empty, running, done, expanded,
@@ -63,6 +106,17 @@ the transcript follows output until you scroll up, the @ picker respects
 `.gitignore` and attaches capped files, / commands, settings persist, sessions
 survive a restart, rename/delete, effort chip, guard nudges, combined diffs,
 error cards with fix actions, …).
+
+### `diff.py` — large patch
+Runs three offline scroll workloads through the real Changes panel with
+10,000 additions and an off-screen long line. Checks retained additions,
+normal exit, no panic, a native screenshot, and steady-state frame evidence.
+Background `--diff-test` launches with `FLINT_BP_FRAMES` open at the primary
+display's edge without activation. This avoids a fully covered centered
+window whose macOS display-link frames can stop. The frame probe does not
+enable capture mode or its post-paint readiness instrumentation.
+CPU and frame results require sufficient recorded frames; missing evidence
+fails the gate and is not a valid performance sample.
 
 ### `live.py` — real runs
 For each fixture in `fixtures/<name>/` (`repo/`, `task.txt`, hidden
@@ -103,6 +157,7 @@ scroll test, the realistic interaction, drops 0).
 | --- | --- |
 | `FLINT_BP_STATE=<path>` | JSON dump of sessions, statuses, item kinds, changes, usage, guard events and time to first token when a turn ends |
 | `FLINT_BP_DUMP_AFTER_MS=<ms>` | also dump the state once the UI has settled (sweep) |
+| `FLINT_BP_CAPTURE=1` | with a timed state dump, position the normal background window at the primary display's edge and write painted composer control bounds after a completed frame; suppress earlier turn-end dumps |
 | `FLINT_BP_FRAMES=<path>` | per-frame timing log, written on exit |
 | `FLINT_BP_TIMING=<path>` | first-frame timestamp |
 | `FLINT_BP_NO_ACTIVATE=1` | open without activating the app or taking focus; the composer also stays unfocused (no caret blink) until the window is key |

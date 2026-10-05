@@ -4,6 +4,37 @@ use serde_json::json;
 use super::*;
 
 #[test]
+fn sse_line_and_event_buffers_have_hard_limits() {
+    let mut parser = SseParser::default();
+    assert!(parser.push(&vec![b'x'; 1024 * 1024 + 1]).is_empty());
+    assert!(parser.buf.is_empty());
+    assert_eq!(parser.finish(), None);
+    let mut parser = SseParser::default();
+    let line = format!("data: {}\n", "x".repeat(64 * 1024));
+    for _ in 0..17 {
+        parser.push(line.as_bytes());
+    }
+    assert!(parser.data.is_empty());
+}
+
+#[test]
+fn completion_and_tool_inventory_have_hard_limits() {
+    let mut builder = CompletionBuilder::default();
+    let chunk = json!({"choices":[{"delta":{"content":"x".repeat(256 * 1024)}}]});
+    for _ in 0..33 {
+        builder.apply(&chunk);
+    }
+    assert!(builder.finish().text.len() <= 8 * 1024 * 1024);
+    let mut builder = CompletionBuilder::default();
+    for index in 0..=256 {
+        builder.apply(&json!({"choices":[{"delta":{"tool_calls":[
+            {"index":index,"id":format!("c{index}"),"function":{"name":"read_file","arguments":"{}"}}
+        ]}}]}));
+    }
+    assert_eq!(builder.finish().tool_calls.len(), 256);
+}
+
+#[test]
 fn sse_frames_across_chunk_boundaries() {
     let mut parser = SseParser::default();
     assert_eq!(parser.push(b"data: {\"a\""), Vec::<String>::new());
@@ -13,6 +44,75 @@ fn sse_frames_across_chunk_boundaries() {
     );
     assert_eq!(parser.push(b"data: tail"), Vec::<String>::new());
     assert_eq!(parser.finish(), Some("tail".to_string()));
+}
+
+#[test]
+fn sse_preserves_unicode_at_every_byte_boundary() {
+    let body = "data: {\"text\":\"café 日本語 🦀\"}\n\n";
+    for split in 0..=body.len() {
+        let mut parser = SseParser::default();
+        let mut payloads = parser.push(&body.as_bytes()[..split]);
+        payloads.extend(parser.push(&body.as_bytes()[split..]));
+        assert_eq!(payloads, vec!["{\"text\":\"café 日本語 🦀\"}"]);
+        assert_eq!(parser.finish(), None);
+    }
+    let mut parser = SseParser::default();
+    let payloads: Vec<_> = body
+        .as_bytes()
+        .chunks(1)
+        .flat_map(|chunk| parser.push(chunk))
+        .collect();
+    assert_eq!(payloads, vec!["{\"text\":\"café 日本語 🦀\"}"]);
+}
+
+#[test]
+fn sse_accepts_all_line_endings_and_preserves_data_spaces() {
+    for ending in ["\n", "\r", "\r\n"] {
+        let body = format!("data:  one  {ending}data: two{ending}{ending}");
+        for split in 0..=body.len() {
+            let mut parser = SseParser::default();
+            let mut payloads = parser.push(&body.as_bytes()[..split]);
+            payloads.extend(parser.push(&body.as_bytes()[split..]));
+            assert_eq!(payloads, vec![" one  \ntwo"]);
+        }
+    }
+    let mut parser = SseParser::default();
+    parser.push(b"data:  tail  ");
+    assert_eq!(parser.finish(), Some(" tail  ".into()));
+    assert_eq!(parser.finish(), None);
+}
+
+#[test]
+fn tool_call_id_can_arrive_after_its_name_and_arguments() {
+    let mut builder = CompletionBuilder::default();
+    builder.apply(&json!({"choices": [{"delta": {"tool_calls": [
+        {"index": 0, "function": {"name": "read_file", "arguments": "{\"path\":"}}
+    ]}}]}));
+    builder.apply(&json!({"choices": [{"delta": {"tool_calls": [
+        {"index": 0, "id": "late-id", "function": {"arguments": "\"a.rs\"}"}}
+    ]}}]}));
+    assert_eq!(
+        builder.finish().tool_calls,
+        vec![RawToolCall {
+            id: "late-id".into(),
+            name: "read_file".into(),
+            arguments: "{\"path\":\"a.rs\"}".into(),
+        }]
+    );
+}
+
+#[test]
+fn different_tool_call_ids_still_create_separate_calls_at_a_reused_index() {
+    let mut builder = CompletionBuilder::default();
+    for id in ["first", "second"] {
+        builder.apply(&json!({"choices": [{"delta": {"tool_calls": [
+            {"index": 0, "id": id, "function": {"name": "read_file", "arguments": "{}"}}
+        ]}}]}));
+    }
+    let calls = builder.finish().tool_calls;
+    assert_eq!(calls.len(), 2);
+    assert_eq!(calls[0].id, "first");
+    assert_eq!(calls[1].id, "second");
 }
 
 #[test]

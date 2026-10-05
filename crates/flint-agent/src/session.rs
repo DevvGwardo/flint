@@ -1,7 +1,7 @@
 //! The agent loop: one model call per step, tools between steps, harness
 //! nudges between steps and at the end of a turn.
 
-use std::path::PathBuf;
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
@@ -16,14 +16,17 @@ use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
 use crate::approvals::Approvals;
+use crate::approvals::Request;
 use crate::context::ContextTracker;
 use crate::harness::Harness;
 use crate::harness::args::RepairedArgs;
 use crate::harness::args::closest_tool_name;
 use crate::harness::args::repair_tool_args;
 use crate::harness::jev::JevClient;
+use crate::mcp::McpHub;
 use crate::persist;
 use crate::persist::Saver;
+use crate::prompt::general_system_prompt;
 use crate::prompt::system_prompt;
 use crate::protocol::AgentConfig;
 use crate::protocol::AgentEvent;
@@ -55,13 +58,18 @@ use crate::tools;
 /// [`TurnEndReason::StepLimit`].
 pub const MAX_STEPS_PER_TURN: u32 = 600;
 
+/// Model calls allowed in one subagent task. Up to four children run at
+/// once, so their cap is lower than the parent's: a delegated task is
+/// smaller by design, and a runaway child should end long before the parent.
+pub const MAX_CHILD_STEPS_PER_TURN: u32 = 200;
+
 /// Runs a session until `Shutdown` or until the front end drops its sender.
 pub(crate) async fn run(config: AgentConfig, ops: Receiver<Op>, events: Sender<AgentEvent>) {
     let current = Arc::new(Mutex::new(CancellationToken::new()));
     let effort = Arc::new(Mutex::new(config.reasoning_effort));
     let approvals = Arc::new(Approvals::default());
     let stopping = Arc::new(AtomicBool::new(false));
-    let (messages_tx, messages_rx) = async_channel::unbounded::<(String, Vec<ImageAttachment>)>();
+    let (messages_tx, messages_rx) = async_channel::unbounded::<Input>();
 
     // Ops are handled on their own task so Interrupt and Approval reach a
     // running turn, and user messages queue while one is in flight.
@@ -73,10 +81,16 @@ pub(crate) async fn run(config: AgentConfig, ops: Receiver<Op>, events: Sender<A
         while let Ok(op) = ops.recv().await {
             match op {
                 Op::UserMessage(text) => {
-                    let _ = messages_tx.send((text, Vec::new())).await;
+                    let _ = messages_tx.send(Input::Message(text, Vec::new())).await;
                 }
                 Op::UserMessageWithImages { text, images } => {
-                    let _ = messages_tx.send((text, images)).await;
+                    let _ = messages_tx.send(Input::Message(text, images)).await;
+                }
+                Op::SteerMessage { id, text, images } => {
+                    let _ = messages_tx.send(Input::Steer { id, text, images }).await;
+                }
+                Op::UndoLastTurn => {
+                    let _ = messages_tx.send(Input::Undo).await;
                 }
                 Op::Interrupt => cancel_current(&ops_current),
                 Op::Approval { call_id, decision } => {
@@ -98,18 +112,40 @@ pub(crate) async fn run(config: AgentConfig, ops: Receiver<Op>, events: Sender<A
     });
 
     let auto_budget = config.context_budget_tokens == 0;
-    let mut session = Session::new(config, events, approvals, effort, false);
+    let mcp = if config.mcp_servers.is_empty() {
+        None
+    } else {
+        let (hub, errors) = McpHub::start(&config.mcp_servers, &config.workspace).await;
+        for error in errors {
+            let _ = events.try_send(AgentEvent::Error(error));
+        }
+        Some(Arc::new(hub))
+    };
+    let tools = tools::ToolContext::new(config.workspace.clone(), config.sandbox);
+    let mut session = Session::new(config, events, approvals, effort, tools, mcp, false);
+    session.inbox = Some(messages_rx);
     if auto_budget {
         let limits = session.provider.model_limits().await;
         session.context.set_budget(budget_for_window(limits));
     }
-    while let Ok((text, images)) = messages_rx.recv().await {
+    while let Some(input) = session.next_input().await {
+        let (text, images, steering) = match input {
+            Input::Message(text, images) => (text, images, None),
+            Input::Steer { id, text, images } => (text, images, Some(id)),
+            Input::Undo => {
+                session.undo();
+                continue;
+            }
+        };
         let token = CancellationToken::new();
         if let Ok(mut slot) = current.lock() {
             *slot = token.clone();
             if stopping.load(Ordering::SeqCst) {
                 break;
             }
+        }
+        if let Some(id) = steering {
+            session.emit(AgentEvent::SteeringAccepted { id });
         }
         session.run_turn_with_images(text, images, &token).await;
     }
@@ -149,6 +185,20 @@ pub(crate) fn budget_for_window(limits: Option<ModelLimits>) -> u64 {
         .max(limits.context_window / 2)
 }
 
+/// What the front end sends a session between (or during) turns.
+pub(super) enum Input {
+    Message(String, Vec<ImageAttachment>),
+    Steer {
+        id: u64,
+        text: String,
+        images: Vec<ImageAttachment>,
+    },
+    Undo,
+}
+
+/// Retries of one step after the stream broke mid-reply.
+const MAX_STEP_RETRIES: u32 = 2;
+
 fn cancel_current(current: &Mutex<CancellationToken>) {
     if let Ok(token) = current.lock() {
         token.cancel();
@@ -156,7 +206,6 @@ fn cancel_current(current: &Mutex<CancellationToken>) {
 }
 
 pub(super) struct Session {
-    workspace: PathBuf,
     approval: ApprovalMode,
     config: AgentConfig,
     provider: Provider,
@@ -173,8 +222,20 @@ pub(super) struct Session {
     pub(super) saver: Option<Saver>,
     subagents: Option<Subagents>,
     pub(super) call_prefix: String,
-    tool_names: Vec<&'static str>,
+    tool_names: Vec<String>,
     pub(super) last_usage: Usage,
+    /// Workspace, file tracker and sandbox for this agent's tools.
+    tools: tools::ToolContext,
+    mcp: Option<Arc<McpHub>>,
+    max_steps: u32,
+    child: bool,
+    /// Messages and undo requests from the front end (the parent only).
+    /// Messages that arrive mid-turn are handed to the running turn.
+    inbox: Option<Receiver<Input>>,
+    /// Inputs taken from the inbox mid-turn that wait for the turn to end.
+    deferred: VecDeque<Input>,
+    /// Told to the model with the next user message (e.g. an undo).
+    pending_note: Option<String>,
 }
 
 impl Session {
@@ -183,19 +244,30 @@ impl Session {
         events: Sender<AgentEvent>,
         approvals: Arc<Approvals>,
         effort: Arc<Mutex<Option<ReasoningEffort>>>,
+        tools: tools::ToolContext,
+        mcp: Option<Arc<McpHub>>,
         child: bool,
     ) -> Self {
         let mut specs = tools::tool_specs();
         if child {
             specs.retain(|spec| spec["function"]["name"] != tools::SPAWN_AGENT);
         }
-        let tool_names = tools::TOOL_NAMES
+        let mut tool_names: Vec<String> = tools::TOOL_NAMES
             .iter()
-            .copied()
-            .filter(|name| !child || *name != tools::SPAWN_AGENT)
+            .filter(|name| !child || **name != tools::SPAWN_AGENT)
+            .map(|name| (*name).to_string())
             .collect();
+        if let Some(hub) = &mcp {
+            specs.extend(hub.specs());
+            tool_names.extend(hub.tools().iter().map(|t| t.full_name.clone()));
+        }
         let tools_json = serde_json::to_string(&specs).unwrap_or_default();
-        let mut history = vec![Message::System(system_prompt(&config.workspace))];
+        let prompt = if config.general {
+            general_system_prompt(&config.workspace)
+        } else {
+            system_prompt(&config.workspace)
+        };
+        let mut history = vec![Message::System(prompt)];
         let mut turn_id = 0;
         if let Some(dir) = &config.session_dir {
             match persist::load(dir) {
@@ -212,7 +284,7 @@ impl Session {
             }
         }
         Self {
-            subagents: (!child).then(|| Subagents::new(config.clone())),
+            subagents: (!child).then(|| Subagents::new(config.clone(), tools.child(), mcp.clone())),
             provider: Provider::new(&config.base_url, &config.model, &config.api_key),
             jev: config.jev.clone().map(JevClient::new),
             context: ContextTracker::new(
@@ -225,7 +297,6 @@ impl Session {
             ),
             saver: config.session_dir.clone().map(Saver::new),
             history,
-            workspace: config.workspace.clone(),
             approval: config.approval,
             config,
             events,
@@ -237,7 +308,87 @@ impl Session {
             call_prefix: String::new(),
             tool_names,
             last_usage: Usage::default(),
+            tools,
+            mcp,
+            max_steps: if child {
+                MAX_CHILD_STEPS_PER_TURN
+            } else {
+                MAX_STEPS_PER_TURN
+            },
+            child,
+            inbox: None,
+            deferred: VecDeque::new(),
+            pending_note: None,
         }
+    }
+
+    /// The next input: one deferred during a turn, else from the inbox.
+    async fn next_input(&mut self) -> Option<Input> {
+        if let Some(input) = self.deferred.pop_front() {
+            return Some(input);
+        }
+        self.inbox.as_ref()?.recv().await.ok()
+    }
+
+    /// Messages the user sent while this turn runs. Undo requests wait for
+    /// the turn to end.
+    fn take_steering(&mut self) -> Vec<(String, Vec<ImageAttachment>)> {
+        let mut messages = Vec::new();
+        if !self.deferred.is_empty() {
+            return messages;
+        }
+        let Some(inbox) = &self.inbox else {
+            return messages;
+        };
+        while let Ok(input) = inbox.try_recv() {
+            match input {
+                Input::Message(text, images) if self.deferred.is_empty() => {
+                    messages.push((text, images));
+                }
+                Input::Steer { id, text, images } if self.deferred.is_empty() => {
+                    self.events
+                        .try_send(AgentEvent::SteeringAccepted { id })
+                        .ok();
+                    messages.push((text, images));
+                }
+                other => self.deferred.push_back(other),
+            }
+        }
+        messages
+    }
+
+    /// Restores the files the last turn with changes edited.
+    fn undo(&mut self) {
+        let report = match self.tools.seen.journal().lock() {
+            Ok(mut journal) => journal.undo_last(&self.tools.seen),
+            Err(_) => Err("The undo journal is unavailable.".to_string()),
+        };
+        match report {
+            Ok(report) => {
+                if !report.diffs.is_empty() {
+                    let files: Vec<&str> = report.diffs.iter().map(|d| d.path.as_str()).collect();
+                    self.pending_note = Some(format!(
+                        "[Note: the user undid your file changes from an earlier turn; these files \
+                         are back to how they were before it: {}. Re-read them before editing.]",
+                        files.join(", ")
+                    ));
+                }
+                self.emit(AgentEvent::FilesReverted {
+                    turn_id: report.turn_id,
+                    diffs: report.diffs,
+                    skipped: report
+                        .skipped
+                        .into_iter()
+                        .map(|(path, why)| format!("{path}: {why}"))
+                        .collect(),
+                });
+            }
+            Err(error) => self.emit(AgentEvent::Error(error)),
+        }
+    }
+
+    fn tool_name_refs(&self) -> Vec<&str> {
+        self.tool_names.iter().map(String::as_str).collect()
     }
 
     /// Queues a snapshot of the history for the background writer.
@@ -294,21 +445,24 @@ impl Session {
         turn_id: u64,
         cancel: &CancellationToken,
     ) -> TurnEndReason {
-        self.history.push(if images.is_empty() {
-            Message::User(text.clone())
-        } else {
-            Message::UserWithImages {
-                text: text.clone(),
-                images,
-            }
-        });
+        if !self.child
+            && let Ok(mut journal) = self.tools.seen.journal().lock()
+        {
+            journal.begin_turn(turn_id);
+        }
         let mut harness = Harness::new(&text, self.jev.clone());
+        self.push_user(text, images);
         let mut usage = Usage::default();
         self.last_usage = usage;
+        let mut retries = 0;
 
-        for step in 0..MAX_STEPS_PER_TURN {
+        for step in 0..self.max_steps {
             if cancel.is_cancelled() {
                 return TurnEndReason::Interrupted;
+            }
+            for (text, images) in self.take_steering() {
+                harness.add_user_message(&text);
+                self.push_user(text, images);
             }
             if let Some(nudge) = harness.before_step().await {
                 self.nudge(NudgeReason::Stuck, nudge);
@@ -341,8 +495,24 @@ impl Session {
                 .complete(&request, &mut on_delta, cancel)
                 .await
             {
-                Ok(completion) => completion,
+                Ok(completion) => {
+                    retries = 0;
+                    completion
+                }
                 Err(ProviderError::Cancelled) => return TurnEndReason::Interrupted,
+                Err(ProviderError::Dropped(message)) if retries < MAX_STEP_RETRIES => {
+                    // The reply was cut off after it started showing: run
+                    // the step again rather than ending the turn.
+                    retries += 1;
+                    self.emit(AgentEvent::Error(format!(
+                        "The model's reply was cut off ({message}). Retrying this step."
+                    )));
+                    continue;
+                }
+                Err(ProviderError::Dropped(message)) => {
+                    self.emit(AgentEvent::Error(message.clone()));
+                    return TurnEndReason::Failed(message);
+                }
                 Err(ProviderError::Failed(message)) => {
                     self.emit(AgentEvent::Error(message.clone()));
                     return TurnEndReason::Failed(message);
@@ -354,6 +524,16 @@ impl Session {
                     "This model endpoint doesn't accept reasoning_effort; continuing without it."
                         .to_string(),
                 ));
+            }
+            // Defense in depth: never prepare or run tools from an incomplete,
+            // filtered or otherwise unsupported model outcome.
+            if !matches!(
+                completion.finish_reason.as_deref(),
+                Some("stop" | "tool_calls")
+            ) {
+                let message = format!("Unsafe model outcome: {:?}", completion.finish_reason);
+                self.emit(AgentEvent::Error(message.clone()));
+                return TurnEndReason::Failed(message);
             }
             if let Some(call_usage) = completion.usage {
                 self.context.observe(&self.history, call_usage.input_tokens);
@@ -377,10 +557,19 @@ impl Session {
             });
 
             if calls.is_empty() {
-                match harness
-                    .continuation(&completion.text, &self.tool_names)
-                    .await
-                {
+                // A message the user sent while the model was finishing
+                // starts another pass of the same turn.
+                let steered = self.take_steering();
+                if !steered.is_empty() {
+                    for (text, images) in steered {
+                        harness.add_user_message(&text);
+                        self.push_user(text, images);
+                    }
+                    self.save();
+                    continue;
+                }
+                let names = self.tool_name_refs();
+                match harness.continuation(&completion.text, &names).await {
                     Some((reason, message)) => {
                         self.nudge(reason, message);
                         self.save();
@@ -405,6 +594,14 @@ impl Session {
                     self.run_subagents(&calls[index..end], &mut harness, &mut usage, cancel)
                         .await;
                     index = end;
+                } else if runs_in_parallel(call) {
+                    let end = calls[index..]
+                        .iter()
+                        .position(|call| !runs_in_parallel(call))
+                        .map_or(calls.len(), |offset| index + offset);
+                    self.run_reads(&calls[index..end], &mut harness, cancel)
+                        .await;
+                    index = end;
                 } else {
                     self.run_call(call, &mut harness, cancel).await;
                     index += 1;
@@ -418,6 +615,19 @@ impl Session {
         TurnEndReason::StepLimit
     }
 
+    /// Adds a user message to the history, with any pending note first.
+    fn push_user(&mut self, text: String, images: Vec<ImageAttachment>) {
+        let text = match self.pending_note.take() {
+            Some(note) => format!("{note}\n\n{text}"),
+            None => text,
+        };
+        self.history.push(if images.is_empty() {
+            Message::User(text)
+        } else {
+            Message::UserWithImages { text, images }
+        });
+    }
+
     fn nudge(&mut self, reason: NudgeReason, message: String) {
         self.emit(AgentEvent::HarnessNudge {
             reason,
@@ -429,8 +639,9 @@ impl Session {
     /// Repairs the tool name and arguments of a raw call.
     fn prepare_call(&self, raw: &RawToolCall) -> PreparedCall {
         let mut name = raw.name.clone();
-        if !self.tool_names.contains(&name.as_str())
-            && let Some(found) = closest_tool_name(&name, &self.tool_names)
+        let names = self.tool_name_refs();
+        if !names.contains(&name.as_str())
+            && let Some(found) = closest_tool_name(&name, &names)
         {
             self.emit(AgentEvent::ToolRepaired {
                 tool: found.to_string(),
@@ -481,13 +692,29 @@ impl Session {
             tools::ToolOutcome::error(format!(
                 "the arguments are not valid JSON ({error}). Send a JSON object."
             ))
-        } else if !self.approved(&call_id, kind, &summary, cancel).await {
+        } else if !self
+            .approved(&call_id, &call.name, kind, &summary, &call.args, cancel)
+            .await
+        {
             let message = if cancel.is_cancelled() {
                 "Interrupted before this ran."
             } else {
                 "The user declined this action. Ask what they want instead, or try another approach."
             };
             tools::ToolOutcome::error(message)
+        } else if call.name == tools::UPDATE_PLAN {
+            match tools::parse_plan(&call.args) {
+                Ok(plan) => {
+                    harness.record_plan(
+                        plan.iter()
+                            .filter(|s| s.status.is_open())
+                            .map(|s| s.step.clone())
+                            .collect(),
+                    );
+                    tools::ToolOutcome::ok(tools::render_plan(&plan))
+                }
+                Err(error) => tools::ToolOutcome::error(error),
+            }
         } else if call.name == tools::LIST_MODELS {
             match self.provider.list_models(cancel).await {
                 Ok(models) => {
@@ -522,11 +749,15 @@ impl Session {
                 }
                 Err(error) => tools::ToolOutcome::error(error),
             }
-        } else if !self.tool_names.contains(&call.name.as_str()) {
+        } else if !self.tool_names.contains(&call.name) {
             tools::ToolOutcome::error(format!(
                 "Tool `{}` is unavailable in this session.",
                 call.name
             ))
+        } else if call.name.starts_with(crate::mcp::PREFIX)
+            && let Some(hub) = &self.mcp
+        {
+            hub.call(&call.name, &call.args, cancel).await
         } else {
             let events = self.events.clone();
             let output_id = call_id.clone();
@@ -536,9 +767,36 @@ impl Session {
                     chunk,
                 });
             };
-            tools::execute(&self.workspace, &call.name, &call.args, &on_output, cancel).await
+            tools::execute(&self.tools, &call.name, &call.args, &on_output, cancel).await
         };
         self.finish_call(call, outcome, harness, started);
+    }
+
+    /// Runs consecutive read-only calls (reads, listings, searches) at once.
+    /// They need no approval and change nothing, so their order doesn't
+    /// matter; results are recorded in call order.
+    async fn run_reads(
+        &mut self,
+        calls: &[PreparedCall],
+        harness: &mut Harness,
+        cancel: &CancellationToken,
+    ) {
+        if let [call] = calls {
+            return self.run_call(call, harness, cancel).await;
+        }
+        let started: Vec<Instant> = calls
+            .iter()
+            .map(|call| self.start_call(call, harness))
+            .collect();
+        let outcomes = futures_util::future::join_all(
+            calls
+                .iter()
+                .map(|call| tools::execute(&self.tools, &call.name, &call.args, &|_| {}, cancel)),
+        )
+        .await;
+        for ((call, outcome), started) in calls.iter().zip(outcomes).zip(started) {
+            self.finish_call(call, outcome, harness, started);
+        }
     }
 
     fn start_call(&self, call: &PreparedCall, harness: &mut Harness) -> Instant {
@@ -704,21 +962,36 @@ impl Session {
     async fn approved(
         &mut self,
         call_id: &str,
+        name: &str,
         kind: ToolKind,
         summary: &str,
+        args: &Map<String, Value>,
         cancel: &CancellationToken,
     ) -> bool {
-        let needs_approval = match kind {
-            ToolKind::Command | ToolKind::Edit => true,
-            ToolKind::Read | ToolKind::Search | ToolKind::Other => false,
+        // Fetches can send data out; MCP tools can do anything.
+        let request = if name == tools::FETCH_URL {
+            let url = args.get("url").and_then(Value::as_str).unwrap_or(summary);
+            Some(Request::Fetch(
+                tools::fetch::url_host(url).unwrap_or_default(),
+            ))
+        } else if name.starts_with(crate::mcp::PREFIX) {
+            Some(Request::Mcp(name.to_string()))
+        } else {
+            match kind {
+                ToolKind::Command | ToolKind::Edit => Some(Request::new(
+                    kind,
+                    args.get("command").and_then(Value::as_str),
+                )),
+                ToolKind::Read | ToolKind::Search | ToolKind::Other => None,
+            }
         };
-        if self.approval == ApprovalMode::Auto
-            || self.approvals.always.load(Ordering::Relaxed)
-            || !needs_approval
-        {
+        let Some(request) = request else {
+            return true;
+        };
+        if self.approval == ApprovalMode::Auto {
             return true;
         }
-        let Some(answer) = self.approvals.register(call_id) else {
+        let Some(answer) = self.approvals.register(call_id, request) else {
             return true;
         };
         self.emit(AgentEvent::ApprovalRequested {
@@ -746,6 +1019,16 @@ impl Session {
             });
         }
     }
+}
+
+/// Read-only calls that may run alongside each other: valid reads, listings
+/// and searches.
+fn runs_in_parallel(call: &PreparedCall) -> bool {
+    call.error.is_none()
+        && matches!(
+            call.name.as_str(),
+            tools::READ_FILE | tools::LIST_DIR | tools::GREP
+        )
 }
 
 struct PreparedCall {

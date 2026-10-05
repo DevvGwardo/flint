@@ -180,7 +180,11 @@ async fn child_cannot_spawn_grandchildren_even_if_it_requests_the_tool() {
 async fn subagent_session_limit_still_allows_existing_children_to_resume() {
     let (_guard, ws) = temp_workspace();
     let config = test_config("http://unused.invalid/v1".into(), ws);
-    let mut children = Subagents::new(config);
+    let mut children = Subagents::new(
+        config.clone(),
+        crate::tools::ToolContext::new(config.workspace.clone(), false),
+        None,
+    );
     let approvals = Arc::new(crate::approvals::Approvals::default());
     let args = spawn_args("Report.").as_object().expect("args").clone();
     for _ in 0..32 {
@@ -216,7 +220,11 @@ async fn subagent_session_limit_still_allows_existing_children_to_resume() {
 async fn invalid_subagent_inputs_do_not_allocate_sessions() {
     let (_guard, ws) = temp_workspace();
     let config = test_config("http://unused.invalid/v1".into(), ws);
-    let mut children = Subagents::new(config);
+    let mut children = Subagents::new(
+        config.clone(),
+        crate::tools::ToolContext::new(config.workspace.clone(), false),
+        None,
+    );
     let approvals = Arc::new(crate::approvals::Approvals::default());
     for args in [
         json!({"label": "Research"}),
@@ -471,7 +479,11 @@ async fn subagent_edits_and_verification_count_as_parent_work() {
             "write_file",
             json!({"path": "a.txt", "content": "hi\n"}),
         ),
-        sse_tool_call("verify", "run_command", json!({"command": "cat a.txt"})),
+        sse_tool_call(
+            "verify",
+            "run_command",
+            json!({"command": "test \"$(cat a.txt)\" = hi"}),
+        ),
         sse_text("Created and verified."),
         sse_text("Completed."),
     ])

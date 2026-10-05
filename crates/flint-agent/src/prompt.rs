@@ -43,13 +43,97 @@ Lead with the outcome. Then, briefly: what changed and why (file paths in backti
 verification you ran and its result, and anything you could not check. No greetings, no file \
 dumps, no headings for small changes.";
 
-/// The full system prompt for a session in `workspace`.
-pub fn system_prompt(workspace: &Path) -> String {
+/// Project instruction files, in order of preference: the first one found
+/// in the workspace root is included in the prompt.
+const INSTRUCTION_FILES: [&str; 2] = ["AGENTS.md", "CLAUDE.md"];
+/// Characters of the instruction file kept in the prompt.
+const MAX_INSTRUCTION_CHARS: usize = 16_000;
+
+/// Project-free conversations still have a bounded folder for created files.
+pub fn general_system_prompt(workspace: &Path) -> String {
     format!(
+        "You are flint, a general-purpose assistant and agent. Help with questions, \
+         research, writing, planning, explanations, calculations, and practical tasks. \
+         This conversation is not attached to a coding project. Answer ordinary questions \
+         directly; do not invent a repository, make unnecessary edits, or run tests for \
+         a purely conversational answer.\n\n\
+         Use tools when the user's task needs them. Read before editing, keep changes \
+         scoped to the request, preserve existing work, and verify files or code you create. \
+         Ask for a folder to be attached if the task needs access to an existing project. \
+         Never claim to have browsed the web, sent a message, or performed an action without \
+         a supporting tool result. Ask before destructive or externally consequential actions. \
+         Keep credentials out of files, logs, and replies.\n\n\
+         # Environment\nPrivate working folder: {}. Relative file paths resolve here. \
+         File writes stay inside this folder; existing sandbox and approval rules still apply. \
+         This folder is not a Git repository and no project setup is required. \
+         OS: {} ({}). Be direct and concise.",
+        workspace.display(),
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+    )
+}
+
+/// The full system prompt for a session in `workspace`, with the project's
+/// `AGENTS.md` (or `CLAUDE.md`) when it has one.
+pub fn system_prompt(workspace: &Path) -> String {
+    let mut prompt = format!(
         "{DISCIPLINES}\n\n# Environment\n- Workspace: {} (relative paths resolve here; tools \
          cannot write outside it)\n- OS: {} ({})\n- Shell: run_command uses sh -c in the workspace.",
         workspace.display(),
         std::env::consts::OS,
         std::env::consts::ARCH,
-    )
+    );
+    if let Some((name, text)) = project_instructions(workspace) {
+        prompt.push_str(&format!(
+            "\n\n# Project instructions ({name})\nThe project's own rules. Follow them; they \
+             override the defaults above where they conflict.\n\n{text}"
+        ));
+    }
+    prompt
+}
+
+/// The first instruction file in the workspace root, trimmed and capped.
+fn project_instructions(workspace: &Path) -> Option<(&'static str, String)> {
+    INSTRUCTION_FILES.iter().find_map(|name| {
+        let text = std::fs::read_to_string(workspace.join(name)).ok()?;
+        let text = text.trim();
+        if text.is_empty() {
+            return None;
+        }
+        let mut kept: String = text.chars().take(MAX_INSTRUCTION_CHARS).collect();
+        if kept.len() < text.len() {
+            kept.push_str("\n[… truncated]");
+        }
+        Some((*name, kept))
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn includes_agents_md_before_claude_md() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        assert!(!system_prompt(dir.path()).contains("# Project instructions"));
+        std::fs::write(dir.path().join("CLAUDE.md"), "Use tabs.").expect("write");
+        assert!(system_prompt(dir.path()).ends_with("Use tabs."));
+        std::fs::write(dir.path().join("AGENTS.md"), "  Run make check.\n").expect("write");
+        let prompt = system_prompt(dir.path());
+        assert!(prompt.contains("# Project instructions (AGENTS.md)"));
+        assert!(prompt.ends_with("Run make check."));
+        assert!(!prompt.contains("Use tabs."));
+    }
+
+    #[test]
+    fn general_mode_does_not_assume_a_project_or_import_project_instructions() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("AGENTS.md"), "Only change Rust files.").expect("write");
+        let prompt = general_system_prompt(dir.path());
+        assert!(prompt.contains("general-purpose assistant"));
+        assert!(prompt.contains("not attached to a coding project"));
+        assert!(prompt.contains("sandbox and approval rules"));
+        assert!(!prompt.contains("Only change Rust files."));
+        assert!(!prompt.contains("coding agent working directly"));
+    }
 }

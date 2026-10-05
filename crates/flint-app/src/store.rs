@@ -24,6 +24,9 @@ pub struct Meta {
     /// Which agent runs the session (older sessions are flint's own).
     #[serde(default)]
     pub agent: AgentKind,
+    /// Older saved sessions remain attached to their original project.
+    #[serde(default)]
+    pub general: bool,
 }
 
 /// One line of `events.jsonl`.

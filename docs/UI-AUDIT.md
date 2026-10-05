@@ -2,6 +2,72 @@
 
 Date: 2026-10-03. Scope: current working tree, including pre-existing changes.
 
+## Current gap-closure checkpoint
+
+Evidence: `target/gap-closure-20261003.n8SJNS/`; current dispositions are in
+[the gap-closure ledger](GAP-CLOSURE-20261003.md), rather than the historical
+sections below. Final integrated formatting, strict Clippy, workspace tests,
+172 serial UI tests, release build and whitespace checks pass for `final3`.
+The compact-pane/accessibility follow-up also passes all six gates, including
+strict Clippy, workspace tests (app 100, UI 173), a separate serial UI run
+(173/173, 117.40 s including Cargo), release build and whitespace checks.
+The retained follow-up binary also passes native sweep 100/100, interleaved
+performance 10/10, diff 16/16 and workloads 71/71. Final native assertions pass
+with no source drift since validation.
+
+The app limits ordered pump batches to 256 events, remeasures changed existing
+rows once per batch, retains a Unicode-safe live-output tail, and offers
+session-local **Jump to latest**. Terminal forwarding follows ownership.
+Agent option chips retain confirmed state until acknowledgement. Drafts and
+attachments remain session-local in ordinary and tiled views, including
+project-created sessions. Mention indexing runs off-thread with workspace
+guards; regular text attachments read a bounded prefix inside the workspace.
+
+The first fixed release passes sweep 100/100, interleaved performance 10/10,
+diff 16/16 and workloads 71/71. Streaming CPU is 53.4 -> 53.6%, frame p95
+15.27 -> 15.23 ms, and scrolling p95 15.09 -> 15.16 ms. Budgets pass, but
+there is no meaningful measured streaming speedup. The latest paired rerun
+is authoritative for the follow-up binary: streaming CPU 75.4 -> 79.4%,
+frame p95 13.37 -> 13.23 ms, first frame 195.63 -> 206.16 ms. Both binaries
+have a different frame cadence from the earlier run; do not compare CPU
+across phases. The latest budgets pass without a meaningful speedup.
+
+Fresh screenshots were inspected for major states, 900x560 welcome/settings,
+large diff, terminal output and restored panes. Normal-state controls are
+readable, and the settings footer remains visible while the form scrolls.
+Review found compact-pane input clipping: wrapped options crushed the input
+to 30.5px. A failing-before/passing-after fixture now requires 44px of readable
+input, a visible send button and scroll-reachable lower options. Latest native
+1/2/4/8-pane screenshots were inspected: the compact eight-pane input is
+readable and Send remains visible; two/four-pane option chips do not overlap.
+Lower wrapped options are scroll-reachable in the headless regression, not
+exercised by this native probe. Idle pane RSS is 77.125/80.297/84.203/88.750 MB,
+CPU 0–1%, with correct restored counts and no panics. The single-pane launch
+intentionally opens a fresh session with the seeded one still in the sidebar.
+
+The native AX tree activates lazily: six elements/one named on the initial
+query, then 13/four named after 500 ms. Source inspection found custom Div
+labels without roles. Primary custom navigation, session, composer, option,
+permission and file controls now have explicit Button roles/names; existing
+native click handlers also supply AccessKit Click actions. The composer role
+fixture fails before/passes after. The final trusted, error-free activated AX
+probe sees 37 elements/28 named, including 31 buttons, with named primary
+buttons advertising AXPress. Actions were enumerated, not invoked. The AX demo
+screenshot was inspected; full VoiceOver/transcript/terminal reading is not
+verified.
+
+The latest 10,000-line diff fixture measures 81.97 MB RSS, CPU 28%, frame p95
+16.54 ms and root-render p95 0.183 ms, without a comparable phase baseline.
+Saved streaming preserves accepted records in order at approximately 2,000
+events/s, with batch p95 0.339–0.378 ms. These do not establish global queue
+bounds or performance on slow storage. Terminal workload frame p95 reaches
+16.73 ms; that script checks behavior, not a 16.7 ms performance budget.
+
+These are not physical keyboard/clipboard, VoiceOver, full transcript/terminal
+semantic reading, or concurrent native multipane streaming passes. Very small
+popover and styled combining-cell paint remain incompletely verified.
+Historical evidence and limits below remain historical.
+
 ## Sidebar closeout
 
 Verified through 2026-10-03 11:32:50 EDT. Continuation began at 10:53:08 EDT:

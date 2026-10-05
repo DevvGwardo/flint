@@ -13,6 +13,102 @@ use crate::test_support::outline;
 use crate::test_support::start;
 
 #[tokio::test]
+async fn shutdown_interrupts_an_unanswered_initialize() {
+    let (harness, mut fake) = start(ApprovalMode::Auto);
+    fake.expect("initialize").await;
+    harness.send(Op::Shutdown).await;
+    fake.closed().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn ignored_cancel_closes_calls_and_turn_exactly_once() {
+    let (harness, mut fake) = start(ApprovalMode::AskForChanges);
+    fake.handshake().await;
+    harness.send(Op::UserMessage("wait".into())).await;
+    fake.expect("session/prompt").await;
+    fake.permission("p1", "t1", "wait").await;
+    harness
+        .until(|e| matches!(e, AgentEvent::ApprovalRequested { .. }))
+        .await;
+    harness.send(Op::Interrupt).await;
+    fake.expect("session/cancel").await;
+    let events = harness.next_turn().await;
+    assert_eq!(events.iter().filter(|e| matches!(e, AgentEvent::ToolCallFinished { call_id, success: false, .. } if call_id == "t1")).count(), 1);
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| matches!(
+                e,
+                AgentEvent::TurnFinished {
+                    reason: TurnEndReason::Interrupted,
+                    ..
+                }
+            ))
+            .count(),
+        1
+    );
+    assert!(!events.iter().any(|e| matches!(e, AgentEvent::Error(_))));
+    fake.closed().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn startup_rpcs_have_deadlines() {
+    for method in ["initialize", "session/new", "session/load"] {
+        let (harness, mut fake) =
+            crate::test_support::start_with(ApprovalMode::Auto, Some("session"));
+        if method == "session/load" {
+            crate::saved::save_saved(
+                &harness.workspace.join("session"),
+                &crate::saved::Saved {
+                    agent: crate::AcpAgent::ClaudeCode.id(),
+                    session_id: "saved".into(),
+                    ..Default::default()
+                },
+            );
+        }
+        let init = fake.expect("initialize").await;
+        if method != "initialize" {
+            fake.respond(
+                &init,
+                json!({"protocolVersion": 1, "agentCapabilities": {"loadSession": true}}),
+            )
+            .await;
+            fake.expect(method).await;
+        }
+        tokio::time::advance(std::time::Duration::from_secs(31)).await;
+        let error = harness.until(|e| matches!(e, AgentEvent::Error(_))).await;
+        assert!(matches!(error, AgentEvent::Error(message) if message.contains("timed out")));
+        // load timeout falls back to new; Shutdown still interrupts it.
+        let _ = harness.ops.send(Op::Shutdown).await;
+        fake.closed().await;
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn shutdown_of_an_unanswered_prompt_still_finishes_the_turn() {
+    let (harness, mut fake) = start(ApprovalMode::Auto);
+    fake.handshake().await;
+    harness.send(Op::UserMessage("wait".into())).await;
+    fake.expect("session/prompt").await;
+    harness.send(Op::Shutdown).await;
+    let events = harness.next_turn().await;
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(
+                event,
+                AgentEvent::TurnFinished {
+                    reason: TurnEndReason::Interrupted,
+                    ..
+                }
+            ))
+            .count(),
+        1
+    );
+    fake.closed().await;
+}
+
+#[tokio::test]
 async fn maps_a_turn_of_updates() {
     let (harness, mut fake) = start(ApprovalMode::Auto);
     fake.handshake().await;
@@ -419,7 +515,38 @@ async fn refuses_a_terminal_outside_the_workspace() {
             .is_some_and(|m| m.contains("outside the workspace")),
         "{refused}"
     );
-    let _ = harness;
+    let event = harness
+        .until(|event| matches!(event, AgentEvent::ToolCallFinished { .. }))
+        .await;
+    assert!(
+        matches!(event, AgentEvent::ToolCallFinished { output, success: false, .. }
+        if output.contains("outside the workspace") && output.contains("Flint terminal"))
+    );
+}
+
+#[tokio::test]
+async fn terminal_spawn_failure_reports_the_reason_to_peer_and_ui() {
+    let (harness, mut fake) = start(ApprovalMode::Auto);
+    fake.handshake().await;
+    fake.send(
+        json!({"jsonrpc": "2.0", "id": "bad", "method": "terminal/create",
+        "params": {"sessionId": "s1", "command": "flint-nonexistent-bin"}}),
+    )
+    .await;
+    let response = fake.answered("bad").await;
+    let reason = response["error"]["message"].as_str().unwrap();
+    assert!(
+        reason.contains("cannot run")
+            && reason.contains("cwd:")
+            && reason.contains("Flint terminal")
+    );
+    let event = harness
+        .until(|event| matches!(event, AgentEvent::ToolCallFinished { .. }))
+        .await;
+    assert!(
+        matches!(event, AgentEvent::ToolCallFinished { output, success: false, .. }
+        if output.contains("flint-nonexistent-bin") && output.contains("cwd:"))
+    );
 }
 
 /// The client kills a command when the agent asks, and reports the signal.

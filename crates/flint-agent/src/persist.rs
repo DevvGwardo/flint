@@ -91,6 +91,7 @@ fn repair(messages: Vec<Message>) -> Vec<Message> {
             Message::User(_)
             | Message::UserWithImages { .. }
             | Message::Nudge(_)
+            | Message::Summary(_)
             | Message::Assistant { .. } => {
                 close_pending(&mut out, &mut pending);
             }

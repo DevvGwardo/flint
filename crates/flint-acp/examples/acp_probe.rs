@@ -37,6 +37,7 @@ fn main() {
                 session_dir: Some(session_dir.clone()),
                 approval: ApprovalMode::AskForChanges,
                 agent_terminals: true,
+                preferred_options: Default::default(),
             },
         );
         let mut result = format!("{}: timed out after 150s", agent.name());

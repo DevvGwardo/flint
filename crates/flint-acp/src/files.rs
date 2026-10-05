@@ -28,15 +28,41 @@ pub(crate) fn inside_workspace(workspace: &Path, path: &Path) -> Result<PathBuf,
             other => normalized.push(other.as_os_str()),
         }
     }
-    if normalized.starts_with(workspace) {
-        Ok(normalized)
-    } else {
-        Err(format!(
+    let outside = || {
+        format!(
             "{} is outside the workspace {}",
             path.display(),
             workspace.display()
-        ))
+        )
+    };
+    let root = workspace
+        .canonicalize()
+        .map_err(|err| format!("cannot resolve workspace {}: {err}", workspace.display()))?;
+    // A symlinked workspace may be addressed by its real path: agents often
+    // resolve the cwd they were given.
+    let base = if normalized.starts_with(workspace) {
+        workspace
+    } else if normalized.starts_with(&root) {
+        root.as_path()
+    } else {
+        return Err(outside());
+    };
+    // New files may not exist yet. Check the deepest existing ancestor,
+    // including dangling symlinks, before reading, writing or changing cwd.
+    for part in normalized
+        .ancestors()
+        .take_while(|part| part.starts_with(base))
+    {
+        match part.symlink_metadata() {
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => return Err(format!("cannot inspect {}: {err}", part.display())),
+            Ok(_) => match part.canonicalize() {
+                Ok(real) if real.starts_with(&root) => break,
+                Ok(_) | Err(_) => return Err(outside()),
+            },
+        }
     }
+    Ok(normalized)
 }
 
 pub(crate) fn read_text(workspace: &Path, request: &ReadTextFileRequest) -> Result<String, String> {
@@ -73,4 +99,72 @@ pub(crate) fn write_text(
     std::fs::write(&path, content)
         .map_err(|err| format!("cannot write {}: {err}", path.display()))?;
     Ok((path, old))
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn paths_refuse_outside_and_dangling_symlinks() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let workspace = dir.path().canonicalize().expect("canonical");
+        let outside = tempfile::tempdir().expect("outside");
+        std::fs::write(outside.path().join("existing.txt"), "keep").expect("write");
+        std::os::unix::fs::symlink(outside.path(), workspace.join("out")).expect("link");
+        std::os::unix::fs::symlink(outside.path().join("new.txt"), workspace.join("dangling"))
+            .expect("link");
+        for path in ["out/existing.txt", "out/new/deep.txt", "dangling"] {
+            assert!(
+                inside_workspace(&workspace, Path::new(path)).is_err(),
+                "{path} must be refused"
+            );
+            assert!(write_text(&workspace, Path::new(path), "overwrite").is_err());
+            let request = serde_json::from_value::<ReadTextFileRequest>(serde_json::json!({
+                "sessionId": "test",
+                "path": workspace.join(path),
+            }))
+            .expect("request");
+            assert!(read_text(&workspace, &request).is_err());
+        }
+        assert_eq!(
+            std::fs::read_to_string(outside.path().join("existing.txt")).expect("read"),
+            "keep"
+        );
+        assert!(!outside.path().join("new").exists());
+        assert!(!outside.path().join("new.txt").exists());
+    }
+
+    #[test]
+    fn paths_allow_internal_symlinks_and_new_descendants() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let workspace = dir.path().canonicalize().expect("canonical");
+        std::fs::create_dir(workspace.join("src")).expect("mkdir");
+        std::os::unix::fs::symlink(workspace.join("src"), workspace.join("inside")).expect("link");
+        assert_eq!(
+            inside_workspace(&workspace, Path::new("inside/new/file.txt")).expect("inside"),
+            workspace.join("inside/new/file.txt")
+        );
+        write_text(&workspace, Path::new("inside/new/file.txt"), "kept").expect("write");
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("src/new/file.txt")).expect("read"),
+            "kept"
+        );
+    }
+
+    #[test]
+    fn symlinked_workspace_accepts_its_real_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let real = dir.path().canonicalize().expect("canonical").join("real");
+        std::fs::create_dir_all(real.join("src")).expect("mkdir");
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).expect("link");
+        assert_eq!(inside_workspace(&link, &real).expect("root"), real);
+        assert_eq!(
+            inside_workspace(&link, &real.join("src/new.txt")).expect("descendant"),
+            real.join("src/new.txt")
+        );
+        assert!(inside_workspace(&link, dir.path()).is_err());
+        assert!(inside_workspace(&link, &real.join("../elsewhere")).is_err());
+    }
 }

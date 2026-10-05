@@ -1,9 +1,12 @@
 //! File tools: read_file, write_file, edit_file, list_dir.
 
 use std::path::Path;
+use std::time::Duration;
 
 use serde_json::Map;
 use serde_json::Value;
+use tokio::io::AsyncReadExt;
+use tokio_util::sync::CancellationToken;
 
 use super::ToolOutcome;
 use super::bool_arg;
@@ -12,15 +15,68 @@ use super::display_path;
 use super::int_arg;
 use super::resolve;
 use super::str_arg;
+use super::tracker::FileTracker;
+use super::tracker::Stale;
+use super::tracker::write_lock;
 
 const DEFAULT_READ_LINES: u64 = 400;
 const MAX_READ_LINES: u64 = 2_000;
 const MAX_READ_CHARS: usize = 40_000;
 const MAX_LINE_CHARS: usize = 2_000;
+/// Bound input as well as output; never grant a tracker hash of a partial read.
+const MAX_READ_BYTES: u64 = 8 * 1024 * 1024;
+const FILE_PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_LIST_ENTRIES: usize = 500;
 const SKIP_DIRS: [&str; 5] = [".git", "node_modules", "target", ".venv", "__pycache__"];
 
-pub(super) async fn read_file(workspace: &Path, args: &Map<String, Value>) -> ToolOutcome {
+/// A full, bounded snapshot for display, stale-write checks, diffs and undo.
+/// Preserve I/O error kinds: only NotFound can authorize creating a new file.
+async fn bounded_regular_read(full: &Path, cancel: &CancellationToken) -> std::io::Result<Vec<u8>> {
+    let read = async {
+        let metadata = tokio::fs::metadata(full).await?;
+        if !metadata.is_file() || metadata.len() > MAX_READ_BYTES {
+            return Err(std::io::Error::other(
+                "file tools require a regular file of at most 8 MiB",
+            ));
+        }
+        let file = tokio::fs::File::open(full).await?;
+        let metadata = file.metadata().await?;
+        if !metadata.is_file() || metadata.len() > MAX_READ_BYTES {
+            return Err(std::io::Error::other(
+                "file tools require a regular file of at most 8 MiB",
+            ));
+        }
+        let mut bytes = Vec::new();
+        file.take(MAX_READ_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .await?;
+        if bytes.len() as u64 > MAX_READ_BYTES {
+            return Err(std::io::Error::other("file exceeds the 8 MiB input limit"));
+        }
+        Ok(bytes)
+    };
+    if cancel.is_cancelled() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Interrupted,
+            "Interrupted.",
+        ));
+    }
+    tokio::select! {
+        result = tokio::time::timeout(FILE_PREFLIGHT_TIMEOUT, read) => match result {
+            Ok(result) => result,
+            Err(_) => Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "file read timed out")),
+        },
+        () = cancel.cancelled() =>
+            Err(std::io::Error::new(std::io::ErrorKind::Interrupted, "Interrupted.")),
+    }
+}
+
+pub(super) async fn read_file(
+    workspace: &Path,
+    args: &Map<String, Value>,
+    files: &FileTracker,
+    cancel: &CancellationToken,
+) -> ToolOutcome {
     let Some(path) = str_arg(args, "path") else {
         return ToolOutcome::error("`path` is required");
     };
@@ -28,13 +84,14 @@ pub(super) async fn read_file(workspace: &Path, args: &Map<String, Value>) -> To
         Ok(full) => full,
         Err(err) => return ToolOutcome::error(err),
     };
-    let bytes = match tokio::fs::read(&full).await {
+    let bytes = match bounded_regular_read(&full, cancel).await {
         Ok(bytes) => bytes,
         Err(err) => return ToolOutcome::error(format!("cannot read {path}: {err}")),
     };
     if bytes.contains(&0) {
         return ToolOutcome::error(format!("{path} looks like a binary file"));
     }
+    files.saw(&full, &bytes);
     let text = String::from_utf8_lossy(&bytes);
     let lines: Vec<&str> = text.lines().collect();
     let total = lines.len() as u64;
@@ -82,7 +139,12 @@ pub(super) async fn read_file(workspace: &Path, args: &Map<String, Value>) -> To
     ToolOutcome::ok(out)
 }
 
-pub(super) async fn write_file(workspace: &Path, args: &Map<String, Value>) -> ToolOutcome {
+pub(super) async fn write_file(
+    workspace: &Path,
+    args: &Map<String, Value>,
+    files: &FileTracker,
+    cancel: &CancellationToken,
+) -> ToolOutcome {
     let (Some(path), Some(content)) = (str_arg(args, "path"), str_arg(args, "content")) else {
         return ToolOutcome::error("`path` and `content` are required");
     };
@@ -90,16 +152,59 @@ pub(super) async fn write_file(workspace: &Path, args: &Map<String, Value>) -> T
         Ok(full) => full,
         Err(err) => return ToolOutcome::error(err),
     };
-    let old = tokio::fs::read_to_string(&full).await.ok();
+    let lock = write_lock(&full);
+    let _held = tokio::select! {
+        held = tokio::time::timeout(FILE_PREFLIGHT_TIMEOUT, lock.lock()) => match held {
+            Ok(held) => held,
+            Err(_) => return ToolOutcome::error("Timed out waiting for the file write lock."),
+        },
+        () = cancel.cancelled() => return ToolOutcome::error("Interrupted."),
+    };
+    let old_bytes = match bounded_regular_read(&full, cancel).await {
+        Ok(bytes) => Some(bytes),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+        Err(err) => return ToolOutcome::error(format!("cannot read {path} before writing: {err}")),
+    };
+    if let Some(old) = &old_bytes
+        && let Err(stale) = files.check(&full, old, true)
+    {
+        return ToolOutcome::error(stale_message(path, &stale));
+    }
+    let old = old_bytes
+        .as_deref()
+        .map(|bytes| String::from_utf8_lossy(bytes).into_owned());
     if let Some(parent) = full.parent()
         && let Err(err) = tokio::fs::create_dir_all(parent).await
     {
         return ToolOutcome::error(format!("cannot create {}: {err}", parent.display()));
     }
-    if let Err(err) = tokio::fs::write(&full, content).await {
+    if cancel.is_cancelled() {
+        return ToolOutcome::error("Interrupted before this ran.");
+    }
+    // Once commit starts, await it and journal its result instead of dropping a
+    // Tokio blocking write that could still mutate the file after cancellation.
+    let write = if old_bytes.is_none() {
+        use tokio::io::AsyncWriteExt;
+        match tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&full)
+            .await
+        {
+            Ok(mut file) => match file.write_all(content.as_bytes()).await {
+                Ok(()) => file.flush().await,
+                Err(err) => Err(err),
+            },
+            Err(err) => Err(err),
+        }
+    } else {
+        tokio::fs::write(&full, content).await
+    };
+    if let Err(err) = write {
         return ToolOutcome::error(format!("cannot write {path}: {err}"));
     }
     let shown = display_path(workspace, &full);
+    files.wrote(&full, &shown, old_bytes.as_deref(), content.as_bytes());
     let diff = file_diff(&shown, old.as_deref(), content);
     let verb = if diff.created { "Created" } else { "Wrote" };
     ToolOutcome {
@@ -110,7 +215,12 @@ pub(super) async fn write_file(workspace: &Path, args: &Map<String, Value>) -> T
     }
 }
 
-pub(super) async fn edit_file(workspace: &Path, args: &Map<String, Value>) -> ToolOutcome {
+pub(super) async fn edit_file(
+    workspace: &Path,
+    args: &Map<String, Value>,
+    files: &FileTracker,
+    cancel: &CancellationToken,
+) -> ToolOutcome {
     let (Some(path), Some(old_string), Some(new_string)) = (
         str_arg(args, "path"),
         str_arg(args, "old_string"),
@@ -130,10 +240,25 @@ pub(super) async fn edit_file(workspace: &Path, args: &Map<String, Value>) -> To
         Ok(full) => full,
         Err(err) => return ToolOutcome::error(err),
     };
-    let old = match tokio::fs::read_to_string(&full).await {
-        Ok(old) => old,
+    let lock = write_lock(&full);
+    let _held = tokio::select! {
+        held = tokio::time::timeout(FILE_PREFLIGHT_TIMEOUT, lock.lock()) => match held {
+            Ok(held) => held,
+            Err(_) => return ToolOutcome::error("Timed out waiting for the file write lock."),
+        },
+        () = cancel.cancelled() => return ToolOutcome::error("Interrupted."),
+    };
+    let bytes = match bounded_regular_read(&full, cancel).await {
+        Ok(bytes) => bytes,
         Err(err) => return ToolOutcome::error(format!("cannot read {path}: {err}")),
     };
+    let old = match String::from_utf8(bytes) {
+        Ok(old) => old,
+        Err(err) => return ToolOutcome::error(format!("cannot read {path} as UTF-8: {err}")),
+    };
+    if let Err(stale) = files.check(&full, old.as_bytes(), false) {
+        return ToolOutcome::error(stale_message(path, &stale));
+    }
     let matches = old.matches(old_string).count();
     let replace_all = bool_arg(args, "replace_all");
     match (matches, replace_all) {
@@ -151,11 +276,28 @@ pub(super) async fn edit_file(workspace: &Path, args: &Map<String, Value>) -> To
             ));
         }
     }
+    let retained = matches
+        .checked_mul(old_string.len())
+        .and_then(|removed| old.len().checked_sub(removed));
+    let result_bytes = retained.and_then(|retained| {
+        matches
+            .checked_mul(new_string.len())
+            .and_then(|inserted| retained.checked_add(inserted))
+    });
+    if result_bytes.is_none_or(|bytes| bytes as u64 > MAX_READ_BYTES) {
+        return ToolOutcome::error(
+            "edit_file result exceeds the 8 MiB limit; no file was changed.",
+        );
+    }
     let new = old.replace(old_string, new_string);
+    if cancel.is_cancelled() {
+        return ToolOutcome::error("Interrupted before this ran.");
+    }
     if let Err(err) = tokio::fs::write(&full, &new).await {
         return ToolOutcome::error(format!("cannot write {path}: {err}"));
     }
     let shown = display_path(workspace, &full);
+    files.wrote(&full, &shown, Some(old.as_bytes()), new.as_bytes());
     let diff = file_diff(&shown, Some(&old), &new);
     let times = if matches > 1 {
         format!(" ({matches} occurrences)")
@@ -167,6 +309,19 @@ pub(super) async fn edit_file(workspace: &Path, args: &Map<String, Value>) -> To
         exit_code: None,
         success: true,
         diff: Some(diff),
+    }
+}
+
+fn stale_message(path: &str, stale: &Stale) -> String {
+    match stale {
+        Stale::Unread => format!(
+            "{path} already exists and you haven't read it. read_file it first, then use \
+             edit_file for changes (or write_file to replace it)."
+        ),
+        Stale::Changed => format!(
+            "{path} changed since you last read it (another agent, the user or a command edited \
+             it). read_file it again and redo your change against the current content."
+        ),
     }
 }
 

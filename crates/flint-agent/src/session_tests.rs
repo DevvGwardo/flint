@@ -8,10 +8,14 @@ use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
 
+use std::path::PathBuf;
+
 use super::*;
 
 #[path = "archive_shutdown_tests.rs"]
 mod archive_shutdown_tests;
+#[path = "queue_steering_tests.rs"]
+mod queue_steering_tests;
 #[path = "subagent_tests.rs"]
 mod subagent_tests;
 
@@ -128,13 +132,37 @@ fn test_config(url: String, workspace: PathBuf) -> AgentConfig {
         subagent_model: None,
         api_key: "test-key".to_string(),
         workspace,
+        general: false,
         approval: ApprovalMode::Auto,
         jev: None,
         session_dir: None,
         // Explicit, so the mock server only sees chat requests (0 would fetch `/models`).
         context_budget_tokens: 100_000,
         reasoning_effort: None,
+        sandbox: false,
+        mcp_servers: Vec::new(),
     }
+}
+
+#[tokio::test]
+async fn general_session_answers_without_a_repository_or_forced_file_edits() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let (url, requests) = mock_server(vec![sse_text("Let's make a short plan.")]).await;
+    let mut config = test_config(url, workspace.path().to_path_buf());
+    config.general = true;
+    let events = run_turns(config, &["Help me plan my day"]).await;
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::ToolCallStarted { .. }))
+    );
+    let seen = requests.lock().expect("requests");
+    let prompt = seen[0]["messages"][0]["content"]
+        .as_str()
+        .expect("system prompt");
+    assert!(prompt.contains("general-purpose assistant"));
+    assert!(prompt.contains("not attached to a coding project"));
+    assert!(!workspace.path().join(".git").exists());
 }
 
 async fn run_one_turn(url: String, workspace: PathBuf, prompt: &str) -> Vec<AgentEvent> {
@@ -198,7 +226,16 @@ fn outline(events: &[AgentEvent]) -> Vec<String> {
             AgentEvent::TurnFinished { reason, .. } => Some(format!("finished {reason:?}")),
             AgentEvent::Error(message) => Some(format!("error {message}")),
             AgentEvent::ContextCompacted { .. } => Some("compacted".to_string()),
-            AgentEvent::SessionOptions(_) => None,
+            AgentEvent::FilesReverted { diffs, skipped, .. } => Some(format!(
+                "reverted {} skipped {}",
+                diffs
+                    .iter()
+                    .map(|d| d.path.as_str())
+                    .collect::<Vec<_>>()
+                    .join(","),
+                skipped.join(",")
+            )),
+            AgentEvent::SessionOptions(_) | AgentEvent::SteeringAccepted { .. } => None,
             AgentEvent::SessionStopped { .. } => None,
             AgentEvent::SubagentStarted { .. } | AgentEvent::SubagentEvent { .. } => None,
             AgentEvent::TerminalStarted { .. }
@@ -221,6 +258,59 @@ fn temp_workspace() -> (tempfile::TempDir, PathBuf) {
 }
 
 #[tokio::test]
+async fn incomplete_model_outcomes_never_mutate_files() {
+    for reason in [None, Some("length"), Some("content_filter")] {
+        let (_guard, ws) = temp_workspace();
+        let mut chunks = vec![json!({"choices":[{"delta":{
+            "content":"partial",
+            "tool_calls":[{"index":0,"id":"unsafe","function":{
+                "name":"write_file","arguments":json!({"path":"victim","content":"bad"}).to_string()
+            }}]
+        }}]})];
+        if let Some(reason) = reason {
+            chunks.push(json!({"choices":[{"delta":{},"finish_reason":reason}]}));
+        }
+        let body = sse(&chunks);
+        let (url, _) = mock_server(vec![body; 8]).await;
+        let events = run_one_turn(url, ws.clone(), "store this file").await;
+        assert!(!ws.join("victim").exists());
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::ToolCallStarted { .. }))
+        );
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::TurnFinished {
+                reason: TurnEndReason::Failed(_),
+                ..
+            }
+        )));
+    }
+}
+
+#[tokio::test]
+async fn valid_json_file_content_remains_a_string_through_the_harness() {
+    let (_guard, ws) = temp_workspace();
+    let content = "{\"x\":null,\"items\":[1,2]}";
+    let (url, _) = mock_server(vec![
+        sse_tool_call(
+            "write",
+            "write_file",
+            json!({"path":"data.json","content":content}),
+        ),
+        sse_text("Stored."),
+        sse_text("Stored."),
+    ])
+    .await;
+    run_one_turn(url, ws.clone(), "store data.json").await;
+    assert_eq!(
+        std::fs::read_to_string(ws.join("data.json")).expect("created"),
+        content
+    );
+}
+
+#[tokio::test]
 async fn full_loop_writes_runs_and_finishes() {
     let (_guard, ws) = temp_workspace();
     let (url, requests) = mock_server(vec![
@@ -229,7 +319,11 @@ async fn full_loop_writes_runs_and_finishes() {
             "write_file",
             json!({"path": "a.txt", "content": "hi\n"}),
         ),
-        sse_tool_call("c2", "run_command", json!({"command": "cat a.txt"})),
+        sse_tool_call(
+            "c2",
+            "run_command",
+            json!({"command": "test \"$(cat a.txt)\" = hi"}),
+        ),
         sse_text("Created a.txt and checked it."),
     ])
     .await;
@@ -242,7 +336,7 @@ async fn full_loop_writes_runs_and_finishes() {
             "call write_file a.txt",
             "done ok=true",
             "step 1",
-            "call run_command cat a.txt",
+            "call run_command test \"$(cat a.txt)\" = hi",
             "done ok=true",
             "step 2",
             "finished Completed",
@@ -661,4 +755,261 @@ fn every_event_round_trips_through_serde() {
             event
         );
     }
+}
+
+fn sse_tool_calls(calls: &[(&str, &str, Value)]) -> String {
+    let calls: Vec<Value> = calls
+        .iter()
+        .enumerate()
+        .map(|(index, (id, name, args))| {
+            json!({"index": index, "id": id, "type": "function",
+                "function": {"name": name, "arguments": args.to_string()}})
+        })
+        .collect();
+    sse(&[json!({"choices": [{"delta": {"tool_calls": calls}, "finish_reason": "tool_calls"}]})])
+}
+
+#[tokio::test]
+async fn read_only_calls_in_one_response_run_together() {
+    let (_guard, ws) = temp_workspace();
+    std::fs::write(ws.join("a.txt"), "alpha\n").expect("write");
+    std::fs::write(ws.join("b.txt"), "beta\n").expect("write");
+    let (url, requests) = mock_server(vec![
+        sse_tool_calls(&[
+            ("r1", "read_file", json!({"path": "a.txt"})),
+            ("r2", "grep", json!({"pattern": "beta"})),
+            ("r3", "list_dir", json!({})),
+        ]),
+        sse_text("Read them."),
+    ])
+    .await;
+    let events = run_one_turn(url, ws, "what do a.txt and b.txt say?").await;
+    // All three start before any finishes, and results keep call order.
+    assert_eq!(
+        outline(&events),
+        vec![
+            "turn",
+            "step 0",
+            "call read_file a.txt",
+            "call grep beta in .",
+            "call list_dir .",
+            "done ok=true",
+            "done ok=true",
+            "done ok=true",
+            "step 1",
+            "finished Completed",
+        ]
+    );
+    let requests = requests.lock().expect("lock").clone();
+    let ids: Vec<&str> = requests[1]["messages"]
+        .as_array()
+        .expect("messages")
+        .iter()
+        .filter_map(|m| m["tool_call_id"].as_str())
+        .collect();
+    assert_eq!(ids, ["r1", "r2", "r3"]);
+}
+
+#[tokio::test]
+async fn open_plan_steps_get_a_nudge_before_the_turn_ends() {
+    let (_guard, ws) = temp_workspace();
+    let plan = |status: &str| {
+        json!({"plan": [
+            {"step": "Look around", "status": "completed"},
+            {"step": "Write the summary", "status": status},
+        ]})
+    };
+    let (url, requests) = mock_server(vec![
+        sse_tool_call("p1", "update_plan", plan("in_progress")),
+        sse_text("Here is a partial answer."),
+        sse_tool_call("p2", "update_plan", plan("completed")),
+        sse_text("Done."),
+    ])
+    .await;
+    let events = run_one_turn(url, ws, "what is in this project?").await;
+    assert_eq!(
+        outline(&events),
+        vec![
+            "turn",
+            "step 0",
+            "call update_plan Plan: 1/2 done",
+            "done ok=true",
+            "step 1",
+            "nudge Watchdog",
+            "step 2",
+            "call update_plan Plan: 2/2 done",
+            "done ok=true",
+            "step 3",
+            "finished Completed",
+        ]
+    );
+    let requests = requests.lock().expect("lock").clone();
+    let tool_result = requests[1]["messages"]
+        .as_array()
+        .expect("messages")
+        .iter()
+        .find(|m| m["tool_call_id"] == "p1")
+        .expect("plan result")
+        .clone();
+    assert_eq!(
+        tool_result["content"],
+        "Plan updated (1/2 closed):\n[x] Look around\n[>] Write the summary"
+    );
+}
+
+#[tokio::test]
+async fn messages_sent_during_a_turn_join_it() {
+    let (_guard, ws) = temp_workspace();
+    let (url, requests) = mock_server(vec![
+        sse_tool_call("c1", "list_dir", json!({})),
+        sse_text("Listed, and noted the follow-up."),
+    ])
+    .await;
+    let handle = crate::spawn_session(test_config(url, ws));
+    // The second arrives while the first turn is running.
+    for text in ["list the files", "also mention the README"] {
+        handle
+            .ops
+            .send(Op::UserMessage(text.to_string()))
+            .await
+            .expect("send");
+    }
+    let mut events = Vec::new();
+    collect_turn(&handle, &mut events).await;
+    let _ = handle.ops.send(Op::Shutdown).await;
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| matches!(e, AgentEvent::TurnStarted { .. }))
+            .count(),
+        1
+    );
+    let requests = requests.lock().expect("lock").clone();
+    let users: Vec<&str> = requests[0]["messages"]
+        .as_array()
+        .expect("messages")
+        .iter()
+        .filter(|m| m["role"] == "user")
+        .filter_map(|m| m["content"].as_str())
+        .collect();
+    assert_eq!(users, ["list the files", "also mention the README"]);
+}
+
+#[tokio::test]
+async fn undo_restores_the_last_turns_files() {
+    let (_guard, ws) = temp_workspace();
+    std::fs::write(ws.join("b.txt"), "old\n").expect("write");
+    std::fs::write(ws.join("c.txt"), "c\n").expect("write");
+    let (url, requests) = mock_server(vec![
+        sse_tool_calls(&[
+            ("r1", "read_file", json!({"path": "b.txt"})),
+            ("r2", "read_file", json!({"path": "c.txt"})),
+        ]),
+        sse_tool_calls(&[
+            (
+                "w1",
+                "write_file",
+                json!({"path": "a.txt", "content": "new file\n"}),
+            ),
+            (
+                "e1",
+                "edit_file",
+                json!({"path": "b.txt", "old_string": "old", "new_string": "new"}),
+            ),
+            (
+                "e2",
+                "edit_file",
+                json!({"path": "c.txt", "old_string": "c", "new_string": "C"}),
+            ),
+        ]),
+        sse_tool_call("t1", "run_command", json!({"command": "test -f a.txt"})),
+        sse_text("Done."),
+        sse_text("Okay."),
+    ])
+    .await;
+    let handle = crate::spawn_session(test_config(url, ws.clone()));
+    let mut events = Vec::new();
+    handle
+        .ops
+        .send(Op::UserMessage("make the changes".into()))
+        .await
+        .expect("send");
+    collect_turn(&handle, &mut events).await;
+    // The user edits c.txt after the agent: undo must leave it alone.
+    std::fs::write(ws.join("c.txt"), "mine\n").expect("write");
+    handle.ops.send(Op::UndoLastTurn).await.expect("undo");
+    let reverted = loop {
+        let event = tokio::time::timeout(Duration::from_secs(10), handle.events.recv())
+            .await
+            .expect("in time")
+            .expect("open");
+        if matches!(event, AgentEvent::FilesReverted { .. }) {
+            break event;
+        }
+    };
+    assert_eq!(
+        outline(&[reverted]),
+        ["reverted a.txt,b.txt skipped c.txt: it changed after the agent's edit"]
+    );
+    assert!(!ws.join("a.txt").exists());
+    assert_eq!(
+        std::fs::read_to_string(ws.join("b.txt")).expect("b"),
+        "old\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(ws.join("c.txt")).expect("c"),
+        "mine\n"
+    );
+
+    // A second undo has nothing left; the model hears about the first.
+    handle.ops.send(Op::UndoLastTurn).await.expect("undo");
+    handle
+        .ops
+        .send(Op::UserMessage("thanks".into()))
+        .await
+        .expect("send");
+    let mut more = Vec::new();
+    collect_turn(&handle, &mut more).await;
+    let _ = handle.ops.send(Op::Shutdown).await;
+    assert!(more.iter().any(|e| matches!(e, AgentEvent::Error(m)
+        if m == "There are no file changes by the agent to undo.")));
+    let requests = requests.lock().expect("lock").clone();
+    let last_user = requests.last().expect("request")["messages"]
+        .as_array()
+        .expect("messages")
+        .iter()
+        .rev()
+        .find(|m| m["role"] == "user")
+        .expect("user")["content"]
+        .as_str()
+        .expect("text")
+        .to_string();
+    assert!(
+        last_user.starts_with("[Note: the user undid your file changes")
+            && last_user.contains("a.txt, b.txt")
+            && last_user.ends_with("thanks"),
+        "{last_user}"
+    );
+}
+
+#[tokio::test]
+async fn a_reply_cut_off_mid_stream_retries_the_step() {
+    let (_guard, ws) = temp_workspace();
+    let cut = sse(&[
+        json!({"choices": [{"delta": {"content": "Partial"}}]}),
+        json!({"error": {"message": "upstream reset"}}),
+    ]);
+    let (url, requests) = mock_server(vec![cut, sse_text("Whole answer.")]).await;
+    let events = run_one_turn(url, ws, "hello").await;
+    assert_eq!(
+        outline(&events),
+        [
+            "turn",
+            "step 0",
+            "error The model's reply was cut off (provider error: upstream reset). Retrying this step.",
+            "step 1",
+            "finished Completed",
+        ]
+    );
+    assert_eq!(requests.lock().expect("lock").len(), 2);
 }

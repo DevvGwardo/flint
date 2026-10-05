@@ -40,6 +40,53 @@ pub fn about(kind: AgentKind) -> &'static str {
 }
 
 impl FlintApp {
+    /// Upgrade existing conversations that predate saved global defaults.
+    /// Reported identity choices can fill missing defaults, never replace a
+    /// newer explicit selection made in another conversation.
+    pub(crate) fn inherit_agent_identity(&mut self, kind: AgentKind) {
+        if self.session().agent != kind || kind == AgentKind::Flint {
+            return;
+        }
+        let options = self.session().options.clone();
+        let saved = self
+            .settings
+            .agent_options
+            .entry(crate::settings::agent_key(kind).into())
+            .or_default();
+        let mut changed = false;
+        for option in options {
+            if (matches!(option.category.as_deref(), Some("model" | "provider"))
+                || option.id == "provider")
+                && !saved.contains_key(&option.id)
+                && option
+                    .choices
+                    .iter()
+                    .any(|choice| choice.value == option.current)
+            {
+                saved.insert(option.id, option.current);
+                changed = true;
+            }
+        }
+        if changed
+            && !self.options.ephemeral()
+            && let Err(err) = self.settings.save(&self.home)
+        {
+            self.store_error = Some(format!("Couldn't retain session model/provider: {err}"));
+        }
+    }
+
+    pub(crate) fn remember_agent(&mut self, kind: AgentKind) {
+        if self.settings.default_agent == kind {
+            return;
+        }
+        self.settings.default_agent = kind;
+        if !self.options.ephemeral()
+            && let Err(err) = self.settings.save(&self.home)
+        {
+            self.store_error = Some(format!("Couldn't save selected agent: {err}"));
+        }
+    }
+
     /// The composer chip text: the agent, plus the model for flint.
     pub fn agent_label(&self, kind: AgentKind) -> String {
         match kind {
@@ -55,6 +102,7 @@ impl FlintApp {
     }
 
     pub fn toggle_agent_menu(&mut self, cx: &mut Context<Self>) {
+        self.queue_popover = false;
         self.agent_menu = !self.agent_menu;
         self.menu_scroll.set_offset(Point::default());
         self.slash = None;
@@ -68,11 +116,14 @@ impl FlintApp {
         self.agent_menu = false;
         let fresh = {
             let session = self.session();
-            session.view.items.is_empty() && session.ops.is_none()
+            session.view.items.is_empty()
+                && session.prompt_queue.items.is_empty()
+                && session.ops.is_none()
         };
         if fresh {
             let ix = self.active;
             self.sessions[ix].agent = kind;
+            self.remember_agent(kind);
             self.start_agent_early(ix, cx);
             self.composer
                 .update(cx, |state, cx| state.focus(window, cx));
@@ -80,6 +131,7 @@ impl FlintApp {
         } else if self.session().agent != kind {
             self.new_agent_session(kind, window, cx);
         } else {
+            self.remember_agent(kind);
             cx.notify();
         }
     }
@@ -92,10 +144,7 @@ impl FlintApp {
         cx: &mut Context<Self>,
     ) {
         self.agent_menu = false;
-        self.new_session(window, cx);
-        let ix = self.active;
-        self.sessions[ix].agent = kind;
-        self.start_agent_early(ix, cx);
+        self.new_session_for(kind, window, cx);
         cx.notify();
     }
 
@@ -134,6 +183,7 @@ impl FlintApp {
                 session_dir: session.dir.clone(),
                 approval: self.approval,
                 agent_terminals: true,
+                preferred_options: self.settings.agent_options(kind),
             },
         ))
     }

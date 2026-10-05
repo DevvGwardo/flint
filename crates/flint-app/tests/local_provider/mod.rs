@@ -65,7 +65,7 @@ impl LocalProvider {
                     let delta = serde_json::json!({"choices":[{"delta":{"tool_calls":[{
                         "index":0,"id":"fixture-edit","type":"function",
                         "function":{"name":"write_file","arguments":"{\"path\":\"fixture.txt\",\"content\":\"fixture\\n\"}"}
-                    }]}}]});
+                    }]},"finish_reason":"tool_calls"}]});
                     (
                         "text/event-stream",
                         format!("data: {delta}\n\ndata: [DONE]\n\n"),

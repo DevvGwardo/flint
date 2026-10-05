@@ -92,16 +92,21 @@ pub fn pinned(
         .gap(px(14.))
         .child(
             div()
+                .id("approval-header")
+                .h(px(26.))
+                .overflow_hidden()
                 .flex()
                 .items_center()
                 .gap(px(10.))
                 .child(ui::icon(IconName::ShieldCheck, 17., p.warning))
                 .child(ui::label(question(kind), size::BASE, p.text))
                 .child(
-                    ui::mono(summary.to_string(), size::SM, p.text_muted)
+                    ui::mono(ui::one_line(summary), size::SM, p.text_muted)
+                        .id("approval-summary")
                         .flex_1()
                         .min_w_0()
-                        .truncate(),
+                        .truncate()
+                        .test_support(),
                 ),
         )
         .child(ui::label(
@@ -126,6 +131,7 @@ pub fn pinned(
         .child(
             div()
                 .id("approval-preview-toggle")
+                .role(gpui_kit::Role::Button)
                 .aria_label(if expanded { "Hide request details" } else { "Inspect request details" })
                 .tab_index(0)
                 .focus_visible(|style| style.border_1().border_color(p.accent))
@@ -240,7 +246,7 @@ pub fn record(
         )
         .child(ui::label(text, size::BASE, color))
         .child(
-            ui::mono(summary.to_string(), size::SM, p.text_muted)
+            ui::mono(ui::one_line(summary), size::SM, p.text_muted)
                 .min_w_0()
                 .truncate(),
         )

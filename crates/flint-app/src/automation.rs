@@ -7,6 +7,10 @@
 //! - `FLINT_BP_FRAMES=<path>`: record per-frame timing (render cost and the
 //!   interval since the previous frame) and write it on exit.
 //! - `FLINT_BP_TIMING=<path>`: write the first-frame timestamp once.
+//! - `FLINT_BP_QUEUE_EDITOR=1`: with a state dump and demo queue, open a long
+//!   synthetic instruction for native editor screenshots.
+//! - `FLINT_BP_CAPTURE=1`: with a timed state dump, position the background
+//!   window at the display edge and record painted composer controls.
 
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -27,6 +31,64 @@ static FRAMES: Mutex<Vec<(f64, f64)>> = Mutex::new(Vec::new());
 static FIRST_FRAME: OnceLock<()> = OnceLock::new();
 static STREAM_RATE: Mutex<f64> = Mutex::new(0.);
 static EVENT_BATCHES: Mutex<Vec<(usize, f64)>> = Mutex::new(Vec::new());
+static COMPOSER_CONTROLS: Mutex<Option<Value>> = Mutex::new(None);
+
+pub fn capture_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        env_path("FLINT_BP_STATE").is_some()
+            && std::env::var("FLINT_BP_DUMP_AFTER_MS")
+                .ok()
+                .and_then(|ms| ms.parse::<u64>().ok())
+                .is_some()
+            && std::env::var("FLINT_BP_CAPTURE").ok().as_deref() == Some("1")
+    })
+}
+
+pub(crate) fn begin_composer_capture(running: bool, tasks: usize) {
+    if capture_enabled()
+        && let Ok(mut controls) = COMPOSER_CONTROLS.lock()
+    {
+        *controls = Some(json!({
+            "running": running,
+            "tasks": tasks,
+            "painted": {},
+        }));
+    }
+}
+
+pub(crate) fn control_probe(name: &'static str) -> impl gpui_kit::IntoElement {
+    use gpui_kit::{Styled as _, canvas, px};
+    canvas(
+        |bounds, _, _| bounds,
+        move |bounds, _, window, _| {
+            let visible =
+                bounds
+                    .intersect(&window.content_mask().bounds)
+                    .intersect(&gpui_kit::Bounds {
+                        origin: gpui_kit::Point::default(),
+                        size: window.viewport_size(),
+                    });
+            if let Ok(mut controls) = COMPOSER_CONTROLS.lock()
+                && let Some(controls) = controls.as_mut()
+            {
+                controls["painted"][name] = json!({
+                    "x": f32::from(bounds.origin.x),
+                    "y": f32::from(bounds.origin.y),
+                    "width": f32::from(bounds.size.width),
+                    "height": f32::from(bounds.size.height),
+                    "fully_visible": visible == bounds
+                        && bounds.size.width > px(0.)
+                        && bounds.size.height > px(0.),
+                    "window_active": window.is_window_active(),
+                    "painted_at_ms": since_start_ms(),
+                });
+            }
+        },
+    )
+    .absolute()
+    .inset_0()
+}
 
 pub fn record_event_batch(count: usize, started: Instant) {
     if frames_enabled()
@@ -56,6 +118,26 @@ fn env_path(name: &str) -> Option<PathBuf> {
     std::env::var_os(name)
         .filter(|v| !v.is_empty())
         .map(PathBuf::from)
+}
+
+pub(crate) fn seed_queue_editor(
+    app: &mut FlintApp,
+    window: &mut gpui_kit::Window,
+    cx: &mut gpui_kit::Context<FlintApp>,
+) {
+    if !app.options.demo
+        || !app.options.demo_queue
+        || env_path("FLINT_BP_STATE").is_none()
+        || std::env::var("FLINT_BP_QUEUE_EDITOR").ok().as_deref() != Some("1")
+    {
+        return;
+    }
+    let Some(prompt) = app.sessions[app.active].prompt_queue.items.front_mut() else {
+        return;
+    };
+    *prompt = prompt.with_text(format!("{}\n{}", "界🙂".repeat(256), "line\n".repeat(12)));
+    let id = prompt.id;
+    app.edit_queued_prompt(id, window, cx);
 }
 
 fn frames_enabled() -> bool {
@@ -104,24 +186,49 @@ pub fn write_frames(label: &str) {
 
 /// With `FLINT_BP_STATE` and `FLINT_BP_DUMP_AFTER_MS`, dumps the state once
 /// the UI has settled (used by the state sweep).
-pub fn schedule_dump(cx: &mut gpui_kit::Context<FlintApp>) {
+pub fn schedule_dump(window: &gpui_kit::Window, cx: &mut gpui_kit::Context<FlintApp>) {
+    use gpui_kit::AppContext as _;
     let Some(ms) = std::env::var("FLINT_BP_DUMP_AFTER_MS")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
     else {
         return;
     };
+    let handle = window.window_handle();
     cx.spawn(async move |this, cx| {
         cx.background_executor()
             .timer(std::time::Duration::from_millis(ms))
             .await;
-        this.update(cx, |app, _| dump_state(app)).ok();
+        if capture_enabled() {
+            cx.update_window(handle, |_, window, _| {
+                // The next-frame callback runs before drawing. Wait for the
+                // following frame so the dump describes a completed paint.
+                window.on_next_frame(move |window, _| {
+                    window.on_next_frame(move |_, cx| {
+                        this.update(cx, |app, _| write_state(app)).ok();
+                    });
+                });
+                window.refresh();
+            })
+            .ok();
+        } else {
+            this.update(cx, |app, _| dump_state(app)).ok();
+        }
     })
     .detach();
 }
 
 /// Writes the session dump to `FLINT_BP_STATE`; returns whether it did.
 pub fn dump_state(app: &FlintApp) -> bool {
+    // Demo background turns can finish before the timed capture's first
+    // paint. Only its scheduled post-paint dump may signal capture readiness.
+    if capture_enabled() {
+        return false;
+    }
+    write_state(app)
+}
+
+fn write_state(app: &FlintApp) -> bool {
     let Some(path) = env_path("FLINT_BP_STATE") else {
         return false;
     };
@@ -173,6 +280,10 @@ pub fn state_json(app: &FlintApp) -> Value {
                 "title": session.title(),
                 "workspace": session.workspace.display().to_string(),
                 "status": status_name(session.status()),
+                "queued_prompts": session.prompt_queue.items.len(),
+                "queue_paused": session.prompt_queue.paused,
+                "queue_editing": app.queue_edit.as_ref().is_some_and(|edit| edit.uid == session.uid),
+                "steering_pending": session.steering_pending.is_some(),
                 "item_kinds": kinds,
                 "changes": view.changes.iter().map(|f| json!({
                     "path": f.path, "added": f.added, "removed": f.removed, "created": f.created,
@@ -194,13 +305,14 @@ pub fn state_json(app: &FlintApp) -> Value {
     let active = &app.session().view;
     json!({
         "sessions": sessions,
+        "composer_controls": COMPOSER_CONTROLS.lock().ok().and_then(|controls| controls.clone()),
         "changes_open": app.changes_open,
         "selected_change": app.selected_change,
         "palette_open": app.palette.is_some(),
         "settings_open": app.settings_form.is_some(),
         "mention_open": app.mention.as_ref().is_some_and(|m| !m.results.is_empty()),
         "slash_open": app.slash.is_some(),
-        "pinned_approval": active.pending_approval().is_some(),
+        "pinned_approval": active.has_pending_approval(),
         "effort_supported": app.effort_supported,
         "work_expanded": active.turns.iter().any(|t| t.expanded),
         "sidebar_visible": app.sidebar_visible,
@@ -218,6 +330,7 @@ pub fn item_kind(item: &Item) -> &'static str {
         Item::Approval { .. } => "approval",
         Item::Error(_) => "error",
         Item::Compacted { .. } => "compacted",
+        Item::Reverted { .. } => "reverted",
         Item::TurnSummary { .. } => "summary",
     }
 }
@@ -226,6 +339,10 @@ fn status_name(status: Status) -> &'static str {
     match status {
         Status::Idle => "idle",
         Status::Running => "running",
+        Status::Starting => "starting",
+        Status::Failed { seen: false } => "failed",
+        Status::Failed { seen: true } => "failed_seen",
+        Status::Stopped => "stopped",
         Status::NeedsApproval => "needs_approval",
         Status::Unread => "unread",
         Status::Done => "done",

@@ -18,6 +18,7 @@ use crate::ui;
 fn chip(id: impl Into<ElementId>) -> Stateful<Div> {
     div()
         .id(id)
+        .role(gpui_kit::Role::Button)
         .h(px(34.))
         .px(px(11.))
         .rounded(px(17.))
@@ -66,6 +67,7 @@ pub fn chips(app: &FlintApp, cx: &mut Context<FlintApp>) -> Vec<AnyElement> {
     if let Some(model) = &slots.model {
         out.push(
             chip("option-model")
+                .aria_label(format!("{}: {}", model.name, label(model)))
                 .on_click(open(MenuTarget::Option(model.id.clone())))
                 .child(ui::label(label(model), size::BASE - 1., p.text_muted))
                 .child(ui::icon(IconName::ChevronDown, 11., p.text_subtle))
@@ -76,6 +78,7 @@ pub fn chips(app: &FlintApp, cx: &mut Context<FlintApp>) -> Vec<AnyElement> {
     if let Some(reasoning) = &slots.reasoning {
         out.push(
             chip("option-reasoning")
+                .aria_label(format!("{}: {}", reasoning.name, label(reasoning)))
                 .on_click(open(MenuTarget::Option(reasoning.id.clone())))
                 .child(ui::icon(IconName::Brain, 14., p.text_subtle))
                 .child(ui::label(label(reasoning), size::BASE - 1., p.text_muted))
@@ -95,6 +98,7 @@ pub fn chips(app: &FlintApp, cx: &mut Context<FlintApp>) -> Vec<AnyElement> {
         };
         out.push(
             chip("option-mode")
+                .aria_label(format!("{}: {}", mode.name, label(mode)))
                 .on_click(open(MenuTarget::Option(mode.id.clone())))
                 .when(plan, |c| c.border_1().border_color(p.accent))
                 .child(ui::icon(icon, 14., color))
@@ -109,6 +113,7 @@ pub fn chips(app: &FlintApp, cx: &mut Context<FlintApp>) -> Vec<AnyElement> {
         let next = toggled_value(fast);
         out.push(
             chip("option-fast")
+                .aria_label(format!("{}: {}", fast.name, label(fast)))
                 .on_click(cx.listener(move |this, _, _, cx| {
                     if let Some(value) = &next {
                         this.set_session_option(&id, value, cx);
@@ -131,6 +136,7 @@ pub fn chips(app: &FlintApp, cx: &mut Context<FlintApp>) -> Vec<AnyElement> {
     if !slots.more.is_empty() {
         out.push(
             chip("option-more")
+                .aria_label("More agent options")
                 .px(px(9.))
                 .on_click(open(MenuTarget::More))
                 .child(ui::icon(IconName::Ellipsis, 15., p.text_subtle))
@@ -184,6 +190,8 @@ pub fn menu(
             .map(|(n, (_, name, detail, current))| {
                 div()
                     .id(("option-item", n))
+                    .role(gpui_kit::Role::Button)
+                    .aria_label(name.clone())
                     .mx(px(6.))
                     .px(px(10.))
                     .py(px(7.))

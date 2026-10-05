@@ -1,6 +1,6 @@
 //! Right panel: the files changed this session. With several files, a list
-//! with a selection; for the selected file, its path, net stats, an "Open in
-//! editor" action, and one combined diff (original -> current) that scrolls
+//! with a selection; for the selected file, its path, net stats, a file
+//! preview action, and one combined diff (original -> current) that scrolls
 //! sideways instead of clipping long lines.
 
 use gpui_kit::assets::IconName;
@@ -16,7 +16,10 @@ use crate::theme::size;
 use crate::transcript::file_icon;
 use crate::ui;
 
-pub fn render(app: &FlintApp, cx: &mut Context<FlintApp>) -> impl IntoElement {
+pub fn render(app: &FlintApp, cx: &mut Context<FlintApp>) -> AnyElement {
+    if app.file_preview.is_some() {
+        return crate::file_preview::render(app, cx);
+    }
     let p = palette();
     let changes = &app.session().view.changes;
     let (added, removed) = changes
@@ -93,7 +96,8 @@ pub fn render(app: &FlintApp, cx: &mut Context<FlintApp>) -> impl IntoElement {
                         size::SM,
                         p.text_subtle,
                     )),
-            );
+            )
+            .into_any_element();
     }
 
     // A file list only when there is something to choose between.
@@ -114,6 +118,7 @@ pub fn render(app: &FlintApp, cx: &mut Context<FlintApp>) -> impl IntoElement {
                 let (dir, name) = file.path.rsplit_once('/').unwrap_or(("", &file.path));
                 div()
                     .id(("change", ix))
+                    .role(gpui_kit::Role::Button)
                     .aria_label(format!("Review {}", file.path))
                     .tab_index(0)
                     .focus_visible(|style| style.border_1().border_color(p.accent))
@@ -178,13 +183,15 @@ pub fn render(app: &FlintApp, cx: &mut Context<FlintApp>) -> impl IntoElement {
                     .child(ui::mono(format!("−{}", file.removed), size::XS, p.danger))
                     .child(
                         div()
-                            .id("open-in-editor")
+                            .id("open-file-preview")
                             .child(
-                                Button::new("open-editor")
+                                Button::new("view-file")
                                     .outline()
-                                    .icon(IconName::ExternalLink)
-                                    .tooltip("Open in editor")
-                                    .on_click(move |_, _, _| open_in_editor(&path)),
+                                    .icon(IconName::Eye)
+                                    .tooltip("View file in sidebar")
+                                    .on_click(cx.listener(move |app, _, _, cx| {
+                                        app.open_file_preview(path.clone(), cx);
+                                    })),
                             )
                             .test_support(),
                     ),
@@ -205,24 +212,5 @@ pub fn render(app: &FlintApp, cx: &mut Context<FlintApp>) -> impl IntoElement {
         .child(header)
         .children(list)
         .children(detail)
-}
-
-/// `$EDITOR <path>` when set (a GUI editor command such as `code` or `zed`),
-/// otherwise the system default app via `open`.
-pub fn open_in_editor(path: &std::path::Path) {
-    let editor = std::env::var("EDITOR")
-        .ok()
-        .filter(|e| !e.trim().is_empty());
-    let spawned = editor.and_then(|editor| {
-        let mut parts = editor.split_whitespace();
-        let program = parts.next()?;
-        std::process::Command::new(program)
-            .args(parts)
-            .arg(path)
-            .spawn()
-            .ok()
-    });
-    if spawned.is_none() {
-        std::process::Command::new("open").arg(path).spawn().ok();
-    }
+        .into_any_element()
 }

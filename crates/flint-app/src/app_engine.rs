@@ -18,6 +18,15 @@ use crate::app::FlintApp;
 use crate::engine;
 use crate::store;
 use crate::store::Logged;
+use crate::view_model::Change;
+
+/// A continuous producer must yield to input, painting, and other sessions.
+const MAX_ENGINE_BATCH_EVENTS: usize = 256;
+
+pub(crate) enum PromptRecord {
+    Immediate,
+    Batched,
+}
 
 impl FlintApp {
     pub fn apply_event(&mut self, ix: usize, event: AgentEvent, cx: &mut Context<Self>) {
@@ -40,8 +49,41 @@ impl FlintApp {
         let started = Instant::now();
         let event_count = events.len();
         let active = self.active;
+        let original_rows = self.sessions[ix].view.items.len();
+        let mut changed_rows = Vec::new();
+        let mut child_changes = Vec::new();
         let mut finished = false;
+        let mut finish_reason = None;
+        // Only events that change what the session needs from the user move
+        // it up the sidebar; streaming deltas would reorder rows constantly.
+        let mut notable = false;
         for event in events {
+            match &event {
+                AgentEvent::TurnStarted { .. } => self.sessions[ix].prompt_pending = false,
+                AgentEvent::TurnFinished { turn_id, reason }
+                    if self.sessions[ix].view.running
+                        && *turn_id == self.sessions[ix].view.turn_id =>
+                {
+                    self.sessions[ix].prompt_pending = false;
+                    finish_reason = Some(reason.clone());
+                }
+                AgentEvent::SteeringAccepted { id } => self.acknowledge_steering(ix, *id, cx),
+                AgentEvent::SessionStopped { .. } => self.queue_engine_stopped(ix, cx),
+                AgentEvent::Error(_) if !self.sessions[ix].view.running => {
+                    self.sessions[ix].prompt_pending = false;
+                    if !self.sessions[ix].prompt_queue.items.is_empty() {
+                        self.sessions[ix].prompt_queue.paused = true;
+                    }
+                }
+                _ => {}
+            }
+            notable |= matches!(
+                event,
+                AgentEvent::TurnStarted { .. }
+                    | AgentEvent::TurnFinished { .. }
+                    | AgentEvent::ApprovalRequested { .. }
+                    | AgentEvent::Error(_)
+            );
             // A command an agent runs gets a read-only tab in the terminal
             // dock; the event itself carries nothing the transcript shows.
             match &event {
@@ -70,7 +112,7 @@ impl FlintApp {
             {
                 session.history_save_failed = true;
             }
-            if let Err(err) = session.log(Logged::Event(event.clone())) {
+            if let Err(err) = session.log_event(&event) {
                 self.store_error = Some(format!("Couldn't save session event: {err}"));
                 // Stop production at the first storage failure, retaining all
                 // queued records without allowing more turns to accumulate.
@@ -90,21 +132,48 @@ impl FlintApp {
             finished |= matches!(event, AgentEvent::TurnFinished { .. });
             match &event {
                 AgentEvent::SessionOptions(options) => {
+                    self.confirm_agent_preferences(ix, options);
                     self.sessions[ix].options = options.clone();
                     self.sessions[ix].agent_ready = true;
                 }
                 AgentEvent::Error(_) if !self.sessions[ix].agent_ready => {
                     self.sessions[ix].agent_failed = true;
                 }
+                AgentEvent::Error(message) => {
+                    self.agent_choice_requests.retain(|(_, id), (owner, _)| {
+                        *owner != uid
+                            || !(message.contains(&format!("didn't change {id}:"))
+                                || message.contains(&format!("has no setting {id} =")))
+                    });
+                }
                 _ => {}
             }
             let session = &mut self.sessions[ix];
             session.record_event_edit(&event);
             let change = session.view.fold(event, now);
-            session.apply(change);
+            child_changes.extend(change.children);
+            changed_rows.extend(
+                change
+                    .updated
+                    .into_iter()
+                    .filter(|row| *row < original_rows),
+            );
         }
         let session = &mut self.sessions[ix];
-        session.touched = SystemTime::now();
+        session.apply(Change {
+            appended: original_rows..session.view.items.len(),
+            updated: changed_rows,
+            children: child_changes,
+        });
+        if ix == active
+            && let Some(id) = &session.selected_subagent
+            && let Some(child) = session.view.subagent_mut(id)
+        {
+            child.unread = false;
+        }
+        if notable {
+            session.touched = SystemTime::now();
+        }
         if finished {
             if let Err(err) = session.save_meta() {
                 self.store_error = Some(format!("Couldn't save session details: {err}"));
@@ -115,6 +184,9 @@ impl FlintApp {
         }
         if finished {
             self.settle_changes_async(uid, cx);
+        }
+        if let Some(reason) = &finish_reason {
+            self.queue_turn_finished(uid, reason, cx);
         }
         self.watch_persistence(uid, cx);
         if finished && crate::automation::dump_state(self) && self.options.exit_after_turn {
@@ -221,8 +293,14 @@ impl FlintApp {
 
     /// Starts the animation clock while any session is working; it stops
     /// itself once all are idle, so an idle window never repaints.
+    /// A session whose sidebar glyph or clock moves: running, or an agent
+    /// still starting.
+    fn animating(session: &crate::session::Session) -> bool {
+        session.view.running || session.agent_starting()
+    }
+
     pub(crate) fn ensure_ticker(&mut self, cx: &mut Context<Self>) {
-        if self.ticker.is_some() || !self.sessions.iter().any(|s| s.view.running) {
+        if self.ticker.is_some() || !self.sessions.iter().any(Self::animating) {
             return;
         }
         self.ticker = Some(cx.spawn(async move |this, cx| {
@@ -231,7 +309,7 @@ impl FlintApp {
                     .timer(Duration::from_millis(crate::ui::TICK_MS))
                     .await;
                 let keep = this.update(cx, |app, cx| {
-                    let running = app.sessions.iter().any(|s| s.view.running);
+                    let running = app.sessions.iter().any(Self::animating);
                     if running {
                         cx.notify();
                     } else {
@@ -247,6 +325,9 @@ impl FlintApp {
     }
 
     pub fn submit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.session().selected_subagent.is_some() {
+            return;
+        }
         if self.permission_choice_open || self.pending_image_pastes > 0 {
             return;
         }
@@ -267,12 +348,6 @@ impl FlintApp {
             return;
         }
         let ix = self.active;
-        if self.sessions[ix].stopping {
-            return;
-        }
-        if !self.storage_ready(ix, cx) {
-            return;
-        }
         if self
             .store_error
             .as_deref()
@@ -280,8 +355,39 @@ impl FlintApp {
         {
             self.store_error = None;
         }
-        if self.sessions[ix].view.running && self.sessions[ix].ops.is_none() {
+        let Some(prompt) = self.prepare_composer_prompt(cx) else {
             return;
+        };
+        if self.prompt_busy(ix)
+            || !self.sessions[ix].prompt_queue.items.is_empty()
+            || self.sessions[ix].prompt_queue.paused
+        {
+            if self.enqueue_prompt(ix, prompt, cx).is_none() {
+                return;
+            }
+            self.clear_submitted_draft(window, cx);
+            self.dispatch_next_prompt(self.sessions[ix].uid, cx);
+        } else {
+            self.dispatch_prompt(ix, prompt.shown, prompt.message, prompt.images, cx);
+            self.clear_submitted_draft(window, cx);
+        }
+    }
+
+    pub(crate) fn prepare_composer_prompt(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) -> Option<crate::prompt_queue::Prompt> {
+        let ix = self.active;
+        if self.permission_choice_open
+            || self.pending_image_pastes > 0
+            || self.sessions[ix].stopping
+            || !self.storage_ready(ix, cx)
+        {
+            return None;
+        }
+        let text = self.composer.read(cx).value().trim().to_string();
+        if text.is_empty() && self.image_attachments.is_empty() {
+            return None;
         }
         let images: Vec<ImageAttachment> = match self
             .image_attachments
@@ -293,28 +399,32 @@ impl FlintApp {
             Err(error) => {
                 self.store_error = Some(error);
                 cx.notify();
-                return;
+                return None;
             }
         };
-        let shown = images.iter().fold(text.clone(), |mut shown, image| {
-            if !shown.is_empty() {
-                shown.push('\n');
-            }
-            shown.push_str(&format!("[Image: {}]", image.name));
-            shown
-        });
-        self.composer
-            .update(cx, |state, cx| state.set_value("", window, cx));
-        self.mention = None;
-        let attachments = std::mem::take(&mut self.attachments);
-        self.image_attachments.clear();
-        self.pasted_image_files.clear();
-        let message = crate::mention::attach(&text, &self.sessions[ix].workspace, &attachments);
-        self.send_message_with_images(ix, shown, message, images, cx);
+        let message =
+            crate::mention::attach(&text, &self.sessions[ix].workspace, &self.attachments);
+        Some(crate::prompt_queue::Prompt::new(text, message, images))
     }
 
-    /// Shows `text` in the transcript and sends `message` (the text plus any
-    /// attachments) to the session's engine, starting it if needed.
+    pub(crate) fn clear_submitted_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.composer.update(cx, |state, cx| {
+            state.set_value("", window, cx);
+        });
+        // Button activation finishes its focus update after the click listener.
+        cx.defer_in(window, |app, window, cx| {
+            app.composer.update(cx, |state, cx| state.focus(window, cx));
+        });
+        self.mention = None;
+        self.slash = None;
+        self.attachments.clear();
+        self.image_attachments.clear();
+        self.pasted_image_files.clear();
+        cx.notify();
+    }
+
+    /// Sends `message` immediately when idle, or captures it in the session's
+    /// queue while busy/paused. The transcript records it only when dispatched.
     pub(crate) fn send_message(
         &mut self,
         ix: usize,
@@ -333,24 +443,93 @@ impl FlintApp {
         images: Vec<ImageAttachment>,
         cx: &mut Context<Self>,
     ) {
+        if self.prompt_busy(ix)
+            || !self.sessions[ix].prompt_queue.items.is_empty()
+            || self.sessions[ix].prompt_queue.paused
+        {
+            self.enqueue_prompt(
+                ix,
+                crate::prompt_queue::Prompt::new(text, message, images),
+                cx,
+            );
+        } else {
+            self.dispatch_prompt(ix, text, message, images, cx);
+        }
+    }
+
+    pub(crate) fn dispatch_prompt(
+        &mut self,
+        ix: usize,
+        text: String,
+        message: String,
+        images: Vec<ImageAttachment>,
+        cx: &mut Context<Self>,
+    ) -> bool {
         if self.sessions[ix].stopping {
             self.store_error = Some(
                 "The engine is stopping. Wait for it to finish saving before continuing.".into(),
             );
             cx.notify();
-            return;
+            return false;
         }
         if !self.storage_ready(ix, cx) {
-            return;
+            return false;
         }
+        let prompt = crate::prompt_queue::Prompt {
+            id: 0,
+            text: text.clone(),
+            shown: text,
+            message,
+            images,
+        };
+        if !self.record_prompt(ix, &prompt, PromptRecord::Immediate, cx) {
+            return false;
+        }
+        let accepted = match self.ensure_engine(ix, cx) {
+            Ok(()) => self.sessions[ix].ops.as_ref().is_some_and(|ops| {
+                let op = if prompt.images.is_empty() {
+                    Op::UserMessage(prompt.message)
+                } else {
+                    Op::UserMessageWithImages {
+                        text: prompt.message,
+                        images: prompt.images,
+                    }
+                };
+                ops.try_send(op).is_ok()
+            }),
+            Err(err) => {
+                self.apply_event(ix, AgentEvent::Error(format!("{err:#}")), cx);
+                false
+            }
+        };
+        self.sessions[ix].prompt_pending = accepted && !self.sessions[ix].view.running;
+        if !accepted && !self.sessions[ix].prompt_queue.items.is_empty() {
+            self.sessions[ix].prompt_queue.paused = true;
+        }
+        cx.notify();
+        accepted
+    }
+
+    pub(crate) fn record_prompt(
+        &mut self,
+        ix: usize,
+        prompt: &crate::prompt_queue::Prompt,
+        mode: PromptRecord,
+        cx: &mut Context<Self>,
+    ) -> bool {
         let session = &mut self.sessions[ix];
+        let text = prompt.shown.clone();
         let change = session.view.push_user(text.clone());
-        session.apply(change);
+        if matches!(mode, PromptRecord::Immediate) {
+            session.apply(change);
+        }
         session.touched = SystemTime::now();
-        session.submitted_at = Some(Instant::now());
-        session.first_token = None;
-        session.first_text = None;
-        session.last_message = Some((text.clone(), message.clone(), images.clone()));
+        if !session.view.running {
+            session.submitted_at = Some(Instant::now());
+            session.first_token = None;
+            session.first_text = None;
+        }
+        session.last_message = Some((text.clone(), prompt.message.clone(), prompt.images.clone()));
         if !self.options.ephemeral() && session.dir.is_none() {
             session.dir = Some(store::sessions_dir(&self.home).join(store::new_id()));
         }
@@ -369,29 +548,15 @@ impl FlintApp {
             }
             self.watch_persistence(self.sessions[ix].uid, cx);
             cx.notify();
-            return;
+            return false;
         }
+        self.save_session_layout();
         self.watch_persistence(self.sessions[ix].uid, cx);
-        match self.ensure_engine(ix, cx) {
-            Ok(()) => {
-                if let Some(ops) = &self.sessions[ix].ops {
-                    if images.is_empty() {
-                        ops.try_send(Op::UserMessage(message)).ok();
-                    } else {
-                        ops.try_send(Op::UserMessageWithImages {
-                            text: message,
-                            images,
-                        })
-                        .ok();
-                    }
-                }
-            }
-            Err(err) => self.apply_event(ix, AgentEvent::Error(format!("{err:#}")), cx),
-        }
         cx.notify();
+        true
     }
 
-    fn storage_ready(&mut self, ix: usize, cx: &mut Context<Self>) -> bool {
+    pub(crate) fn storage_ready(&mut self, ix: usize, cx: &mut Context<Self>) -> bool {
         if self.sessions[ix].storage_failed()
             && let Err(error) = self.sessions[ix].flush_records()
         {
@@ -437,9 +602,19 @@ impl FlintApp {
         if self.sessions[ix].ops.is_some() {
             return Ok(());
         }
+        if self.sessions[ix].general {
+            let workspace = crate::general::prepare(&self.home)?;
+            if workspace != self.sessions[ix].workspace {
+                anyhow::bail!(
+                    "The saved general-agent folder is unavailable. Start a new general chat."
+                );
+            }
+        }
         let kind = self.sessions[ix].agent;
         if let Some(handle) = self.spawn_acp(ix, kind) {
             self.attach_engine(ix, handle, cx);
+            // Its sidebar row spins while the agent starts.
+            self.ensure_ticker(cx);
             return Ok(());
         }
         let session = &self.sessions[ix];
@@ -451,6 +626,7 @@ impl FlintApp {
             self.approval,
         )?;
         config.session_dir = session.dir.clone();
+        config.general = session.general;
         config.reasoning_effort = self.effort.filter(|_| self.effort_supported);
         self.sessions[ix].native_model = Some(config.model.clone());
         self.sessions[ix].native_approval = Some(config.approval);
@@ -495,7 +671,9 @@ impl FlintApp {
                     event
                 };
                 let mut batch = vec![first];
-                while let Ok(more) = events.try_recv() {
+                while batch.len() < MAX_ENGINE_BATCH_EVENTS
+                    && let Ok(more) = events.try_recv()
+                {
                     batch.push(more);
                 }
                 let applied = this.update(cx, |app, cx| {
@@ -512,6 +690,7 @@ impl FlintApp {
             }
             this.update(cx, |app, cx| {
                 if let Some(ix) = app.session_index(uid) {
+                    app.queue_engine_stopped(ix, cx);
                     app.sessions[ix].ops = None;
                     app.sessions[ix].pump = None;
                     app.sessions[ix].native_model = None;
@@ -553,8 +732,29 @@ impl FlintApp {
         }));
     }
 
+    /// Asks flint's engine to restore the files its last turn with changes
+    /// edited. The answer arrives as a `FilesReverted` (or error) event.
+    pub fn undo_last_turn(&mut self, cx: &mut Context<Self>) {
+        let ix = self.active;
+        let message = if self.sessions[ix].agent != flint_agent::AgentKind::Flint {
+            Some("Undo is only available for flint's own agent.")
+        } else if let Some(ops) = &self.sessions[ix].ops {
+            ops.try_send(Op::UndoLastTurn).ok();
+            None
+        } else {
+            Some("Nothing to undo: the agent hasn't changed files since flint started.")
+        };
+        if let Some(message) = message {
+            self.apply_event(ix, AgentEvent::Error(message.to_string()), cx);
+        }
+        cx.notify();
+    }
+
     pub fn interrupt(&mut self, cx: &mut Context<Self>) {
         let ix = self.active;
+        self.sessions[ix].prompt_queue.paused = !self.sessions[ix].prompt_queue.items.is_empty();
+        self.sessions[ix].prompt_queue.steer_after_turn = None;
+        self.save_prompt_queue(ix, cx);
         if !self.sessions[ix].view.running {
             return;
         }
@@ -612,7 +812,12 @@ impl FlintApp {
 
     /// Answers the oldest unanswered approval in the active session.
     pub fn answer_pending(&mut self, decision: ApprovalDecision, cx: &mut Context<Self>) {
-        if let Some((call_id, _, _)) = self.session().view.pending_approval() {
+        if let Some(call_id) = self
+            .session()
+            .view
+            .pending_approval_ref()
+            .map(|(call_id, _, _)| call_id.to_owned())
+        {
             self.answer_approval(call_id, decision, cx);
         }
     }

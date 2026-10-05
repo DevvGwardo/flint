@@ -1,8 +1,7 @@
 //! Best-effort repair of tool-call argument strings and tool names.
 //!
 //! Cheap models emit arguments that are *nearly* valid JSON: optional
-//! arguments sent as `null`, arrays or objects double-encoded as strings,
-//! trailing commas, and containers left open by a truncated stream. Every
+//! trailing commas and containers left open after complete values. Every
 //! repair is validated by re-parsing; when nothing parses, the caller gets the
 //! parse error so the model sees a real failure instead of guessed arguments.
 
@@ -52,19 +51,12 @@ fn finish(value: Value, repaired: bool) -> RepairedArgs {
             error: "tool arguments must be a JSON object".to_string(),
         };
     };
-    let original = Value::Object(map.clone());
-    let cleaned = clean_value(original.clone());
-    let changed = repaired || cleaned != original;
-    match cleaned {
-        Value::Object(value) => RepairedArgs::Ok {
-            value,
-            repaired: changed,
-        },
-        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) | Value::Array(_) => {
-            RepairedArgs::Invalid {
-                error: "tool arguments must be a JSON object".to_string(),
-            }
-        }
+    // A JSON-looking string is still a string (especially file content and
+    // MCP inputs); null is a valid schema value. Repairs belong to the
+    // individual tool's schema, never to arbitrary nested values.
+    RepairedArgs::Ok {
+        value: map,
+        repaired,
     }
 }
 
@@ -144,43 +136,14 @@ pub fn close_unbalanced(input: &str) -> Option<String> {
             _ => {}
         }
     }
-    if stack.is_empty() && !in_string {
+    if in_string || stack.is_empty() {
         return None;
     }
     let mut closed = input.to_string();
-    if in_string {
-        closed.push('"');
-    }
     while let Some(closer) = stack.pop() {
         closed.push(closer);
     }
     Some(closed)
-}
-
-/// Drops null-valued keys and re-expands JSON containers encoded as strings.
-fn clean_value(value: Value) -> Value {
-    match value {
-        Value::Array(items) => Value::Array(items.into_iter().map(clean_value).collect()),
-        Value::Object(map) => Value::Object(
-            map.into_iter()
-                .filter(|(_, v)| !v.is_null())
-                .map(|(k, v)| (k, clean_value(v)))
-                .collect(),
-        ),
-        Value::String(text) => expand_encoded_json(text),
-        Value::Null | Value::Bool(_) | Value::Number(_) => value,
-    }
-}
-
-fn expand_encoded_json(text: String) -> Value {
-    let first = text.trim_start().chars().next();
-    if !matches!(first, Some('[') | Some('{')) {
-        return Value::String(text);
-    }
-    match serde_json::from_str::<Value>(&text) {
-        Ok(parsed @ (Value::Array(_) | Value::Object(_))) => clean_value(parsed),
-        Ok(_) | Err(_) => Value::String(text),
-    }
 }
 
 /// `ReadFile`, `read-file`, `functions.read_file` -> `read_file` when offered.
