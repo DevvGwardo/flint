@@ -7,6 +7,8 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  FLINT_LIVE: "0"
+  FLINT_EVAL: "0"
 
 jobs:
   check:
@@ -25,3 +27,41 @@ jobs:
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Test
         run: cargo test --workspace --locked
+
+  windows:
+    runs-on: windows-2025
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install the pinned toolchain
+        run: rustup show active-toolchain
+      - name: Install rustfmt and clippy
+        run: rustup component add rustfmt clippy
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+      - uses: Swatinem/rust-cache@v2
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Clippy (including UI test compilation)
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Core tests
+        run: cargo test --workspace --exclude flint-app --locked -- --test-threads=1
+      - name: App model tests
+        run: cargo test -p flint-app --lib --locked -- --test-threads=1
+      - name: Windows UI regressions
+        run: cargo test -p flint-app --test platform_ui --locked -- --test-threads=1
+      - name: Build Windows desktop executable
+        run: cargo build --release -p flint-app --bin hooter --locked
+      - name: Offline desktop startup smoke test
+        run: ./tools/windows/smoke.ps1 -Executable ./target/release/hooter.exe -OutputDirectory ./target/windows-smoke
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: hooter-windows-x86_64
+          path: |
+            target/release/hooter.exe
+            target/windows-smoke/
+          if-no-files-found: warn

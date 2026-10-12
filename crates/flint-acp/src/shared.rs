@@ -32,6 +32,7 @@ pub(crate) struct Shared {
     pub agent: AcpAgent,
     pub workspace: PathBuf,
     pub events: Sender<AgentEvent>,
+    pub intake: async_channel::Receiver<flint_agent::Op>,
     pub stderr: Arc<Mutex<String>>,
     pub mapper: Mutex<Mapper>,
     pub pending: Mutex<HashMap<String, PendingPermission>>,

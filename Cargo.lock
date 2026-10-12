@@ -2021,6 +2021,7 @@ dependencies = [
  "anyhow",
  "async-channel",
  "flint-agent",
+ "flint-platform",
  "futures",
  "pretty_assertions",
  "serde",
@@ -2037,16 +2038,22 @@ dependencies = [
  "anyhow",
  "async-channel",
  "bytes",
+ "flint-platform",
  "futures-util",
+ "libc",
  "pretty_assertions",
  "regex",
  "reqwest",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
+ "shlex 2.0.1",
  "similar",
  "tempfile",
  "tokio",
  "tokio-util",
+ "uuid",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2059,6 +2066,7 @@ dependencies = [
  "diffy",
  "flint-acp",
  "flint-agent",
+ "flint-platform",
  "flint-term",
  "gpui-kit",
  "ignore",
@@ -2076,12 +2084,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "flint-platform"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "tempfile",
+ "tokio",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "flint-term"
 version = "0.1.0"
 dependencies = [
  "alacritty_terminal",
  "anyhow",
  "async-channel",
+ "flint-platform",
  "pretty_assertions",
 ]
 
@@ -2555,8 +2574,6 @@ dependencies = [
 [[package]]
 name = "gpui-base"
 version = "0.7.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "64bb52b29a8dcdc8d3f595b8b0839c076f237572ab601ba4577d3da8ae085728"
 dependencies = [
  "aho-corasick",
  "anyhow",
@@ -2680,8 +2697,6 @@ dependencies = [
 [[package]]
 name = "gpui-pre"
 version = "0.3.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0e87a42bb37c7cb4e76dd1ac0ce88851e46e976e0373a47ab3e0757abffee54d"
 dependencies = [
  "accesskit",
  "anyhow",

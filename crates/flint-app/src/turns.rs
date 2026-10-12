@@ -16,6 +16,8 @@ use crate::view_model::ToolCall;
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct TurnInfo {
+    pub turn_id: u64,
+    pub task: Option<flint_agent::TaskRecord>,
     /// First item index belonging to the turn.
     pub first: usize,
     /// The summary row, once the turn has finished.
@@ -74,6 +76,7 @@ pub enum Activity {
 impl SessionView {
     pub(crate) fn begin_turn(&mut self) {
         self.turns.push(TurnInfo {
+            turn_id: self.turn_id,
             first: self.items.len(),
             ..TurnInfo::default()
         });
@@ -105,6 +108,9 @@ impl SessionView {
         };
         let end = self.items.len() - 1;
         let turn = &mut self.turns[t];
+        if turn.end.is_none() {
+            self.finished_turns += 1;
+        }
         turn.end = Some(end);
         turn.duration = duration;
         turn.final_answer = (turn.first..end)

@@ -13,6 +13,98 @@ use crate::test_support::outline;
 use crate::test_support::start;
 
 #[tokio::test]
+async fn external_end_turn_remains_unknown_instead_of_claiming_native_acceptance() {
+    let (harness, mut fake) = start(ApprovalMode::Auto);
+    fake.handshake().await;
+    harness
+        .send(Op::UserMessage(
+            "Research only. Do not change files.".into(),
+        ))
+        .await;
+    let prompt = fake.expect("session/prompt").await;
+    assert_eq!(
+        prompt["params"]["prompt"][0]["text"],
+        "Research only. Do not change files."
+    );
+    fake.respond(&prompt, json!({"stopReason":"end_turn"}))
+        .await;
+    let events = harness.next_turn().await;
+    let task = events
+        .iter()
+        .find_map(|event| match event {
+            AgentEvent::TaskAssessed { task, .. } => Some(task),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(task.source, flint_agent::TaskSource::External);
+    assert_eq!(task.contract.mode, flint_agent::TaskMode::Unspecified);
+    assert_eq!(
+        task.assessment.as_ref().unwrap().outcome,
+        flint_agent::TaskOutcome::Unknown
+    );
+    assert!(!task.is_accepted());
+    assert!(task.checks.is_empty());
+    harness.send(Op::Shutdown).await;
+    fake.closed().await;
+}
+
+fn native_task_controls() -> Vec<Op> {
+    vec![
+        Op::ContinueTask {
+            task_id: 1,
+            expected_revision: 1,
+        },
+        Op::ReviewTask(flint_agent::TaskReview {
+            turn_id: 1,
+            task_id: 1,
+            contract_revision: 1,
+            work_revision: 0,
+            decision: flint_agent::ReviewDecision::Accept,
+        }),
+        Op::EditTask(flint_agent::TaskEdit {
+            task_id: 1,
+            expected_revision: 1,
+            objective: "Scope".into(),
+            mode: flint_agent::TaskMode::ReadOnly,
+            requirements: vec![flint_agent::RequirementSpec::Review("Result".into())],
+            restrictions: Vec::new(),
+            clear_reported_blockers: false,
+        }),
+    ]
+}
+
+#[tokio::test]
+async fn external_loop_refuses_native_controls_when_idle_and_during_a_prompt() {
+    let (harness, mut fake) = start(ApprovalMode::Auto);
+    fake.handshake().await;
+    for op in native_task_controls() {
+        harness.send(op).await;
+        let event = harness
+            .until(|event| matches!(event, AgentEvent::Error(_)))
+            .await;
+        assert!(matches!(event,AgentEvent::Error(text) if text.contains("cannot govern")));
+    }
+    // Any accidental control RPC precedes this prompt and fails the check.
+    harness
+        .send(Op::UserMessage("Explicit user follow-up.".into()))
+        .await;
+    let prompt = fake.recv().await;
+    assert_eq!(prompt["method"], "session/prompt");
+    for op in native_task_controls() {
+        harness.send(op).await;
+        let event = harness
+            .until(|event| matches!(event, AgentEvent::Error(_)))
+            .await;
+        assert!(matches!(event,AgentEvent::Error(text) if text.contains("cannot govern")));
+    }
+    fake.respond(&prompt, json!({"stopReason":"end_turn"}))
+        .await;
+    harness.next_turn().await;
+    harness.send(Op::Shutdown).await;
+    fake.closed().await;
+}
+
+#[tokio::test]
 async fn shutdown_interrupts_an_unanswered_initialize() {
     let (harness, mut fake) = start(ApprovalMode::Auto);
     fake.expect("initialize").await;
@@ -33,6 +125,10 @@ async fn ignored_cancel_closes_calls_and_turn_exactly_once() {
     harness.send(Op::Interrupt).await;
     fake.expect("session/cancel").await;
     let events = harness.next_turn().await;
+    assert!(
+        harness.ops.is_closed(),
+        "terminal cancellation must close public prompt intake before TurnFinished"
+    );
     assert_eq!(events.iter().filter(|e| matches!(e, AgentEvent::ToolCallFinished { call_id, success: false, .. } if call_id == "t1")).count(), 1);
     assert_eq!(
         events
@@ -48,6 +144,112 @@ async fn ignored_cancel_closes_calls_and_turn_exactly_once() {
         1
     );
     assert!(!events.iter().any(|e| matches!(e, AgentEvent::Error(_))));
+    fake.closed().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn terminal_event_wake_observes_closed_public_intake() {
+    use std::future::Future;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU8, Ordering};
+    use std::task::{Context, Wake, Waker};
+
+    struct IntakeAtWake {
+        ops: async_channel::Sender<Op>,
+        first: AtomicU8,
+    }
+    impl Wake for IntakeAtWake {
+        fn wake(self: Arc<Self>) {
+            self.wake_by_ref();
+        }
+        fn wake_by_ref(self: &Arc<Self>) {
+            let closed = u8::from(self.ops.is_closed());
+            let _ = self
+                .first
+                .compare_exchange(2, closed, Ordering::SeqCst, Ordering::SeqCst);
+        }
+    }
+
+    let (harness, mut fake) = start(ApprovalMode::Auto);
+    fake.handshake().await;
+    harness
+        .send(Op::UserMessage("wait for cancellation".into()))
+        .await;
+    fake.expect("session/prompt").await;
+    harness.send(Op::Interrupt).await;
+    fake.expect("session/cancel").await;
+    while let Ok(event) = harness.events.try_recv() {
+        assert!(!matches!(event, AgentEvent::TurnFinished { .. }));
+    }
+    let witness = Arc::new(IntakeAtWake {
+        ops: harness.ops.clone(),
+        first: AtomicU8::new(2),
+    });
+    let waker = Waker::from(witness.clone());
+    let mut waiting = std::pin::pin!(harness.events.recv());
+    assert!(
+        waiting
+            .as_mut()
+            .poll(&mut Context::from_waker(&waker))
+            .is_pending()
+    );
+    tokio::time::advance(std::time::Duration::from_secs(3)).await;
+    for _ in 0..128 {
+        if witness.first.load(Ordering::SeqCst) != 2 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    let first = waiting.await.unwrap();
+    assert!(
+        matches!(first, AgentEvent::TaskAssessed { .. }),
+        "{first:?}"
+    );
+    assert_eq!(
+        witness.first.load(Ordering::SeqCst),
+        1,
+        "the event wake must not advertise a reusable public channel"
+    );
+    harness.next_turn().await;
+    assert!(
+        harness
+            .ops
+            .try_send(Op::UserMessage("too late".into()))
+            .is_err()
+    );
+    fake.closed().await;
+}
+
+#[tokio::test]
+async fn uncategorized_model_slot_restores_without_silently_changing_identity() {
+    use crate::launch::AcpAgent;
+    use crate::test_support::start_agent_with_preferences;
+    let (harness, mut fake) = start_agent_with_preferences(
+        AcpAgent::ClaudeCode,
+        ApprovalMode::Auto,
+        None,
+        [("model".into(), "m1".into())].into(),
+    );
+    fake.handshake_with_options(json!([
+        {"id":"model","name":"Model","type":"select","currentValue":"m1",
+         "options":[{"value":"m1","name":"One"},{"value":"m2","name":"Two"}]}
+    ]))
+    .await;
+    harness
+        .send(Op::UserMessage("keep the saved model".into()))
+        .await;
+    let started = harness
+        .until(|event| matches!(event, AgentEvent::TurnStarted { .. } | AgentEvent::Error(_)))
+        .await;
+    assert!(
+        matches!(started, AgentEvent::TurnStarted { .. }),
+        "{started:?}"
+    );
+    let prompt = fake.expect("session/prompt").await;
+    fake.respond(&prompt, json!({"stopReason":"end_turn"}))
+        .await;
+    harness.next_turn().await;
+    harness.send(Op::Shutdown).await;
     fake.closed().await;
 }
 
@@ -156,6 +358,7 @@ async fn maps_a_turn_of_updates() {
             "options ",
             "turn 1",
             "step 0",
+            "task scope 1",
             "thinking plan",
             "text Writing it.",
             "start t1 Edit Write hello.py",
@@ -165,6 +368,7 @@ async fn maps_a_turn_of_updates() {
             "step 1",
             "text Done.",
             "usage 20 10",
+            "task outcome Unverified",
             "finished Completed",
         ]
     );
@@ -256,11 +460,12 @@ async fn interrupt_sends_cancel_and_ends_interrupted() {
     fake.respond(&prompt, json!({"stopReason": "cancelled"}))
         .await;
     let events = harness.next_turn().await;
-    let tail: Vec<String> = outline(&events).into_iter().rev().take(3).collect();
+    let tail: Vec<String> = outline(&events).into_iter().rev().take(4).collect();
     assert_eq!(
         tail,
         vec![
             "finished Interrupted",
+            "task outcome Unverified",
             "finish t2 ok=false \"Interrupted.\"",
             "finish t1 ok=false \"Interrupted.\"",
         ]
@@ -428,7 +633,11 @@ async fn runs_the_terminals_the_agent_asks_for() {
     fake.send(ask(
         "t1",
         "terminal/create",
-        json!({"sessionId": "s1", "command": "printf", "args": ["hi\\n"]}),
+        if cfg!(windows) {
+            json!({"sessionId": "s1", "command": "cmd.exe", "args": ["/D", "/C", "echo hi"]})
+        } else {
+            json!({"sessionId": "s1", "command": "printf", "args": ["hi\\n"]})
+        },
     ))
     .await;
     let created = fake.answered("t1").await;
@@ -441,7 +650,14 @@ async fn runs_the_terminals_the_agent_asks_for() {
     let AgentEvent::TerminalStarted { label, cwd, .. } = started else {
         panic!("terminal started")
     };
-    assert_eq!(label, "claude: printf hi\\n");
+    assert_eq!(
+        label,
+        if cfg!(windows) {
+            "claude: cmd.exe /D /C echo hi"
+        } else {
+            "claude: printf hi\\n"
+        }
+    );
     assert_eq!(cwd.as_deref(), Some(harness.workspace.as_path()));
 
     // Wait for the exit first, so the output below is the whole of it.
@@ -461,7 +677,8 @@ async fn runs_the_terminals_the_agent_asks_for() {
     ))
     .await;
     let output = fake.answered("t3").await;
-    assert_eq!(output["result"]["output"], json!("hi\n"));
+    let expected = if cfg!(windows) { "hi\r\n" } else { "hi\n" };
+    assert_eq!(output["result"]["output"], json!(expected));
     assert_eq!(output["result"]["truncated"], json!(false));
 
     let events: Vec<AgentEvent> = vec![
@@ -472,7 +689,7 @@ async fn runs_the_terminals_the_agent_asks_for() {
             .until(|e| matches!(e, AgentEvent::TerminalExited { .. }))
             .await,
     ];
-    assert!(matches!(&events[0], AgentEvent::TerminalOutput { data, .. } if data == "hi\n"));
+    assert!(matches!(&events[0], AgentEvent::TerminalOutput { data, .. } if data == expected));
     assert!(matches!(
         &events[1],
         AgentEvent::TerminalExited {
@@ -556,7 +773,9 @@ async fn kills_a_terminal_on_request() {
     fake.handshake().await;
     fake.send(
         json!({"jsonrpc": "2.0", "id": "t1", "method": "terminal/create",
-        "params": {"sessionId": "s1", "command": "sleep", "args": ["30"]}}),
+        "params": if cfg!(windows) {
+            json!({"sessionId": "s1", "command": "powershell.exe", "args": ["-NoProfile", "-NonInteractive", "-Command", "Start-Sleep -Seconds 30"]})
+        } else { json!({"sessionId": "s1", "command": "sleep", "args": ["30"]}) }}),
     )
     .await;
     let created = fake.answered("t1").await;

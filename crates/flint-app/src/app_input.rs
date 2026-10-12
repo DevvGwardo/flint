@@ -344,6 +344,9 @@ impl FlintApp {
 
     /// A menu key delivered as an action (see the `menu > Input` bindings).
     pub(crate) fn menu_key(&mut self, key: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if self.task_panel.is_some() {
+            return;
+        }
         let keystroke = Keystroke {
             key: key.to_string(),
             ..Keystroke::default()
@@ -411,7 +414,7 @@ impl FlintApp {
             let empty = composer_is_empty(self.composer.read(cx));
             let decision = match (
                 key.key.as_str(),
-                key.modifiers.platform,
+                crate::shortcuts::primary(key.modifiers),
                 key.modifiers.shift,
             ) {
                 ("enter", true, true) => Some(ApprovalDecision::ApproveAlways),

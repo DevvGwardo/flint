@@ -68,9 +68,19 @@ impl Prompt {
 pub struct Queue {
     pub items: VecDeque<Prompt>,
     pub paused: bool,
+    #[serde(default)]
+    pub review_hold: Option<String>,
+    #[serde(default)]
+    pub resume_after_review: bool,
+    /// One explicitly confirmed bypass, never carried through restart.
+    #[serde(skip)]
+    pub review_override_turn: Option<u64>,
     next_id: u64,
     #[serde(skip)]
     pub error: Option<String>,
+    /// Retry a failed persistence write even when review state is unchanged.
+    #[serde(skip)]
+    pub(crate) save_failed: bool,
     /// ACP steering interrupts the current turn, then dispatches this entry.
     #[serde(skip)]
     pub steer_after_turn: Option<u64>,
@@ -242,6 +252,7 @@ impl Queue {
         }
         // Never run pending user work automatically after a restart.
         queue.paused = !queue.items.is_empty();
+        queue.resume_after_review = false;
         Ok(queue)
     }
 }

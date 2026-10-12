@@ -14,6 +14,19 @@ use crate::settings::Settings;
 /// Settings).
 pub const NO_KEY: &str = "No API key found";
 
+pub fn jev_config(settings: &Settings, sources: &KeySources) -> Option<flint_agent::JevConfig> {
+    settings
+        .jev_judge
+        .then(|| (sources.env)("TYPESAFE_API_KEY"))
+        .flatten()
+        .map(|api_key| flint_agent::JevConfig {
+            api_key,
+            base_url: (sources.env)("TYPESAFE_BASE_URL")
+                .unwrap_or_else(|| "https://api.typesafe.ai".into()),
+            model: (sources.env)("JEV_MODEL").unwrap_or_else(|| "jev-latest".into()),
+        })
+}
+
 /// Settings decide the model and endpoint; `FLINT_MODEL` / `FLINT_BASE_URL`
 /// override them for one run. The key comes from [`Settings::resolve_key`] and
 /// is never logged or shown.
@@ -41,12 +54,7 @@ pub fn config_for(
         model: (sources.env)("FLINT_MODEL").unwrap_or_else(|| settings.model.clone()),
         api_key: found.key,
         approval,
-        jev: (sources.env)("TYPESAFE_API_KEY").map(|api_key| flint_agent::JevConfig {
-            api_key,
-            base_url: (sources.env)("TYPESAFE_BASE_URL")
-                .unwrap_or_else(|| "https://api.typesafe.ai".into()),
-            model: (sources.env)("JEV_MODEL").unwrap_or_else(|| "jev-latest".into()),
-        }),
+        jev: jev_config(settings, sources),
         subagent_model: None,
         session_dir: None,
         context_budget_tokens: flint_agent::DEFAULT_CONTEXT_BUDGET_TOKENS,

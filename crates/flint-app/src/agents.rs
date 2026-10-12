@@ -17,14 +17,14 @@ pub const AGENTS: [AgentKind; 4] = [
     AgentKind::Droid,
 ];
 
-/// `/agent claude|codex|droid|flint` typed into the composer.
+/// `/agent claude|codex|droid|hooter` typed into the composer.
 pub fn parse_command(text: &str) -> Option<AgentKind> {
     let name = text.trim().strip_prefix("/agent")?.trim().to_lowercase();
     match name.as_str() {
         "claude" | "claude-code" | "claude code" | "cc" => Some(AgentKind::ClaudeCode),
         "codex" => Some(AgentKind::Codex),
         "droid" | "factory" | "factory-droid" => Some(AgentKind::Droid),
-        "flint" => Some(AgentKind::Flint),
+        "hooter" | "jevdex" | "flint" => Some(AgentKind::Flint),
         _ => None,
     }
 }
@@ -32,7 +32,7 @@ pub fn parse_command(text: &str) -> Option<AgentKind> {
 /// One line describing what an agent is, for the picker.
 pub fn about(kind: AgentKind) -> &'static str {
     match kind {
-        AgentKind::Flint => "flint's own agent and harness",
+        AgentKind::Flint => "Hooter's native agent and harness",
         AgentKind::ClaudeCode => "Anthropic's agent, on your Claude plan (ACP)",
         AgentKind::Codex => "OpenAI's agent, on your ChatGPT plan (ACP)",
         AgentKind::Droid => "Factory's agent, on your Factory account (ACP)",
@@ -91,7 +91,8 @@ impl FlintApp {
     pub fn agent_label(&self, kind: AgentKind) -> String {
         match kind {
             AgentKind::Flint => format!(
-                "flint · {}",
+                "{} · {}",
+                crate::brand::NAME,
                 self.session()
                     .native_model
                     .as_deref()
@@ -201,6 +202,10 @@ mod tests {
         assert_eq!(parse_command("/agent claude"), Some(AgentKind::ClaudeCode));
         assert_eq!(parse_command(" /agent Codex "), Some(AgentKind::Codex));
         assert_eq!(parse_command("/agent flint"), Some(AgentKind::Flint));
+        assert_eq!(parse_command("/agent hooter"), Some(AgentKind::Flint));
+        assert_eq!(parse_command(" /agent Hooter "), Some(AgentKind::Flint));
+        assert_eq!(parse_command("/agent jevdex"), Some(AgentKind::Flint));
+        assert_eq!(parse_command(" /agent Jevdex "), Some(AgentKind::Flint));
         assert_eq!(parse_command("/agent droid"), Some(AgentKind::Droid));
         assert_eq!(parse_command(" /agent Droid "), Some(AgentKind::Droid));
         assert_eq!(

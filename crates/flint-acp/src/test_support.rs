@@ -194,8 +194,38 @@ pub(crate) fn start_agent_with_preferences(
     session_dir: Option<&str>,
     preferred_options: std::collections::BTreeMap<String, String>,
 ) -> (Harness, Fake) {
+    start_agent_fixture(agent, approval, session_dir, preferred_options, None)
+}
+
+pub(crate) fn start_agent_with_saved(
+    agent: AcpAgent,
+    approval: ApprovalMode,
+    saved: crate::saved::Saved,
+) -> (Harness, Fake) {
+    start_agent_fixture(
+        agent,
+        approval,
+        Some("session"),
+        Default::default(),
+        Some(saved),
+    )
+}
+
+fn start_agent_fixture(
+    agent: AcpAgent,
+    approval: ApprovalMode,
+    session_dir: Option<&str>,
+    preferred_options: std::collections::BTreeMap<String, String>,
+    saved: Option<crate::saved::Saved>,
+) -> (Harness, Fake) {
     let dir = tempfile::tempdir().expect("tempdir");
     let workspace = dir.path().canonicalize().expect("canonical");
+    if let Some(saved) = saved {
+        crate::saved::save_saved(
+            &workspace.join(session_dir.expect("saved session directory")),
+            &saved,
+        );
+    }
     let (client_side, agent_side) = tokio::io::duplex(1 << 20);
     let (client_read, client_write) = tokio::io::split(client_side);
     let (agent_read, agent_write) = tokio::io::split(agent_side);
@@ -237,6 +267,13 @@ pub(crate) fn outline(events: &[AgentEvent]) -> Vec<String> {
         .iter()
         .map(|event| match event {
             AgentEvent::TurnStarted { turn_id } => format!("turn {turn_id}"),
+            AgentEvent::TaskUpdated { task, .. } => {
+                format!("task scope {}", task.contract.revision)
+            }
+            AgentEvent::TaskAssessed { task, .. } => format!(
+                "task outcome {}",
+                task.assessment.as_ref().expect("assessed").outcome.label()
+            ),
             AgentEvent::StepStarted { step, .. } => format!("step {step}"),
             AgentEvent::ReasoningDelta(text) => format!("thinking {text}"),
             AgentEvent::TextDelta(text) => format!("text {text}"),

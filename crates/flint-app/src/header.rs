@@ -2,6 +2,7 @@
 //! area) and a few icon actions.
 
 use gpui_kit::assets::IconName;
+use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -12,7 +13,7 @@ use crate::theme::palette;
 use crate::theme::size;
 use crate::ui;
 
-pub const HEADER_HEIGHT: f32 = 54.;
+pub const HEADER_HEIGHT: f32 = 60.;
 
 pub fn render(app: &FlintApp, window: &mut Window, cx: &mut Context<FlintApp>) -> impl IntoElement {
     let p = palette();
@@ -21,11 +22,12 @@ pub fn render(app: &FlintApp, window: &mut Window, cx: &mut Context<FlintApp>) -
     let changes = session.view.changes.len();
     let compact = app.chat_width(f32::from(window.viewport_size().width)) < 640.;
 
-    let icon_button = |id: &'static str, icon: IconName, tip: &'static str, active: bool| {
+    let icon_button = |id: &'static str, icon: IconName, tip: &str, active: bool| {
+        let tip = tip.to_string();
         div()
             .id(id)
             .role(gpui_kit::Role::Button)
-            .aria_label(tip)
+            .aria_label(tip.clone())
             .tab_index(0)
             .focus_visible(|style| style.border_1().border_color(p.accent))
             .size(px(34.))
@@ -36,7 +38,7 @@ pub fn render(app: &FlintApp, window: &mut Window, cx: &mut Context<FlintApp>) -
             .cursor_pointer()
             .when(active, |b| b.bg(p.raised))
             .hover(|style| style.bg(p.raised))
-            .tooltip(move |window, cx| Tooltip::new(tip).build(window, cx))
+            .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
             .child(ui::icon(
                 icon,
                 17.,
@@ -66,28 +68,42 @@ pub fn render(app: &FlintApp, window: &mut Window, cx: &mut Context<FlintApp>) -
                     .truncate()
                     .text_size(px(size::BASE))
                     .font_weight(FontWeight::MEDIUM)
-                    .text_color(ui::tinted(p.text, session.color_seed()))
+                    .text_color(p.text)
                     .tooltip(move |window, cx| Tooltip::new(full_title.clone()).build(window, cx))
                     .child(session.title())
                     .test_support(),
             )
         })
         .when(!compact, |row| {
-            row.child(div().flex_shrink_0().child(ui::label(
-                session.workspace_label(),
-                size::SM,
-                p.text_subtle,
-            )))
-        })
-        .when_some((!compact).then(|| app.branch()).flatten(), |row, branch| {
-            row.child(
+            row.when(has_items, |row| {
+                row.child(ui::label("/", size::SM, p.border_strong))
+            })
+            .child(
                 div()
                     .flex_shrink_0()
                     .flex()
                     .items_center()
-                    .gap(px(3.))
-                    .child(ui::icon(IconName::GitBranch, 11., p.text_subtle))
-                    .child(ui::mono(branch, size::XS, p.text_subtle)),
+                    .gap(px(7.))
+                    .child(ui::icon(
+                        if session.general {
+                            IconName::Sparkles
+                        } else {
+                            IconName::Folder
+                        },
+                        15.,
+                        p.text_subtle,
+                    ))
+                    .child(ui::label(session.workspace_label(), size::SM, p.text_muted)),
+            )
+        })
+        .when_some((!compact).then(|| app.branch()).flatten(), |row, branch| {
+            row.child(
+                Button::new("branch-select")
+                    .ghost()
+                    .icon(IconName::GitBranch)
+                    .label(branch)
+                    .tooltip("Select a local or remote Git branch")
+                    .on_click(cx.listener(|app, _, window, cx| app.open_worktrees(window, cx))),
             )
         });
 
@@ -95,10 +111,41 @@ pub fn render(app: &FlintApp, window: &mut Window, cx: &mut Context<FlintApp>) -
         .flex()
         .items_center()
         .gap(px(2.))
+        .when(compact && app.branch().is_some(), |actions| {
+            actions.child(
+                icon_button(
+                    "header-branches",
+                    IconName::GitBranch,
+                    "Select Git branch",
+                    false,
+                )
+                .on_click(cx.listener(|app, _, window, cx| app.open_worktrees(window, cx))),
+            )
+        })
+        .when(session.view.task.is_some(), |actions| {
+            actions.child(
+                icon_button(
+                    "task-details-current",
+                    IconName::ListTree,
+                    "Task goal, evidence and review",
+                    app.task_panel.is_some(),
+                )
+                .on_click(cx.listener(|app, _, window, cx| app.open_current_task(window, cx))),
+            )
+        })
         .when(!compact, |actions| {
             actions.child(
-                icon_button("reveal", IconName::FolderOpen, "Open in Finder  ⌘⇧R", false)
-                    .on_click(cx.listener(|this, _, _, _| this.reveal_workspace())),
+                icon_button(
+                    "reveal",
+                    IconName::FolderOpen,
+                    &format!(
+                        "Open in {}  {}",
+                        flint_platform::desktop::FILE_MANAGER,
+                        crate::shortcuts::label("⌘⇧R")
+                    ),
+                    false,
+                )
+                .on_click(cx.listener(|this, _, _, _| this.reveal_workspace())),
             )
         })
         .when(!compact, |actions| {
@@ -106,7 +153,7 @@ pub fn render(app: &FlintApp, window: &mut Window, cx: &mut Context<FlintApp>) -
                 icon_button(
                     "header-terminal",
                     IconName::SquareTerminal,
-                    "Terminal  ⌃`",
+                    &crate::shortcuts::label("Terminal  ⌃`"),
                     app.terminal.open,
                 )
                 .on_click(cx.listener(|this, _, window, cx| this.toggle_terminal(window, cx))),
@@ -119,7 +166,7 @@ pub fn render(app: &FlintApp, window: &mut Window, cx: &mut Context<FlintApp>) -
                     icon_button(
                         "changes",
                         IconName::FileDiff,
-                        "Changes panel  ⌘J",
+                        &crate::shortcuts::label("Changes panel  ⌘J"),
                         app.changes_open,
                     )
                     .on_click(cx.listener(|this, _, _, cx| {
@@ -144,7 +191,10 @@ pub fn render(app: &FlintApp, window: &mut Window, cx: &mut Context<FlintApp>) -
         .id("header")
         .h(px(HEADER_HEIGHT))
         .flex_shrink_0()
-        .px(px(20.))
+        .px(px(28.))
+        .bg(p.bg)
+        .border_b_1()
+        .border_color(p.border.opacity(0.6))
         .flex()
         .items_center()
         .justify_between()

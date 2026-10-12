@@ -1,0 +1,83 @@
+<!doctype html><html lang="en"><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Hooter · Orchestrator evidence</title><style>
+:root{color-scheme:light dark;--bg:#f5f3ee;--ink:#24231f;--line:#c8c5bb;--accent:#7d4b19}
+@media(prefers-color-scheme:dark){:root{--bg:#171713;--ink:#efede3;--line:#444439;--accent:#e4b76d}}
+*{box-sizing:border-box}body{background:var(--bg);color:var(--ink);font:16px/1.6 system-ui;
+max-width:1180px;margin:40px auto;padding:0 24px}h1{font:700 clamp(32px,5vw,52px)/1.08 Georgia;
+max-width:760px}h2{margin-top:36px}a{color:var(--accent)}.eyebrow{color:var(--accent);
+text-transform:uppercase;letter-spacing:.12em;font-size:12px}.note{border-left:4px solid
+var(--accent);padding:12px 20px}.metrics{display:grid;grid-template-columns:repeat(auto-fit,
+minmax(190px,1fr));gap:16px}.metric{border:1px solid var(--line);padding:16px}
+.metric strong{display:block;font-size:30px}table{border-collapse:collapse;width:100%;
+font-size:14px}th,td{padding:10px;text-align:left;border-bottom:1px solid var(--line)}
+.scroll{overflow:auto}code,small{overflow-wrap:anywhere}p{max-width:85ch}
+</style><p class="eyebrow">Hooter / Native orchestrator / Evidence, 2026-10-10</p>
+<h1>Completion checks, without the loop.</h1>
+<p>Direct Bun checks now count as verification; output-masking wrappers do not. Analysis-only requests leave files unchanged. The new live pilot confirmed Bun recovery paths but stopped at its conservative budget, so incomplete trials stay visible.</p>
+<div class="metrics"><div class="metric"><strong>30</strong>baseline attempts</div>
+<div class="metric"><strong>2/2</strong>earlier Python live probes</div>
+<div class="metric"><strong>48/48</strong>final offline scenarios</div>
+<div class="metric"><strong>306 + 133</strong>agent + harness tests passed</div></div>
+
+<h2>New: Bun checks and analysis-only requests</h2>
+<p><strong>3/7 raw live records passed;
+6 received model execution, of 9 planned.</strong>
+3 executed records were budget-censored. Independent artifacts:
+5/6. Interrupted records stay in raw totals and are not fair quality failures.
+No live analysis result is claimed if it received no model execution.</p><p>
+Real Bun tests, TypeScript compilation, and read-only file integrity were evaluated.
+Each case was scheduled once per variant; this small, capped sample cannot rank policies.</p>
+<div class="scroll"><table><thead><tr><th>Case</th><th>Variant</th><th>Pipeline</th>
+<th>Outcome</th><th>Edits</th><th>Finish nudges</th><th>Independent grade</th>
+<th>Hidden + visible tests</th></tr></thead>
+<tbody><tr><td>bun-mask-recovery</td><td>single</td><td>PASS</td><td>needs_review</td><td>1</td><td>0</td><td>PASS</td><td>4</td></tr><tr><td>bun-mask-recovery</td><td>delegated-gemini-judge</td><td>CAPPED</td><td>partial</td><td>1</td><td>0</td><td>PASS</td><td>4</td></tr><tr><td>bun-mask-recovery</td><td>delegated</td><td>PASS</td><td>needs_review</td><td>1</td><td>0</td><td>PASS</td><td>4</td></tr><tr><td>bun-typescript</td><td>delegated</td><td>PASS</td><td>needs_review</td><td>1</td><td>0</td><td>PASS</td><td>4</td></tr><tr><td>bun-typescript</td><td>delegated-gemini-judge</td><td>CAPPED</td><td>partial</td><td>1</td><td>0</td><td>PASS</td><td>4</td></tr><tr><td>bun-typescript</td><td>single</td><td>CAPPED</td><td>partial</td><td>0</td><td>0</td><td>FAIL</td><td>4</td></tr><tr><td>analysis-gaps</td><td>delegated-gemini-judge</td><td>CAPPED</td><td>partial</td><td>0</td><td>0</td><td>PASS</td><td>None</td></tr></tbody></table></div>
+<p>The masked-check case begins with failing tests behind <code>2&gt;&amp;1 | tail -5</code>.
+Its zero wrapper exit is not credited. A direct failed check, an actual fix, and both current
+<code>bun run typecheck</code> and <code>bun test</code> passes are required.
+Protected test/config files stay intact; each Bun grader runs at least four tests.</p>
+<p>The exact “analyze this for improvements and gaps to fix” request runs read-only, with
+zero edits and unchanged files. Recommendations are checked for the known fixture findings
+(trim, uppercase, tests), not comprehensively judged for natural-language quality.
+Analysis ends Needs review without an unnecessary verification requirement.
+Explicit “and please fix” still authorizes implementation.</p>
+<p>Hooter now asks for direct checks, explains rejected wrappers in command output, and stops
+an identical finish follow-up early when no actual edit, current check, completed plan step
+or usable child result changed. It does not raise the continuation cap or auto-accept work.</p>
+<p>Separate, explicitly authorized quota: 73/120 calls and
+285,146/300,000 tokens. Subscription-only routing remains
+pinned and attested; no paid fallback. Installed Bun/compiler hashes are checked before and
+after. Earlier frozen pilot evidence below is historical, not a pre-fix Bun A/B.</p>
+<p><a href="../../blueprint-out/orchestrator-1791668670-76a21043/report.json">Fresh workflow evidence, commands, grades and route receipts</a></p><p>45 scoped headless task-outcome UI tests passed.
+<a href="../../blueprint-out/bun-final-validation.3BwYYF/ui-task-tests.log">Native task/queue/review UI evidence</a>.
+The full UI suite was stopped at an unrelated, CPU-heavy 140-conversation markdown-cache test;
+no full-suite pass or native interactive-session validation is claimed.</p>
+<h2>Historical Python baseline</h2><div class="scroll"><table><thead><tr><th>Variant</th>
+<th>Raw pipeline</th><th>Artifact grade</th><th>Host-held passes</th><th>Censored</th>
+<th>Calls</th></tr></thead><tbody><tr><td>single</td><td>9/10</td><td>8/8</td><td>1</td><td>0</td><td>136</td></tr><tr><td>delegated</td><td>7/10</td><td>8/8</td><td>3</td><td>0</td><td>155</td></tr><tr><td>delegated-gemini-judge</td><td>6/10</td><td>7/8</td><td>3</td><td>1</td><td>161</td></tr></tbody></table></div>
+<p class="note">Censored: parallel-changes-1-delegated-gemini-judge. Global reservations
+were denied before forwarding. Keep this failed attempt in raw pipeline totals, but do not
+interpret it as a fair model-quality failure or rank the three policies from this small sample.
+Correct blocked scenarios are not shipped artifacts. This historical column counts only
+global-reservation denials; the new feature table labels local token cutoffs too.</p>
+<h2>Earlier repair: Python compiler-only recovery</h2><p>An optional Python inline check failed to compile. The engine retained
+that failed command even after a corrected check and current unittest verification passed.
+The fix requires both a statically invalid simple invocation and matching compiler diagnostics,
+followed by a newer current passing check. Failed evidence stays visible. Semantic failures and
+user-specified commands remain blocking. Acceptance, child presets and approvals are unchanged.</p>
+<p>The live probes had no finish nudges, but did not repeat the malformed command. They are not
+a causal A/B result. The saved failing task snapshot supplies the deterministic regression.</p>
+<h2>Earlier pilot limits and quota</h2><p>Historical cumulative budget debit: 487 calls,
+1,954,788 tokens, including the conservative routing-probe debit.
+Only Antigravity Gemini subscription routing was requested. No paid fallback was authorized.
+Exact billing is unavailable. The Gemini judge is experimental, not calibrated Typesafe JEV.</p>
+<p>B1 durable acceptance does not execute provider jobs. This tests native sessions and subagents.
+One Rust test remains ignored. Native UI was not rerun in that historical pass.
+Current scoped UI evidence, when supplied, is shown above. Other-platform runtime checks remain untested.</p>
+<h2>Raw evidence and reproduction</h2><ul>
+<li><a href="../../blueprint-out/orchestrator-1791662003-f455ed28/report.json">Frozen baseline, with batch provenance</a></li>
+<li><a href="../../blueprint-out/orchestrator-1791662692-59822cfb/report.json">Post-fix live probes</a></li><li><a href="../../blueprint-out/orchestrator-1791668618-4442f01d/report.json">Final-source offline pilot</a></li>
+<li><a href="../../blueprint-out/bun-final-validation.3BwYYF/evidence-final-validation.log">Unit tests, Clippy and release-build output</a></li>
+<li><a href="../ORCHESTRATOR-EVAL.md">Commands, scoring, safeguards and findings</a></li>
+</ul><p>Each raw report records its own source and binary hashes. Baseline and post-fix engine
+versions differ; later user-command protection was tested on the final source offline.</p></html>

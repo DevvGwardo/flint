@@ -1,4 +1,4 @@
-//! Workspace and sidebar actions on the root view: opening folders, Finder
+//! Workspace and sidebar actions on the root view: opening folders, a file manager
 //! and Terminal, command-card actions, and the sidebar's search/filter.
 
 use gpui_kit::*;
@@ -32,7 +32,7 @@ impl FlintApp {
             return;
         };
         let terminal_id = call.terminal_id.clone();
-        let command = command_text(call);
+        let command = terminal_command_text(call);
         if let Some(id) = terminal_id {
             let uid = self.session().uid;
             if self.show_agent_terminal(uid, &id, window, cx) {
@@ -74,21 +74,14 @@ impl FlintApp {
         .detach();
     }
 
-    /// Opens the active session's workspace in Finder.
+    /// Opens the active session's workspace in the platform's file manager.
     pub(crate) fn reveal_workspace(&self) {
-        std::process::Command::new("open")
-            .arg(&self.session().workspace)
-            .spawn()
-            .ok();
+        flint_platform::desktop::open_directory(&self.session().workspace).ok();
     }
 
     /// Opens a Terminal window in the active session's workspace.
     pub(crate) fn open_terminal(&self) {
-        std::process::Command::new("open")
-            .args(["-a", "Terminal"])
-            .arg(&self.session().workspace)
-            .spawn()
-            .ok();
+        flint_platform::desktop::open_terminal(&self.session().workspace).ok();
     }
 
     pub fn set_filter(&mut self, filter: SessionFilter, cx: &mut Context<Self>) {
@@ -217,20 +210,19 @@ impl BucketCounts {
 /// The shell command behind a command card: its arguments when they carry
 /// one (flint's own agent and [CC] both do), else the summary shown.
 pub(crate) fn command_text(call: &ToolCall) -> String {
-    let command = ["command", "cmd", "script"]
-        .iter()
-        .find_map(|key| {
-            call.args
-                .get(*key)
-                .and_then(|value| value.as_str())
-                .filter(|text| !text.trim().is_empty())
-        })
-        .or_else(|| call.args.as_str())
-        .unwrap_or(&call.summary);
+    let command = raw_command(call);
     if let Some(args) = call.args.get("args").and_then(serde_json::Value::as_array)
-        && !args.is_empty()
         && args.iter().all(|arg| arg.is_string())
     {
+        #[cfg(windows)]
+        {
+            return std::iter::once(command)
+                .chain(args.iter().filter_map(serde_json::Value::as_str))
+                .map(flint_platform::quote_windows_arg)
+                .collect::<Vec<_>>()
+                .join(" ");
+        }
+        #[cfg(not(windows))]
         return std::iter::once(command)
             .chain(args.iter().filter_map(serde_json::Value::as_str))
             .map(shell_word)
@@ -240,6 +232,64 @@ pub(crate) fn command_text(call: &ToolCall) -> String {
     command.to_string()
 }
 
+fn raw_command(call: &ToolCall) -> &str {
+    ["command", "cmd", "script"]
+        .iter()
+        .find_map(|key| {
+            call.args
+                .get(*key)
+                .and_then(|value| value.as_str())
+                .filter(|text| !text.trim().is_empty())
+        })
+        .or_else(|| call.args.as_str())
+        .unwrap_or(&call.summary)
+}
+
+fn terminal_command_text(call: &ToolCall) -> String {
+    #[cfg(windows)]
+    if let Some(args) = call.args.get("args").and_then(serde_json::Value::as_array)
+        && args.iter().all(|arg| arg.is_string())
+    {
+        // Do not run literal argv through cmd expansion or PowerShell 5's
+        // lossy native-argument binder. Keep expanded cards human-readable;
+        // only the editable terminal prompt gets the encoded invocation.
+        use base64::Engine as _;
+        let program = raw_command(call);
+        let quote = |word: &str| format!("'{}'", word.replace('\'', "''"));
+        let batch = std::path::Path::new(program)
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("cmd") || ext.eq_ignore_ascii_case("bat"));
+        let script = if batch {
+            // Batch programs necessarily retain their own shell semantics.
+            let words = std::iter::once(program)
+                .chain(args.iter().filter_map(serde_json::Value::as_str))
+                .map(quote)
+                .collect::<Vec<_>>()
+                .join(" ");
+            format!("$ErrorActionPreference = 'Stop'; & {words}; exit $LASTEXITCODE")
+        } else {
+            let arguments = args
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .map(flint_platform::quote_windows_arg)
+                .collect::<Vec<_>>()
+                .join(" ");
+            format!(
+                "$ErrorActionPreference = 'Stop'; $info = New-Object System.Diagnostics.ProcessStartInfo; $info.FileName = {}; $info.Arguments = {}; $info.UseShellExecute = $false; $child = [System.Diagnostics.Process]::Start($info); $child.WaitForExit(); exit $child.ExitCode",
+                quote(program),
+                quote(&arguments)
+            )
+        };
+        let bytes: Vec<u8> = script.encode_utf16().flat_map(u16::to_le_bytes).collect();
+        return format!(
+            "powershell.exe -NoLogo -NoProfile -EncodedCommand {}",
+            base64::engine::general_purpose::STANDARD.encode(bytes)
+        );
+    }
+    command_text(call)
+}
+
+#[cfg(not(windows))]
 fn shell_word(word: &str) -> String {
     if !word.is_empty()
         && word
@@ -254,7 +304,7 @@ fn shell_word(word: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::command_text;
+    use super::{command_text, terminal_command_text};
     use crate::view_model::{Item, SessionView};
 
     #[test]
@@ -283,7 +333,109 @@ mod tests {
             let Item::Tool(call) = view.items.last().unwrap() else {
                 panic!("tool row")
             };
+            #[cfg(not(windows))]
             assert_eq!(command_text(call), expected);
+            #[cfg(windows)]
+            if call.args.get("args").is_some() {
+                use base64::Engine as _;
+                assert_eq!(
+                    command_text(call),
+                    "\"printf\" \"%s\" \"hi; echo wrong\" \"\" \"a'b\" \"$HOME\""
+                );
+                let typed = terminal_command_text(call);
+                let encoded = typed
+                    .strip_prefix("powershell.exe -NoLogo -NoProfile -EncodedCommand ")
+                    .unwrap();
+                let bytes = base64::engine::general_purpose::STANDARD
+                    .decode(encoded)
+                    .unwrap();
+                let units: Vec<u16> = bytes
+                    .chunks_exact(2)
+                    .map(|b| u16::from_le_bytes([b[0], b[1]]))
+                    .collect();
+                assert_eq!(
+                    String::from_utf16(&units).unwrap(),
+                    "$ErrorActionPreference = 'Stop'; $info = New-Object System.Diagnostics.ProcessStartInfo; $info.FileName = 'printf'; $info.Arguments = '\"%s\" \"hi; echo wrong\" \"\" \"a''b\" \"$HOME\"'; $info.UseShellExecute = $false; $child = [System.Diagnostics.Process]::Start($info); $child.WaitForExit(); exit $child.ExitCode"
+                );
+            } else {
+                assert_eq!(command_text(call), expected);
+            }
+            #[cfg(not(windows))]
+            assert_eq!(terminal_command_text(call), expected);
         }
+    }
+
+    #[test]
+    fn empty_argument_vectors_still_quote_the_executable() {
+        let mut view = SessionView::default();
+        view.fold(
+            flint_agent::AgentEvent::ToolCallStarted {
+                call_id: "empty".into(),
+                name: "execute".into(),
+                kind: flint_agent::ToolKind::Command,
+                summary: "literal executable".into(),
+                args: serde_json::json!({"command":"program with spaces.exe","args":[]}),
+            },
+            std::time::Duration::ZERO,
+        );
+        let Item::Tool(call) = &view.items[0] else {
+            panic!("tool row")
+        };
+        assert_eq!(
+            command_text(call),
+            if cfg!(windows) {
+                "\"program with spaces.exe\""
+            } else {
+                "'program with spaces.exe'"
+            }
+        );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_terminal_replay_preserves_native_argv_without_expansion() {
+        let arguments = [
+            "",
+            "%PATH%",
+            "a& echo injected",
+            "a\"b",
+            r"a\",
+            "a'b",
+            "$HOME",
+        ];
+        let mut args = vec![
+            "-c".to_string(),
+            "import json, sys; print(json.dumps(sys.argv[1:]))".into(),
+        ];
+        args.extend(arguments.map(str::to_string));
+        let mut view = SessionView::default();
+        view.fold(
+            flint_agent::AgentEvent::ToolCallStarted {
+                call_id: "replay".into(),
+                name: "execute".into(),
+                kind: flint_agent::ToolKind::Command,
+                summary: "literal argv".into(),
+                args: serde_json::json!({"command":"python","args":args}),
+            },
+            std::time::Duration::ZERO,
+        );
+        let Item::Tool(call) = &view.items[0] else {
+            panic!("tool row")
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let output = flint_platform::shell_command(&terminal_command_text(call))
+            .current_dir(dir.path())
+            .output()
+            .await
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            serde_json::from_slice::<Vec<String>>(&output.stdout).unwrap(),
+            arguments
+        );
     }
 }

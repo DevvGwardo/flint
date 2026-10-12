@@ -91,6 +91,7 @@ where
     let (interrupts, _) = tokio::sync::watch::channel(0u64);
     let on_interrupt = interrupts.clone();
     let incoming = ctx.ops;
+    let intake = incoming.clone();
     let op_bridge = tokio::spawn(async move {
         while let Ok(op) = incoming.recv().await {
             let stopping = matches!(op, Op::Shutdown);
@@ -115,6 +116,7 @@ where
         agent: ctx.agent.clone(),
         workspace: ctx.workspace.clone(),
         events: ctx.events.clone(),
+        intake,
         stderr: Arc::clone(&ctx.stderr),
         mapper: Mutex::new(
             Mapper::new(&ctx.workspace, saved.as_ref().map_or(0, |s| s.turn_id))
@@ -314,6 +316,7 @@ where
             Ok(())
         })
         .await;
+    shared.intake.close();
     op_bridge.abort();
     shared.cancel_pending();
     shared.terminals.shutdown();

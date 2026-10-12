@@ -152,13 +152,9 @@ impl Live {
                     }
                     // The provider's reported model belongs to this saved
                     // conversation too, not just future-session defaults.
-                    for model in self
-                        .shared
-                        .options()
-                        .list
-                        .iter()
-                        .filter(|option| option.category.as_deref() == Some("model"))
-                    {
+                    for model in self.shared.options().list.iter().filter(|option| {
+                        option.category.as_deref() == Some("model") || option.id == "model"
+                    }) {
                         self.chosen.insert(model.id.clone(), model.current.clone());
                     }
                 }
@@ -197,13 +193,18 @@ impl Live {
             let options = self.shared.options();
             let supported = options.get(id).is_some_and(|option| {
                 (matches!(option.category.as_deref(), Some("model" | "provider"))
-                    || option.id == "provider")
+                    || matches!(option.id.as_str(), "model" | "provider"))
                     && option.choices.iter().any(|choice| choice.value == *value)
             });
             if !supported {
+                let recovery = if options.get(id).is_none() {
+                    "Selecting an available model/provider will replace this unavailable saved slot with the agent's current identity."
+                } else {
+                    "Choose an available value before sending a prompt."
+                };
                 self.shared.emit_all(vec![AgentEvent::Error(format!(
-                    "{} no longer offers the saved model/provider setting {id} = {value}. Choose an available value before sending a prompt.",
-                    self.shared.agent.name()
+                    "{} no longer offers the saved model/provider setting {id} = {value}. {recovery}",
+                    self.shared.agent.name(),
                 ))]);
                 return false;
             }
@@ -284,7 +285,11 @@ impl Live {
         if !self.identity_ready
             && matches!(
                 op,
-                Some(Op::UserMessage(_) | Op::UserMessageWithImages { .. })
+                Some(
+                    Op::UserMessage(_)
+                        | Op::UserMessageWithImages { .. }
+                        | Op::UserMessageWithContext { .. }
+                )
             )
         {
             self.shared.emit_all(vec![AgentEvent::Error(
@@ -295,6 +300,21 @@ impl Live {
         match op {
             Some(Op::UserMessage(text)) => Next::Prompt(text, Vec::new()),
             Some(Op::UserMessageWithImages { text, images }) => Next::Prompt(text, images),
+            Some(Op::UserMessageWithContext {
+                text,
+                images,
+                steering_id: None,
+                ..
+            }) => Next::Prompt(text, images),
+            Some(Op::UserMessageWithContext {
+                steering_id: Some(_),
+                ..
+            }) => {
+                self.shared.emit_all(vec![AgentEvent::Error(
+                    "In-turn steering is only available for Flint's native agent.".into(),
+                )]);
+                Next::Continue
+            }
             Some(Op::SteerMessage { .. }) => {
                 self.shared.emit_all(vec![AgentEvent::Error(
                     "In-turn steering is only available for Flint's native agent.".into(),
@@ -308,14 +328,21 @@ impl Live {
             Some(Op::SetSessionOption { id, value }) => {
                 let identity = self.shared.options().get(&id).is_some_and(|option| {
                     matches!(option.category.as_deref(), Some("model" | "provider"))
-                        || option.id == "provider"
+                        || matches!(option.id.as_str(), "model" | "provider")
                 });
                 if self.set_option(&id, &value).await && !self.identity_ready && identity {
                     let mut preferred = self.identity_choices.clone();
+                    // Only an explicit, successful user identity choice may
+                    // replace a slot the adapter no longer exposes at all.
+                    let options = self.shared.options();
+                    preferred.retain(|key, _| options.get(key).is_some());
+                    self.chosen.retain(|key, _| options.get(key).is_some());
                     preferred.insert(id, value);
                     // Fixing the model alone must not release prompts while
                     // a requested provider (or another identity slot) is invalid.
-                    self.restore_preferences(&preferred).await;
+                    if self.restore_preferences(&preferred).await {
+                        self.save();
+                    }
                 }
                 Next::Continue
             }
@@ -329,7 +356,13 @@ impl Live {
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 Next::Continue
             }
-            Some(Op::SetReasoningEffort(_)) => Next::Continue,
+            Some(Op::SetReasoningEffort(_) | Op::SetJev(_)) => Next::Continue,
+            Some(Op::EditTask(_) | Op::ReviewTask(_) | Op::ContinueTask { .. }) => {
+                self.shared.emit_all(vec![AgentEvent::Error(
+                    "Native task controls cannot govern this external agent's loop. Review its result in the app or send an explicit follow-up.".into(),
+                )]);
+                Next::Continue
+            }
             Some(Op::Shutdown) | None => Next::Stop,
         }
     }
@@ -366,6 +399,17 @@ impl Live {
         let opening = shared.with_mapper(Mapper::start_turn).unwrap_or_default();
         let turn_id = shared.with_mapper(|m| m.turn_id()).unwrap_or(0);
         shared.emit_all(opening);
+        let mut task = flint_agent::TaskRecord::unverified(
+            turn_id,
+            text.clone(),
+            TurnEndReason::Completed,
+            flint_agent::TaskSource::External,
+        );
+        task.assessment = None;
+        shared.emit_all(vec![AgentEvent::TaskUpdated {
+            turn_id,
+            task: Box::new(task.clone()),
+        }]);
         self.save();
 
         let cx = self.cx.clone();
@@ -399,6 +443,10 @@ impl Live {
                 op = ops.recv(), if keep_going => match op {
                     Ok(Op::UserMessage(text)) => queue.push_back((text, Vec::new())),
                     Ok(Op::UserMessageWithImages { text, images }) => queue.push_back((text, images)),
+                    Ok(Op::UserMessageWithContext { text, images, steering_id:None, .. }) => queue.push_back((text, images)),
+                    Ok(Op::UserMessageWithContext { steering_id:Some(_), .. }) => self.shared.emit_all(vec![AgentEvent::Error(
+                        "In-turn steering is only available for Flint's native agent.".into(),
+                    )]),
                     Ok(Op::SteerMessage { .. }) => self.shared.emit_all(vec![AgentEvent::Error(
                         "In-turn steering is only available for Flint's native agent.".into(),
                     )]),
@@ -413,7 +461,10 @@ impl Live {
                             self.set_option(&id, &value).await;
                         }
                     }
-                    Ok(Op::SetReasoningEffort(_)) => {}
+                    Ok(Op::SetReasoningEffort(_) | Op::SetJev(_)) => {}
+                    Ok(Op::EditTask(_) | Op::ReviewTask(_) | Op::ContinueTask { .. }) => self.shared.emit_all(vec![AgentEvent::Error(
+                        "Native task controls cannot govern this external agent's loop.".into(),
+                    )]),
                     Ok(Op::UndoLastTurn) => self.undo_unavailable(),
                     Ok(Op::Interrupt) => {
                         shared.interrupts_seen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -488,6 +539,22 @@ impl Live {
                     .unwrap_or_default(),
             ),
         };
+        task = flint_agent::TaskRecord::unverified(
+            turn_id,
+            task.contract.original_request,
+            reason.clone(),
+            flint_agent::TaskSource::External,
+        );
+        closing.push(AgentEvent::TaskAssessed {
+            turn_id,
+            task: Box::new(task),
+        });
+        if !keep_going {
+            // The UI may dispatch as soon as it sees TurnFinished. Close the
+            // public bridge as well as the loop inbox before that notification.
+            shared.intake.close();
+            ops.close();
+        }
         closing.push(AgentEvent::TurnFinished { turn_id, reason });
         shared.emit_all(closing);
         self.save();

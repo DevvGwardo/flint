@@ -24,6 +24,133 @@ fn options(model: &str, effort: &str) -> Value {
 }
 
 #[tokio::test]
+async fn a_user_model_selection_can_replace_a_disappeared_saved_provider_slot() {
+    let (harness, mut fake) = crate::test_support::start_agent_with_preferences(
+        AcpAgent::Droid,
+        ApprovalMode::Auto,
+        Some("session"),
+        [
+            ("provider".into(), "removed-provider".into()),
+            ("model".into(), "gpt-6-sol".into()),
+        ]
+        .into(),
+    );
+    harness
+        .send(Op::UserMessage("must remain blocked".into()))
+        .await;
+    fake.handshake_with_options(options("gpt-6-sol", "high"))
+        .await;
+    harness.until(|event| matches!(event, AgentEvent::Error(message) if message.contains("no longer offers"))).await;
+    harness.until(|event| matches!(event, AgentEvent::Error(message) if message.contains("No prompt was sent"))).await;
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(20), fake.recv())
+            .await
+            .is_err()
+    );
+    harness
+        .send(Op::SetSessionOption {
+            id: "model".into(),
+            value: "claude-sonnet-4-6".into(),
+        })
+        .await;
+    let change = fake.expect("session/set_config_option").await;
+    fake.respond(
+        &change,
+        json!({"configOptions":options("claude-sonnet-4-6","high")}),
+    )
+    .await;
+    harness
+        .send(Op::UserMessage(
+            "retry with the explicitly selected current identity".into(),
+        ))
+        .await;
+    let prompt = fake.expect("session/prompt").await;
+    assert_eq!(
+        prompt["params"]["prompt"][0]["text"],
+        "retry with the explicitly selected current identity"
+    );
+    let saved = crate::saved::load_saved(&harness.workspace.join("session")).unwrap();
+    assert!(!saved.options.contains_key("provider"));
+    assert_eq!(saved.options["model"], "claude-sonnet-4-6");
+    fake.respond(&prompt, json!({"stopReason":"end_turn"}))
+        .await;
+    harness.next_turn().await;
+    harness.send(Op::Shutdown).await;
+}
+
+#[tokio::test]
+async fn recovered_identity_is_durable_when_the_user_quits_before_prompting() {
+    use crate::saved::{Saved, load_saved};
+    use crate::test_support::start_agent_with_saved;
+    let saved = Saved {
+        agent: "droid".into(),
+        session_id: "earlier".into(),
+        turn_id: 7,
+        options: [
+            ("provider".into(), "removed-provider".into()),
+            ("model".into(), "gpt-6-sol".into()),
+        ]
+        .into(),
+    };
+    let (harness, mut fake) = start_agent_with_saved(AcpAgent::Droid, ApprovalMode::Auto, saved);
+    fake.handshake_with_options(options("gpt-6-sol", "high"))
+        .await;
+    harness.until(|event| matches!(event,AgentEvent::Error(message) if message.contains("no longer offers"))).await;
+    harness
+        .send(Op::SetSessionOption {
+            id: "model".into(),
+            value: "claude-sonnet-4-6".into(),
+        })
+        .await;
+    let change = fake.expect("session/set_config_option").await;
+    fake.respond(
+        &change,
+        json!({"configOptions":options("claude-sonnet-4-6","high")}),
+    )
+    .await;
+    harness
+        .until(|event| {
+            matches!(event,AgentEvent::SessionOptions(list)
+        if list.iter().any(|option|option.id=="model" && option.current=="claude-sonnet-4-6"))
+        })
+        .await;
+    harness.send(Op::Shutdown).await;
+    fake.closed().await;
+    let recovered = load_saved(&harness.workspace.join("session")).unwrap();
+    assert!(
+        !recovered.options.contains_key("provider"),
+        "quitting must not restore the removed slot"
+    );
+    assert_eq!(recovered.options["model"], "claude-sonnet-4-6");
+    assert_eq!(recovered.turn_id, 7);
+    let (reopened, mut next_fake) =
+        start_agent_with_saved(AcpAgent::Droid, ApprovalMode::Auto, recovered);
+    reopened
+        .send(Op::UserMessage(
+            "use the confirmed repaired identity".into(),
+        ))
+        .await;
+    next_fake
+        .handshake_with_options(options("gpt-6-sol", "high"))
+        .await;
+    let change = next_fake.expect("session/set_config_option").await;
+    assert_eq!(change["params"]["value"], "claude-sonnet-4-6");
+    next_fake
+        .respond(
+            &change,
+            json!({"configOptions":options("claude-sonnet-4-6","high")}),
+        )
+        .await;
+    let prompt = next_fake.expect("session/prompt").await;
+    next_fake
+        .respond(&prompt, json!({"stopReason":"end_turn"}))
+        .await;
+    reopened.next_turn().await;
+    reopened.send(Op::Shutdown).await;
+    next_fake.closed().await;
+}
+
+#[tokio::test]
 async fn preferred_model_is_confirmed_before_a_queued_first_prompt() {
     let (harness, mut fake) = crate::test_support::start_agent_with_preferences(
         AcpAgent::Droid,

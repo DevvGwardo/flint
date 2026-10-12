@@ -66,13 +66,17 @@ pub struct Session {
     pub first_token: Option<Duration>,
     /// Time from sending to the first answer text.
     pub first_text: Option<Duration>,
-    /// The last message as shown and as sent (with attachments), for Retry.
-    pub last_message: Option<(String, String, Vec<flint_agent::ImageAttachment>)>,
+    /// Preserve the request and operation, never reconstruct Retry authority
+    /// from the transcript's attachment labels or shortened continue text.
+    pub last_message: Option<RetryRequest>,
     pub prompt_queue: crate::prompt_queue::Queue,
     pub queue_scroll: ScrollHandle,
     /// An accepted prompt is waiting for TurnStarted, or a steering ack.
     pub prompt_pending: bool,
     pub steering_pending: Option<u64>,
+    /// Prevent a stopped engine or archive from racing a saved-task writer,
+    /// even if the task sheet is dismissed while the write runs.
+    pub(crate) task_update_pending: Option<TaskWrite>,
     /// Failed UI writes are retained in order and retried before archiving.
     pub(crate) pending_records: VecDeque<Logged>,
     pub(crate) event_writer: Option<store::EventWriter>,
@@ -80,10 +84,24 @@ pub struct Session {
     /// Shutdown has been requested; submissions and retries must wait.
     pub stopping: bool,
     pub(crate) history_save_failed: bool,
+    pub(crate) native_history_conflict: bool,
     pub(crate) engine_shutdown_verified: bool,
     /// Every edit this session, oldest first: (turn index, diff).
     diff_log: Vec<(usize, Arc<FileDiff>)>,
     pub(crate) changes_task: Option<Task<()>>,
+}
+
+#[derive(Clone)]
+pub enum RetryRequest {
+    Prompt(crate::prompt_queue::Prompt),
+    Continue { task_id: u64, revision: u64 },
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TaskWrite {
+    Engine,
+    Stopped,
+    Restore,
 }
 
 /// The sidebar's live status glyph for a session.
@@ -94,6 +112,9 @@ pub enum Status {
     Starting,
     Running,
     NeedsApproval,
+    /// Reading an unresolved result does not make it accepted work.
+    NeedsReview,
+    Blocked,
     /// The last turn failed, hit the step limit, or the agent could not
     /// start. Needs you until `seen`.
     Failed {
@@ -147,9 +168,11 @@ impl Bucket {
 impl Status {
     pub fn bucket(self) -> Bucket {
         match self {
-            Status::NeedsApproval | Status::Unread | Status::Failed { seen: false } => {
-                Bucket::NeedsYou
-            }
+            Status::NeedsApproval
+            | Status::NeedsReview
+            | Status::Blocked
+            | Status::Unread
+            | Status::Failed { seen: false } => Bucket::NeedsYou,
             Status::Running | Status::Starting => Bucket::Working,
             Status::Done | Status::Stopped | Status::Failed { seen: true } => Bucket::Ready,
             Status::Idle => Bucket::Inactive,
@@ -201,11 +224,13 @@ impl Session {
             queue_scroll: ScrollHandle::new(),
             prompt_pending: false,
             steering_pending: None,
+            task_update_pending: None,
             pending_records: VecDeque::new(),
             event_writer: None,
             persistence_task: None,
             stopping: false,
             history_save_failed: false,
+            native_history_conflict: false,
             engine_shutdown_verified: true,
             diff_log: Vec::new(),
             changes_task: None,
@@ -304,6 +329,19 @@ impl Session {
             Status::Starting
         } else if self.failure_text().is_some() {
             Status::Failed { seen: !self.unread }
+        } else if self
+            .view
+            .task
+            .as_ref()
+            .is_some_and(|task| task.assessment.is_some())
+            && self.view.outcome() == flint_agent::TaskOutcome::Blocked
+        {
+            Status::Blocked
+        } else if !self.view.turns.is_empty()
+            && !self.view.outcome().allows_queue()
+            && self.view.last_reason != Some(TurnEndReason::Interrupted)
+        {
+            Status::NeedsReview
         } else if self.unread {
             Status::Unread
         } else if self.view.last_reason == Some(TurnEndReason::Interrupted) {
@@ -328,6 +366,13 @@ impl Session {
         match &self.view.last_reason {
             Some(TurnEndReason::Failed(error)) => Some(error),
             Some(TurnEndReason::StepLimit) => Some("stopped at the step limit"),
+            Some(TurnEndReason::ContinuationLimit) => Some(
+                self.view
+                    .task
+                    .as_ref()
+                    .and_then(|task| task.continuation_stop.as_ref())
+                    .map_or("automatic follow-ups stopped", |stop| stop.label()),
+            ),
             _ => None,
         }
     }
@@ -370,6 +415,7 @@ impl Session {
                 streaming: true, ..
             }) => "Writing…".to_string(),
             Some(Item::Nudge { .. }) => "Checking its work…".to_string(),
+            Some(Item::Jev { .. }) => "Checking its work…".to_string(),
             _ => "Working…".to_string(),
         }
     }
@@ -403,6 +449,18 @@ impl Session {
         }
         match self.status() {
             Status::NeedsApproval => (approval_line(&self.view.items), Tone::Warning),
+            Status::NeedsReview => (self.view.outcome().label().into(), Tone::Warning),
+            Status::Blocked => (
+                self.view
+                    .task
+                    .as_ref()
+                    .and_then(|task| task.blockers.first())
+                    .map_or_else(
+                        || "Blocked".into(),
+                        |blocker| format!("Blocked: {}", crate::ui::one_line(&blocker.text)),
+                    ),
+                Tone::Warning,
+            ),
             Status::Starting => (format!("Starting {}…", self.agent.label()), Tone::Muted),
             Status::Running => {
                 let mut text = self.activity();
@@ -421,9 +479,13 @@ impl Session {
                 Some(files) => (format!("Stopped · {files}"), Tone::Muted),
                 None => ("Stopped".to_string(), Tone::Muted),
             },
-            Status::Unread | Status::Done => (
+            Status::Unread => (
                 self.last_turn_files()
-                    .unwrap_or_else(|| "Answered".to_string()),
+                    .unwrap_or_else(|| self.view.outcome().label().to_string()),
+                Tone::Muted,
+            ),
+            Status::Done => (
+                self.last_turn_files().unwrap_or_else(|| "Done".to_string()),
                 Tone::Muted,
             ),
             Status::Idle if self.view.items.is_empty() => {
@@ -518,6 +580,12 @@ impl Session {
                 id,
                 title: self.view.title.clone(),
                 workspace: self.workspace.clone(),
+                subagent_workspaces: self
+                    .view
+                    .subagents
+                    .iter()
+                    .filter_map(|child| child.workspace.clone())
+                    .collect(),
                 created_at: unix_secs(self.created),
                 updated_at: unix_secs(self.touched),
                 agent: self.agent,
@@ -560,7 +628,22 @@ impl Session {
 
     pub(crate) fn record_event_edit(&mut self, event: &AgentEvent) {
         let event = match event {
-            AgentEvent::SubagentEvent { event, .. } => event.as_ref(),
+            AgentEvent::SubagentEvent { call_id, event } => {
+                let isolated = self
+                    .view
+                    .items
+                    .iter()
+                    .find_map(|item| match item {
+                        Item::Tool(call) if &call.call_id == call_id => call.subagent.as_ref(),
+                        _ => None,
+                    })
+                    .and_then(|link| self.view.subagent(&link.session_id))
+                    .is_some_and(|child| child.workspace.is_some());
+                if isolated {
+                    return;
+                }
+                event.as_ref()
+            }
             event => event,
         };
         if let AgentEvent::ToolCallFinished {

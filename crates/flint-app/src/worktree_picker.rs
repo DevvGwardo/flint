@@ -13,14 +13,18 @@ use gpui_kit::*;
 
 use crate::app::FlintApp;
 use crate::theme::{palette, size};
-use crate::{ui, worktrees};
+use crate::{branches, ui, worktrees};
 
 pub struct WorktreeForm {
     pub branch: Entity<InputState>,
     pub base: Entity<InputState>,
+    pub search: Entity<InputState>,
     pub trees: Vec<worktrees::Worktree>,
+    pub branches: Vec<branches::Branch>,
+    pub remotes: Vec<String>,
     pub busy: bool,
     pub error: Option<String>,
+    pub status: Option<String>,
     pub remove_confirm: Option<PathBuf>,
     cwd: PathBuf,
     agent: AgentKind,
@@ -32,14 +36,28 @@ pub struct WorktreeForm {
 
 enum Job {
     List,
+    Fetch,
+    OpenBranch(String),
     Create { branch: String, base: String },
     Remove(PathBuf),
 }
 
 enum Outcome {
-    Listed(Vec<worktrees::Worktree>),
+    Listed(branches::Repository, bool),
     Created(worktrees::Worktree),
     Removed(PathBuf),
+}
+
+impl WorktreeForm {
+    pub fn branch_indices(&self, cx: &App) -> Vec<usize> {
+        let query = self.search.read(cx).value().trim().to_lowercase();
+        self.branches
+            .iter()
+            .enumerate()
+            .filter(|(_, branch)| branch.name.to_lowercase().contains(&query))
+            .map(|(ix, _)| ix)
+            .collect()
+    }
 }
 
 impl FlintApp {
@@ -61,7 +79,9 @@ impl FlintApp {
         self.session_menu = None;
         let branch = cx.new(|cx| InputState::new(window, cx).placeholder("feature/my-task"));
         let base = cx.new(|cx| InputState::new(window, cx).default_value("HEAD"));
-        let subscriptions = [&branch, &base]
+        let search =
+            cx.new(|cx| InputState::new(window, cx).placeholder("Find a local or remote branch…"));
+        let mut subscriptions: Vec<_> = [&branch, &base]
             .into_iter()
             .map(|input| {
                 cx.subscribe_in(input, window, |app, _, event: &InputEvent, window, cx| {
@@ -71,14 +91,33 @@ impl FlintApp {
                 })
             })
             .collect();
+        subscriptions.push(cx.subscribe_in(
+            &search,
+            window,
+            |app, _, event: &InputEvent, window, cx| {
+                if matches!(event, InputEvent::PressEnter { .. })
+                    && let Some(ix) = app
+                        .worktree_form
+                        .as_ref()
+                        .and_then(|form| form.branch_indices(cx).first().copied())
+                {
+                    app.open_branch(ix, window, cx);
+                }
+                cx.notify();
+            },
+        ));
         let focus = cx.focus_handle();
         let return_focus = window.focused(cx);
         self.worktree_form = Some(WorktreeForm {
             branch: branch.clone(),
             base,
+            search: search.clone(),
             trees: Vec::new(),
+            branches: Vec::new(),
+            remotes: Vec::new(),
             busy: false,
             error: None,
+            status: None,
             remove_confirm: None,
             cwd: self.session().workspace.clone(),
             agent: self.session().agent,
@@ -87,7 +126,7 @@ impl FlintApp {
             _subscriptions: subscriptions,
             task: None,
         });
-        branch.update(cx, |input, cx| input.focus(window, cx));
+        search.update(cx, |input, cx| input.focus(window, cx));
         self.worktree_job(Job::List, window, cx);
     }
 
@@ -122,7 +161,7 @@ impl FlintApp {
         let Some(form) = &self.worktree_form else {
             return;
         };
-        if form.busy {
+        if form.busy || form.remove_confirm.is_some() {
             return;
         }
         let Some(tree) = form.trees.get(ix) else {
@@ -137,6 +176,28 @@ impl FlintApp {
         self.activate_worktree(path, agent, window, cx);
     }
 
+    pub fn refresh_branches(&mut self, fetch: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if self.worktree_form.as_ref().is_none_or(|form| {
+            form.busy || form.remove_confirm.is_some() || (fetch && form.remotes.is_empty())
+        }) {
+            return;
+        }
+        self.worktree_job(if fetch { Job::Fetch } else { Job::List }, window, cx);
+    }
+
+    pub fn open_branch(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(form) = &self.worktree_form else {
+            return;
+        };
+        if form.busy || form.remove_confirm.is_some() {
+            return;
+        }
+        let Some(branch) = form.branches.get(ix) else {
+            return;
+        };
+        self.worktree_job(Job::OpenBranch(branch.reference.clone()), window, cx);
+    }
+
     fn activate_worktree(
         &mut self,
         path: PathBuf,
@@ -144,38 +205,52 @@ impl FlintApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let ix = self
-            .sessions
-            .iter()
-            .position(|session| worktrees::same_path(&session.workspace, &path))
-            .unwrap_or_else(|| {
-                let mut session = self.new_session_value(path.clone());
-                session.agent = agent;
-                self.sessions.push(session);
-                self.sessions.len() - 1
-            });
-        self.workspace = path;
+        let ix = if worktrees::contains_workspace(&path, &self.session().workspace) {
+            Some(self.active)
+        } else {
+            self.sessions
+                .iter()
+                .position(|session| worktrees::same_path(&session.workspace, &path))
+        }
+        .unwrap_or_else(|| {
+            let mut session = self.new_session_value(path.clone());
+            session.agent = agent;
+            self.sessions.push(session);
+            self.sessions.len() - 1
+        });
+        self.workspace = self.sessions[ix].workspace.clone();
         self.select_session(ix, window, cx);
         self.start_agent_early(ix, cx);
     }
 
     pub fn worktree_in_use(&self, path: &Path, cx: &App) -> bool {
-        self.sessions
+        self.sessions.iter().any(|session| {
+            worktrees::contains_workspace(path, &session.workspace)
+                || session.view.subagents.iter().any(|child| {
+                    child
+                        .workspace
+                        .as_ref()
+                        .is_some_and(|workspace| worktrees::contains_workspace(path, workspace))
+                })
+        }) || self.archives.iter().any(|(_, meta)| {
+            worktrees::contains_workspace(path, &meta.workspace)
+                || meta
+                    .subagent_workspaces
+                    .iter()
+                    .any(|workspace| worktrees::contains_workspace(path, workspace))
+        }) || self.archived_session.as_ref().is_some_and(|(session, _)| {
+            worktrees::contains_workspace(path, &session.workspace)
+                || session.view.subagents.iter().any(|child| {
+                    child
+                        .workspace
+                        .as_ref()
+                        .is_some_and(|workspace| worktrees::contains_workspace(path, workspace))
+                })
+        }) || self
+            .terminal
+            .tabs
             .iter()
-            .any(|session| worktrees::contains_workspace(path, &session.workspace))
-            || self
-                .archives
-                .iter()
-                .any(|(_, meta)| worktrees::contains_workspace(path, &meta.workspace))
-            || self
-                .archived_session
-                .as_ref()
-                .is_some_and(|(session, _)| worktrees::contains_workspace(path, &session.workspace))
-            || self
-                .terminal
-                .tabs
-                .iter()
-                .any(|view| worktrees::contains_workspace(path, &view.read(cx).cwd))
+            .any(|view| worktrees::contains_workspace(path, &view.read(cx).cwd))
     }
 
     pub fn request_remove_worktree(&mut self, ix: usize, cx: &mut Context<Self>) {
@@ -237,6 +312,11 @@ impl FlintApp {
         }
         form.busy = true;
         form.error = None;
+        form.status = Some(if matches!(&job, Job::Fetch) {
+            "Fetching remote branches…".into()
+        } else {
+            "Working…".into()
+        });
         let id = form.branch.entity_id();
         let cwd = form.cwd.clone();
         let home = self.home.clone();
@@ -245,7 +325,11 @@ impl FlintApp {
             .name("flint-worktrees".into())
             .spawn(move || {
                 let result = match job {
-                    Job::List => worktrees::list(&cwd).map(Outcome::Listed),
+                    Job::List => branches::list(&cwd).map(|repo| Outcome::Listed(repo, false)),
+                    Job::Fetch => branches::fetch(&cwd).map(|repo| Outcome::Listed(repo, true)),
+                    Job::OpenBranch(reference) => {
+                        branches::open(&cwd, &home, &reference).map(Outcome::Created)
+                    }
                     Job::Create { branch, base } => {
                         worktrees::create(&cwd, &home, &branch, &base).map(Outcome::Created)
                     }
@@ -258,6 +342,7 @@ impl FlintApp {
             });
         if let Err(error) = thread {
             form.busy = false;
+            form.status = None;
             form.error = Some(format!("Couldn't start worktree operation: {error}"));
             cx.notify();
             return;
@@ -285,12 +370,29 @@ impl FlintApp {
                 }
                 form.busy = false;
                 form.task = None;
+                form.status = None;
                 match result {
-                    Ok(Outcome::Listed(trees)) => form.trees = trees,
+                    Ok(Outcome::Listed(repo, fetched)) => {
+                        form.trees = repo.trees;
+                        form.branches = repo.branches;
+                        form.remotes = repo.remotes;
+                        if fetched {
+                            form.status = Some("Remote branches updated.".into());
+                        }
+                    }
                     Ok(Outcome::Removed(path)) => {
                         form.trees
                             .retain(|tree| !worktrees::same_path(&tree.path, &path));
                         form.remove_confirm = None;
+                        for branch in &mut form.branches {
+                            if branch
+                                .checkout
+                                .as_ref()
+                                .is_some_and(|checkout| worktrees::same_path(checkout, &path))
+                            {
+                                branch.checkout = None;
+                            }
+                        }
                     }
                     Ok(Outcome::Created(tree)) => {
                         let agent = form.agent;
@@ -310,6 +412,51 @@ impl FlintApp {
 pub fn render(app: &FlintApp, window: &Window, cx: &mut Context<FlintApp>) -> Option<AnyElement> {
     let form = app.worktree_form.as_ref()?;
     let p = palette();
+    let branch_indices = form.branch_indices(cx);
+    let branch_rows = branch_indices.iter().copied().map(|ix| {
+        let branch = &form.branches[ix];
+        let current = branch
+            .checkout
+            .as_ref()
+            .is_some_and(|path| worktrees::contains_workspace(path, &form.cwd));
+        let detail = if current {
+            "Current checkout"
+        } else if branch.checkout.is_some() {
+            "Existing checkout"
+        } else if branch.remote.is_some() {
+            "Remote · opens a tracking branch"
+        } else {
+            "Local · opens an isolated checkout"
+        };
+        div()
+            .id(("branch-row", ix))
+            .flex()
+            .items_center()
+            .gap(px(8.))
+            .py(px(6.))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .child(div().text_ellipsis().child(ui::mono(
+                        branch.name.clone(),
+                        size::SM,
+                        p.text,
+                    )))
+                    .child(ui::label(detail, size::XS, p.text_muted)),
+            )
+            .child(
+                Button::new(("branch-open", ix))
+                    .label(if current { "Current" } else { "Open" })
+                    .disabled(form.busy || form.remove_confirm.is_some())
+                    .on_click(
+                        cx.listener(move |app, _, window, cx| app.open_branch(ix, window, cx)),
+                    ),
+            )
+            .test_support()
+    });
     let rows = form.trees.iter().enumerate().map(|(ix, tree)| {
         let unavailable = tree.bare || tree.prunable || !tree.path.is_dir();
         let label = tree.branch.clone().unwrap_or_else(|| {
@@ -350,7 +497,7 @@ pub fn render(app: &FlintApp, window: &Window, cx: &mut Context<FlintApp>) -> Op
             .child(
                 Button::new(("worktree-open", ix))
                     .label("Open")
-                    .disabled(form.busy || unavailable)
+                    .disabled(form.busy || form.remove_confirm.is_some() || unavailable)
                     .on_click(
                         cx.listener(move |app, _, window, cx| app.open_worktree(ix, window, cx)),
                     ),
@@ -370,21 +517,43 @@ pub fn render(app: &FlintApp, window: &Window, cx: &mut Context<FlintApp>) -> Op
                     ),
             )
     });
-    let sheet = div().id("worktree-picker").w(px(620.))
+    let sheet = div().id("worktree-picker").w(px(620.)).max_w(window.viewport_size().width - px(40.))
         .max_h(window.viewport_size().height - px(40.)).p(px(20.)).rounded(px(14.))
-        .border_1().border_color(p.border_strong).bg(p.surface).flex().flex_col().gap(px(12.))
+        .border_1().border_color(p.border_strong).bg(p.surface).flex().flex_col().gap(px(8.))
         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
         .on_click(|_, _, cx| cx.stop_propagation())
-        .child(ui::label("Git worktrees", size::PROSE, p.text))
-        .child(ui::label("Open an isolated checkout, or create a new branch from a commit.", size::SM, p.text_muted))
         .child(
-            div().id("worktree-list").max_h((window.viewport_size().height - px(350.)).max(px(80.)))
-                .overflow_y_scroll().children(rows).test_support(),
+            div().flex().items_center().gap(px(8.)).flex_shrink_0()
+                .child(div().flex_1().child(ui::label("Git branches & worktrees", size::PROSE, p.text)))
+                .child(Button::new("branch-refresh").label("Refresh")
+                    .disabled(form.busy || form.remove_confirm.is_some())
+                    .on_click(cx.listener(|app, _, window, cx| app.refresh_branches(false, window, cx))))
+                .child(Button::new("branch-fetch").label("Fetch remotes")
+                    .disabled(form.busy || form.remove_confirm.is_some() || form.remotes.is_empty())
+                    .on_click(cx.listener(|app, _, window, cx| app.refresh_branches(true, window, cx)))),
         )
-        .child(ui::label("New branch", size::SM, p.text))
-        .child(Input::new(&form.branch).id("worktree-branch").aria_label("New worktree branch").disabled(form.busy))
-        .child(ui::label("Start from branch or commit", size::SM, p.text))
-        .child(Input::new(&form.base).id("worktree-base").aria_label("Worktree base branch or commit").disabled(form.busy))
+        .child(ui::label("Select a branch without changing your current checkout. GitHub remotes use your existing Git credentials.", size::SM, p.text_muted))
+        .child(Input::new(&form.search).id("branch-search").aria_label("Find a Git branch").disabled(form.busy))
+        .child(
+            div().id("worktree-list").min_h_0().flex_shrink_1()
+                .max_h((window.viewport_size().height - px(390.)).max(px(80.)))
+                .overflow_y_scroll()
+                .child(ui::label("Branches", size::SM, p.text_muted))
+                .children(branch_rows)
+                .when(branch_indices.is_empty() && !form.busy, |list| list.child(ui::label(
+                    if form.branches.is_empty() { "No branches yet. Create an initial commit, or fetch a configured remote." } else { "No matching branches." },
+                    size::SM, p.text_muted,
+                )))
+                .child(div().mt(px(8.)).child(ui::label("Checkouts", size::SM, p.text_muted)))
+                .children(rows).test_support(),
+        )
+        .child(
+            div().flex_shrink_0().flex().flex_col().gap(px(4.))
+                .child(ui::label("New branch", size::SM, p.text))
+                .child(Input::new(&form.branch).id("worktree-branch").aria_label("New worktree branch").disabled(form.busy))
+                .child(ui::label("Start from branch or commit", size::SM, p.text))
+                .child(Input::new(&form.base).id("worktree-base").aria_label("Worktree base branch or commit").disabled(form.busy)),
+        )
         .children(form.error.as_ref().map(|error| ui::label(error.clone(), size::SM, p.danger)))
         .when_some(form.remove_confirm.clone(), |sheet, path| {
             sheet.child(ui::label(format!("Remove {}? Only a clean checkout can be removed. Its branch and commits are kept.", path.display()), size::SM, p.text))
@@ -398,8 +567,8 @@ pub fn render(app: &FlintApp, window: &Window, cx: &mut Context<FlintApp>) -> Op
                 )
         })
         .child(
-            div().flex().justify_end().gap(px(8.))
-                .when(form.busy, |row| row.child(ui::label("Working…", size::SM, p.text_muted)))
+            div().flex_shrink_0().flex().items_center().justify_end().gap(px(8.))
+                .when_some(form.status.as_ref(), |row, status| row.child(div().flex_1().child(ui::label(status.clone(), size::XS, p.text_muted))))
                 .child(Button::new("worktree-close").label("Close").disabled(form.busy).on_click(cx.listener(|app, _, window, cx| app.close_worktrees(window, cx))))
                 .child(Button::new("worktree-create").primary().label("Create worktree").disabled(form.busy || form.remove_confirm.is_some()).on_click(cx.listener(|app, _, window, cx| app.create_worktree(window, cx)))),
         )

@@ -1,6 +1,7 @@
 //! User settings in `~/.flint/config.toml` (or `$FLINT_HOME/config.toml`):
-//! model, base URL, default approval mode, reasoning effort, theme, and
-//! one-time tips. Read on startup, written by the Settings sheet.
+//! model, base URL, default approval mode, reasoning effort, the JEV judge
+//! toggle, theme, and one-time tips. Read on startup, written by the Settings
+//! sheet.
 
 use std::path::Path;
 use std::path::PathBuf;
@@ -11,6 +12,38 @@ use flint_agent::config::DEFAULT_BASE_URL;
 use flint_agent::config::DEFAULT_MODEL;
 use serde::Deserialize;
 use serde::Serialize;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TranscriptWidth {
+    #[default]
+    Readable,
+    Wide,
+    Fill,
+}
+
+impl TranscriptWidth {
+    pub fn maximum(self) -> Option<f32> {
+        match self {
+            Self::Readable => Some(760.),
+            Self::Wide => Some(1040.),
+            Self::Fill => None,
+        }
+    }
+}
+
+fn deserialize_width<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<TranscriptWidth, D::Error> {
+    // Consume any valid TOML value: a bad width must not reject the other
+    // provider/permission/theme settings in the same file.
+    let value = toml::Value::deserialize(deserializer)?;
+    Ok(match value.as_str() {
+        Some("wide") => TranscriptWidth::Wide,
+        Some("fill") => TranscriptWidth::Fill,
+        _ => TranscriptWidth::Readable,
+    })
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -32,11 +65,20 @@ pub struct Settings {
     pub api_key_file: String,
     /// `auto` or `ask`.
     pub approval: String,
+    /// Ask the optional JEV judge to confirm harness suspicions. The judge runs
+    /// only when this is on *and* a TypeSafe credential is present; `false`
+    /// always keeps the harness on its own heuristics.
+    pub jev_judge: bool,
+    /// Continue queued native work after current passing verification, without
+    /// accepting its result or changing approvals/sandboxing. Off by default.
+    pub queue_after_verification: bool,
     /// Missing on existing installations. Only a genuinely fresh home sets true.
     pub permission_choice_pending: Option<bool>,
     /// `low`, `medium`, `high`, or empty for the provider default.
     pub effort: String,
     pub theme: String,
+    #[serde(deserialize_with = "deserialize_width")]
+    pub transcript_width: TranscriptWidth,
     /// The welcome tip about the guard was dismissed.
     pub tip_dismissed: bool,
     /// The terminal dock was open when flint last closed.
@@ -77,9 +119,13 @@ impl Default for Settings {
             // New installs start in ask mode. Existing config files retain
             // their saved choice, including auto-run.
             approval: "ask".to_string(),
+            // Existing installs keep the judge on when a credential is present.
+            jev_judge: true,
+            queue_after_verification: false,
             permission_choice_pending: None,
             effort: "medium".to_string(),
             theme: "dark".to_string(),
+            transcript_width: TranscriptWidth::Readable,
             tip_dismissed: false,
             terminal_open: false,
             terminal_height: crate::term_panel::DEFAULT_HEIGHT,
@@ -99,9 +145,7 @@ pub fn flint_home() -> PathBuf {
 }
 
 pub fn home() -> PathBuf {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_default()
+    flint_platform::home_dir().unwrap_or_default()
 }
 
 impl Settings {
@@ -272,6 +316,56 @@ pub enum KeyStatus {
     Missing(String),
 }
 
+/// Cache only the display status, never a credential. Config changes invalidate
+/// immediately; external key-file/environment changes are picked up within 2s.
+#[derive(Default)]
+pub(crate) struct KeyStatusCache {
+    entry: Option<KeyStatusEntry>,
+}
+
+struct KeyStatusEntry {
+    read: std::time::Instant,
+    base_url: String,
+    api_key_file: String,
+    api_key_env: String,
+    key_path: Option<PathBuf>,
+    sources: KeySources,
+    status: KeyStatus,
+}
+
+impl KeyStatusCache {
+    pub fn get(
+        &mut self,
+        settings: &Settings,
+        key_path: Option<&Path>,
+        sources: &KeySources,
+        now: std::time::Instant,
+    ) -> KeyStatus {
+        if let Some(entry) = &self.entry
+            && now.saturating_duration_since(entry.read) < std::time::Duration::from_secs(2)
+            && entry.base_url == settings.base_url
+            && entry.api_key_file == settings.api_key_file
+            && entry.api_key_env == settings.api_key_env
+            && entry.key_path.as_deref() == key_path
+            && entry.sources.legacy_key_file == sources.legacy_key_file
+            && std::ptr::fn_addr_eq(entry.sources.env, sources.env)
+        {
+            return entry.status.clone();
+        }
+        let status = settings.key_status(key_path, sources);
+        self.entry = Some(KeyStatusEntry {
+            read: now,
+            base_url: settings.base_url.clone(),
+            api_key_file: settings.api_key_file.clone(),
+            api_key_env: settings.api_key_env.clone(),
+            key_path: key_path.map(Path::to_path_buf),
+            sources: sources.clone(),
+            status: status.clone(),
+        });
+        status
+    }
+}
+
 /// An API key and a description of where it came from.
 pub struct ResolvedKey {
     pub key: String,
@@ -300,7 +394,7 @@ fn key_with_typesafe_fallback(
 
 /// Expands a leading `~/` to the home directory.
 pub fn expand_home(path: &str) -> PathBuf {
-    match path.strip_prefix("~/") {
+    match path.strip_prefix("~/").or_else(|| path.strip_prefix("~\\")) {
         Some(rest) => home().join(rest),
         None => PathBuf::from(path),
     }

@@ -26,12 +26,15 @@ struct Metadata {
     model: String,
     #[serde(default)]
     effort: Option<ReasoningEffort>,
+    #[serde(default)]
+    worktree: Option<crate::worktree::Checkout>,
 }
 
 pub(super) struct Child {
     pub id: String,
     pub model: String,
     effort: Option<ReasoningEffort>,
+    pub worktree: Option<crate::worktree::Checkout>,
     pub session: Session,
     events: Receiver<AgentEvent>,
 }
@@ -45,10 +48,18 @@ pub(super) struct Subagents {
     children: HashMap<String, Child>,
     saved: HashMap<String, Metadata>,
     active: HashSet<String>,
+    active_workspaces: HashSet<std::path::PathBuf>,
     next_id: u64,
 }
 
 impl Subagents {
+    pub fn set_jev(&mut self, config: Option<crate::JevConfig>) {
+        self.config.jev = config.clone();
+        for child in self.children.values_mut() {
+            child.session.stage_jev(config.clone());
+        }
+    }
+
     pub fn new(config: AgentConfig, tools: ToolContext, mcp: Option<Arc<McpHub>>) -> Self {
         let mut saved = HashMap::new();
         let mut next_id = 1;
@@ -82,11 +93,30 @@ impl Subagents {
             children: HashMap::new(),
             saved,
             active: HashSet::new(),
+            active_workspaces: HashSet::new(),
             next_id,
         }
     }
 
-    pub fn prepare(
+    /// Worktree scope is separate from edit approvals, including after restart.
+    pub fn worktree_scope(&self, args: &Map<String, Value>) -> Option<String> {
+        if let Some(request) = args.get("worktree").filter(|value| !value.is_null()) {
+            return Some(format!("Prepare Git worktree and run subagent: {request}"));
+        }
+        let id = args.get("session_id")?.as_str()?.trim();
+        let checkout = self
+            .children
+            .get(id)
+            .and_then(|child| child.worktree.as_ref())
+            .or_else(|| self.saved.get(id).and_then(|meta| meta.worktree.as_ref()))?;
+        Some(format!(
+            "Resume subagent in Git worktree {} ({})",
+            checkout.workspace.display(),
+            checkout.branch
+        ))
+    }
+
+    pub async fn prepare(
         &mut self,
         args: &Map<String, Value>,
         models: Option<&Result<Vec<String>, String>>,
@@ -108,6 +138,10 @@ impl Subagents {
             .to_string();
         let session_id = text("session_id")?;
         let model = text("model")?;
+        let request = crate::worktree::Request::parse(args)?;
+        if session_id.is_some() && request.is_some() {
+            return Err("worktree cannot be changed when resuming a subagent session.".into());
+        }
         if session_id.is_some() && model.is_some() {
             return Err("model cannot be changed when resuming a subagent session.".to_string());
         }
@@ -115,13 +149,33 @@ impl Subagents {
             if self.active.contains(&id) {
                 return Err(format!("Subagent {id} is already running in this batch."));
             }
+            let checkout = self
+                .children
+                .get(&id)
+                .and_then(|child| child.worktree.clone())
+                .or_else(|| self.saved.get(&id).and_then(|meta| meta.worktree.clone()));
+            if let Some(checkout) = &checkout {
+                crate::worktree::validate(checkout).await?;
+                if self.active_workspaces.contains(&checkout.workspace) {
+                    return Err("Another subagent is already using this worktree.".into());
+                }
+            }
             let child = if let Some(child) = self.children.remove(&id) {
                 child
             } else if let Some(meta) = self.saved.get(&id) {
-                self.create(id.clone(), meta.model.clone(), approvals, meta.effort)?
+                self.create(
+                    id.clone(),
+                    meta.model.clone(),
+                    approvals,
+                    meta.effort,
+                    checkout,
+                )?
             } else {
                 return Err(format!("No subagent session found with id {id}."));
             };
+            if let Some(checkout) = &child.worktree {
+                self.active_workspaces.insert(checkout.workspace.clone());
+            }
             self.active.insert(id);
             return Ok((child, message));
         }
@@ -162,12 +216,34 @@ impl Subagents {
                     .filter(|model| !model.is_empty())
             })
             .unwrap_or_else(|| self.config.model.clone());
+        let checkout = if let Some(request) = request {
+            if self.config.general && request.repository.is_none() {
+                return Err(
+                    "General-agent worktree tasks need an absolute `worktree.repository`.".into(),
+                );
+            }
+            let checkout = crate::worktree::prepare(
+                &request,
+                &self.config.workspace,
+                &crate::worktree::home()?,
+            )
+            .await?;
+            if self.active_workspaces.contains(&checkout.workspace) {
+                return Err("Another subagent is already using this worktree.".into());
+            }
+            Some(checkout)
+        } else {
+            None
+        };
         let id = format!("agent-{}", self.next_id);
         self.next_id = self
             .next_id
             .checked_add(1)
             .ok_or("Subagent id limit reached.")?;
-        let child = self.create(id.clone(), model, approvals, effort)?;
+        let child = self.create(id.clone(), model, approvals, effort, checkout)?;
+        if let Some(checkout) = &child.worktree {
+            self.active_workspaces.insert(checkout.workspace.clone());
+        }
         self.active.insert(id);
         Ok((child, message))
     }
@@ -178,11 +254,16 @@ impl Subagents {
         model: String,
         approvals: Arc<Approvals>,
         effort: Option<ReasoningEffort>,
+        worktree: Option<crate::worktree::Checkout>,
     ) -> Result<Child, String> {
         let mut config = self.config.clone();
         config.model = model.clone();
         config.subagent_model = None;
         config.reasoning_effort = effort;
+        if let Some(checkout) = &worktree {
+            config.workspace = checkout.workspace.clone();
+            config.general = false;
+        }
         config.session_dir = config
             .session_dir
             .map(|dir| dir.join("subagents").join(&id));
@@ -191,6 +272,7 @@ impl Subagents {
             let bytes = serde_json::to_vec(&Metadata {
                 model: model.clone(),
                 effort,
+                worktree: worktree.clone(),
             })
             .expect("metadata");
             let tmp = dir.join("subagent.json.tmp");
@@ -199,13 +281,28 @@ impl Subagents {
                 .map_err(|err| format!("Cannot save subagent: {err}"))?;
         }
         let (events, events_rx) = async_channel::unbounded();
+        let tools = if worktree.is_some() {
+            let mut tools = ToolContext::new(config.workspace.clone(), config.sandbox);
+            // Scope restrictions still propagate immediately across the family,
+            // but this checkout has its own confined file/undo journal.
+            tools.work_clock = self.tools.work_clock.clone();
+            tools
+        } else {
+            self.tools.child()
+        };
         let mut session = Session::new(
             config,
             events,
             approvals,
             Arc::new(Mutex::new(effort)),
-            self.tools.child(),
-            self.mcp.clone(),
+            tools,
+            // Parent MCP servers were started in its workspace. Do not expose
+            // them as if they were scoped to this isolated checkout.
+            if worktree.is_some() {
+                None
+            } else {
+                self.mcp.clone()
+            },
             true,
         );
         session.call_prefix = format!("{id}:");
@@ -213,6 +310,7 @@ impl Subagents {
             id,
             model,
             effort,
+            worktree,
             session,
             events: events_rx,
         })
@@ -220,11 +318,15 @@ impl Subagents {
 
     pub fn put(&mut self, child: Child) {
         self.active.remove(&child.id);
+        if let Some(checkout) = &child.worktree {
+            self.active_workspaces.remove(&checkout.workspace);
+        }
         self.saved.insert(
             child.id.clone(),
             Metadata {
                 model: child.model.clone(),
                 effort: child.effort,
+                worktree: child.worktree.clone(),
             },
         );
         self.children.insert(child.id.clone(), child);
@@ -255,7 +357,11 @@ pub(super) async fn run_child(
     call_id: &str,
     events: Sender<AgentEvent>,
     cancel: &CancellationToken,
+    read_only: bool,
+    restrictions: Vec<String>,
 ) -> ChildResult {
+    child.session.inherited_read_only = read_only;
+    child.session.inherited_restrictions = restrictions;
     let rx = child.events.clone();
     child.session.initialize_child_budget(cancel).await;
     let mut work = Vec::new();
@@ -295,7 +401,23 @@ pub(super) async fn run_child(
     while let Ok(event) = rx.try_recv() {
         forward(event);
     }
-    let success = reason == TurnEndReason::Completed;
+    let execution_success = reason == TurnEndReason::Completed;
+    let assessment = child
+        .session
+        .task
+        .as_ref()
+        .and_then(|task| task.assessment.as_ref());
+    // A successfully returned report is not accepted child work. NeedsReview
+    // is a usable report, but blocked/partial work is not task success.
+    let success = execution_success
+        && assessment.is_some_and(|assessment| {
+            matches!(
+                assessment.outcome,
+                crate::task::TaskOutcome::Answered
+                    | crate::task::TaskOutcome::NeedsReview
+                    | crate::task::TaskOutcome::Accepted
+            )
+        });
     let output = child
         .session
         .history
@@ -310,12 +432,26 @@ pub(super) async fn run_child(
             _ => None,
         })
         .unwrap_or("");
-    let result = if success {
-        json!({"session_id": child.id, "output": head_tail(output, OUTPUT_CHARS)})
+    let result = if execution_success {
+        json!({
+            "session_id": child.id,
+            "workspace": child.worktree.as_ref().map(|checkout| &checkout.workspace),
+            "branch": child.worktree.as_ref().map(|checkout| &checkout.branch),
+            "output": head_tail(output, OUTPUT_CHARS),
+            "execution_success": true,
+            "accepted": assessment.is_some_and(|assessment| assessment.outcome == crate::task::TaskOutcome::Accepted),
+            "assessment": assessment,
+            "deliverables": child.session.task.as_ref().map(|task| &task.files),
+            "blockers": child.session.task.as_ref().map(|task| &task.blockers),
+        })
     } else {
-        json!({"session_id": child.id, "error": match reason {
+        json!({"session_id": child.id, "workspace": child.worktree.as_ref().map(|checkout| &checkout.workspace), "branch": child.worktree.as_ref().map(|checkout| &checkout.branch), "execution_success":false, "accepted":false, "assessment":assessment, "error": match reason {
             TurnEndReason::Interrupted => "Subagent interrupted.".to_string(),
             TurnEndReason::StepLimit => "Subagent reached the step limit.".to_string(),
+            TurnEndReason::ContinuationLimit => child.session.task.as_ref()
+                .and_then(|task| task.continuation_stop.as_ref())
+                .map(crate::task::ContinuationStop::detail)
+                .unwrap_or_else(|| "Subagent stopped with unresolved finish conditions.".to_string()),
             TurnEndReason::Failed(error) => error,
             TurnEndReason::Completed => unreachable!(),
         }})

@@ -47,6 +47,10 @@ pub fn render(app: &FlintApp, max_height: f32, cx: &mut Context<FlintApp>) -> Op
         edit.uid == session.uid && queue.items.iter().any(|prompt| prompt.id == edit.id)
     });
     let footer_height = if editing.is_some() { 44. } else { 0. };
+    let confirming = app
+        .queue_resume_confirm
+        .as_ref()
+        .is_some_and(|confirmation| confirmation.key.uid == session.uid);
     let p = palette();
     let roomy = app
         .popover_room
@@ -59,8 +63,12 @@ pub fn render(app: &FlintApp, max_height: f32, cx: &mut Context<FlintApp>) -> Op
         "Applying steering"
     } else if queue.paused {
         "Paused"
+    } else if app.settings.queue_after_verification
+        && session.agent == flint_agent::AgentKind::Flint
+    {
+        "Runs after checks or acceptance"
     } else {
-        "Runs after this turn"
+        "Runs after acceptance"
     };
     let header = div()
         .id("queue-header")
@@ -91,7 +99,13 @@ pub fn render(app: &FlintApp, max_height: f32, cx: &mut Context<FlintApp>) -> Op
         .child(
             Button::new("queue-pause")
                 .small()
-                .label(if queue.paused { "Resume" } else { "Pause" })
+                .label(if queue.paused && app.queue_needs_review(app.active) {
+                    "Resume anyway"
+                } else if queue.paused {
+                    "Resume"
+                } else {
+                    "Pause"
+                })
                 .disabled(queue.steer_after_turn.is_some() || session.steering_pending.is_some())
                 .on_click(cx.listener(|app, _, _, cx| app.pause_prompt_queue(cx))),
         )
@@ -239,14 +253,41 @@ pub fn render(app: &FlintApp, max_height: f32, cx: &mut Context<FlintApp>) -> Op
             .flex()
             .flex_col()
             .child(header)
+            .children(queue.review_hold.as_ref().filter(|_| !queue.items.is_empty() && !confirming).map(|hold| {
+                div().id("queue-review-hold").relative().px(px(12.)).py(px(9.)).flex_shrink_0()
+                    .flex().flex_col().gap(px(6.))
+                    .child(ui::label(hold.clone(), size::XS, p.warning))
+                    .child(Button::new("queue-review-task").small().label("Review task")
+                        .on_click(cx.listener(|app, _, window, cx| app.open_current_task(window, cx))))
+                    .child(crate::automation::task_control_probe("queue-review"))
+                    .test_support()
+            }))
+            .when(confirming, |queue| {
+                queue.child(div().id("queue-resume-confirmation").relative().px(px(12.)).py(px(8.)).flex_shrink_0()
+                    .flex().flex_col().gap(px(6.))
+                    .child(ui::label("Run queued work despite the unresolved task? This does not accept its result.", size::XS, p.warning))
+                    .child(div().flex().flex_wrap().gap(px(6.))
+                        .child(Button::new("queue-review-task").small().label("Review task")
+                            .on_click(cx.listener(|app, _, window, cx| app.open_current_task(window, cx))))
+                        .child(Button::new("queue-resume-cancel").small().label("Cancel")
+                            .on_click(cx.listener(|app, _, _, cx| { app.queue_resume_confirm = None; cx.notify(); })))
+                        .child(Button::new("queue-resume-confirm").small().primary().label("Resume anyway")
+                            .on_click(cx.listener(|app, _, _, cx| app.confirm_queue_override(cx)))))
+                    .child(crate::automation::task_control_probe("queue-confirmation"))
+                    .child(crate::automation::task_control_probe("queue-review"))
+                    .test_support())
+            })
             .child(
                 div()
                     .relative()
                     .min_h_0()
                     .overflow_hidden()
+                    .flex()
+                    .flex_col()
                     .child(
                         div()
                             .id("queue-rows")
+                            .min_h_0()
                             .max_h(px((max_height - 36. - footer_height - 2.).max(0.)))
                             .overflow_y_scroll()
                             .track_scroll(&session.queue_scroll)

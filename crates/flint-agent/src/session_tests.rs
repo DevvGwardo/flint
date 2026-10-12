@@ -10,6 +10,8 @@ use tokio::net::TcpListener;
 
 use std::path::PathBuf;
 
+use crate::JevQuestion;
+
 use super::*;
 
 #[path = "archive_shutdown_tests.rs"]
@@ -18,6 +20,10 @@ mod archive_shutdown_tests;
 mod queue_steering_tests;
 #[path = "subagent_tests.rs"]
 mod subagent_tests;
+#[path = "task_engine_tests.rs"]
+mod task_engine_tests;
+#[path = "worktree_session_tests.rs"]
+mod worktree_session_tests;
 
 /// A one-request-per-connection HTTP server that answers each POST with the
 /// next scripted SSE body and records the request bodies.
@@ -36,6 +42,15 @@ async fn mock_server(responses: Vec<String>) -> (String, Arc<StdMutex<Vec<Value>
 async fn mock_server_with_models(
     responses: Vec<String>,
     listing: Value,
+) -> (String, Arc<StdMutex<Vec<Value>>>) {
+    mock_server_with_response_hook(responses, listing, |_| {}).await
+}
+
+/// Run deterministic host-side changes while inference is in flight.
+async fn mock_server_with_response_hook(
+    responses: Vec<String>,
+    listing: Value,
+    before_response: impl Fn(usize) + Send + 'static,
 ) -> (String, Arc<StdMutex<Vec<Value>>>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let url = format!("http://{}/v1", listener.local_addr().expect("addr"));
@@ -82,6 +97,8 @@ async fn mock_server_with_models(
             seen.lock()
                 .expect("lock")
                 .push(serde_json::from_slice(&body).unwrap_or(Value::Null));
+            let index = seen.lock().expect("lock").len() - 1;
+            before_response(index);
             let sse = responses
                 .next()
                 .unwrap_or_else(|| sse_text("(script exhausted)"));
@@ -99,6 +116,64 @@ async fn mock_server_with_models(
         }
     });
     (url, requests)
+}
+
+/// A one-request-per-connection stand-in for the Typesafe System One endpoint.
+/// Every POST to `/v1/systemone` is answered with the same calibrated `noul`
+/// probability, and the request bodies are recorded so a test can assert which
+/// question the harness asked.
+async fn mock_judge(probability: f64) -> (String, Arc<StdMutex<Vec<Value>>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let base = format!("http://{}", listener.local_addr().expect("addr"));
+    let requests = Arc::new(StdMutex::new(Vec::new()));
+    let seen = Arc::clone(&requests);
+    tokio::spawn(async move {
+        while let Ok((mut socket, _)) = listener.accept().await {
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 4096];
+            let body = loop {
+                let n = socket.read(&mut chunk).await.unwrap_or(0);
+                if n == 0 {
+                    break None;
+                }
+                buf.extend_from_slice(&chunk[..n]);
+                let text = String::from_utf8_lossy(&buf).to_string();
+                let Some(split) = text.find("\r\n\r\n") else {
+                    continue;
+                };
+                let length = text[..split]
+                    .lines()
+                    .find_map(|l| {
+                        l.to_ascii_lowercase()
+                            .strip_prefix("content-length:")
+                            .map(|v| v.trim().parse::<usize>().unwrap_or(0))
+                    })
+                    .unwrap_or(0);
+                if buf.len() >= split + 4 + length {
+                    break Some(buf[split + 4..split + 4 + length].to_vec());
+                }
+            };
+            let Some(body) = body else { continue };
+            let value: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+            seen.lock().expect("lock").push(value.clone());
+            // Answer under the name the harness asked with, the way System One
+            // echoes the question key back.
+            let name = value["questions"]
+                .as_object()
+                .and_then(|questions| questions.keys().next().cloned())
+                .unwrap_or_else(|| "stuck".to_string());
+            let mut answers = serde_json::Map::new();
+            answers.insert(name, json!({"type": "noul", "noul": probability}));
+            let reply_body = json!({"answers": Value::Object(answers)}).to_string();
+            let reply = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{reply_body}",
+                reply_body.len()
+            );
+            let _ = socket.write_all(reply.as_bytes()).await;
+            let _ = socket.shutdown().await;
+        }
+    });
+    (base, requests)
 }
 
 fn sse(chunks: &[Value]) -> String {
@@ -166,7 +241,13 @@ async fn general_session_answers_without_a_repository_or_forced_file_edits() {
 }
 
 async fn run_one_turn(url: String, workspace: PathBuf, prompt: &str) -> Vec<AgentEvent> {
-    let events = run_turns(test_config(url, workspace), &[prompt]).await;
+    run_one_turn_config(test_config(url, workspace), prompt).await
+}
+
+/// Like [`run_one_turn`], for a config the caller has already customised (a
+/// JEV judge, an alternate model, ...).
+async fn run_one_turn_config(config: AgentConfig, prompt: &str) -> Vec<AgentEvent> {
+    let events = run_turns(config, &[prompt]).await;
     // Only the turn itself, as these tests were written.
     let end = events
         .iter()
@@ -237,7 +318,11 @@ fn outline(events: &[AgentEvent]) -> Vec<String> {
             )),
             AgentEvent::SessionOptions(_) | AgentEvent::SteeringAccepted { .. } => None,
             AgentEvent::SessionStopped { .. } => None,
-            AgentEvent::SubagentStarted { .. } | AgentEvent::SubagentEvent { .. } => None,
+            AgentEvent::JevVerdict { .. } => None,
+            AgentEvent::TaskUpdated { .. } | AgentEvent::TaskAssessed { .. } => None,
+            AgentEvent::SubagentStarted { .. }
+            | AgentEvent::SubagentWorkspace { .. }
+            | AgentEvent::SubagentEvent { .. } => None,
             AgentEvent::TerminalStarted { .. }
             | AgentEvent::TerminalOutput { .. }
             | AgentEvent::TerminalExited { .. } => None,
@@ -287,6 +372,126 @@ async fn incomplete_model_outcomes_never_mutate_files() {
             }
         )));
     }
+}
+
+async fn assert_duplicate_tool_call_ids_rejected(reason: &str) {
+    let (_guard, ws) = temp_workspace();
+    let calls: Vec<Value> = [
+        ("unique", "before"),
+        ("duplicate", "one"),
+        ("duplicate", "two"),
+    ]
+    .into_iter()
+    .enumerate()
+    .map(|(index, (id, path))| {
+        json!({"index": index, "id": id, "type": "function",
+                "function": {"name": "write_file",
+                    "arguments": json!({"path": path, "content": "bad"}).to_string()}})
+    })
+    .collect();
+    let (url, requests) = mock_server(vec![sse(&[json!({
+        "choices": [{"delta": {"tool_calls": calls}, "finish_reason": reason}]
+    })])])
+    .await;
+    let events = run_one_turn(url, ws.clone(), "store these files").await;
+    for path in ["before", "one", "two"] {
+        assert!(
+            !ws.join(path).exists(),
+            "duplicate provider IDs released file {path} before validation ({reason})"
+        );
+    }
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::ToolCallStarted { .. }))
+    );
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::TurnFinished {
+            reason: TurnEndReason::Failed(message),
+            ..
+        } if message.contains("duplicate tool-call IDs")
+    )));
+    assert_eq!(requests.lock().expect("requests").len(), 1);
+}
+
+#[tokio::test]
+async fn duplicate_tool_call_ids_with_stop_never_mutate_files() {
+    assert_duplicate_tool_call_ids_rejected("stop").await;
+}
+
+#[tokio::test]
+async fn duplicate_tool_call_ids_with_tool_calls_never_mutate_files() {
+    assert_duplicate_tool_call_ids_rejected("tool_calls").await;
+}
+
+async fn assert_malformed_stream_json_rejected(reason: &str) {
+    let (_guard, ws) = temp_workspace();
+    let call = json!({"choices": [{"delta": {
+        "content": "partial",
+        "tool_calls": [{"index": 0, "id": "unsafe", "type": "function",
+            "function": {"name": "write_file",
+                "arguments": json!({"path": "victim", "content": "bad"}).to_string()}}]
+    }}]});
+    let terminal = json!({"choices": [{"delta": {}, "finish_reason": reason}]});
+    let body =
+        format!("data: {call}\n\ndata: {{\"choices\": [\n\ndata: {terminal}\n\ndata: [DONE]\n\n");
+    let (url, requests) = mock_server(vec![body]).await;
+    let events = run_one_turn(url, ws.clone(), "store victim").await;
+    assert!(
+        !ws.join("victim").exists(),
+        "malformed provider JSON released a file mutation ({reason})"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::ToolCallStarted { .. }))
+    );
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::TurnFinished {
+            reason: TurnEndReason::Failed(message),
+            ..
+        } if message.contains("invalid JSON")
+    )));
+    assert_eq!(requests.lock().expect("requests").len(), 1);
+}
+
+#[tokio::test]
+async fn malformed_stream_json_with_stop_never_mutates_files() {
+    assert_malformed_stream_json_rejected("stop").await;
+}
+
+#[tokio::test]
+async fn malformed_stream_json_with_tool_calls_never_mutates_files() {
+    assert_malformed_stream_json_rejected("tool_calls").await;
+}
+
+#[tokio::test]
+async fn valid_tool_calls_with_sse_keepalives_still_execute() {
+    let (_guard, ws) = temp_workspace();
+    let body = sse_tool_call(
+        "write",
+        "write_file",
+        json!({"path": "victim", "content": "safe"}),
+    )
+    .replace(
+        "\n\n",
+        "\n\n: keepalive\n\nevent: ping\nid: ignored\nretry: 1000\n\ndata:\n\ndata:  \n\n",
+    );
+    let (url, _) = mock_server(vec![body, sse_text("Stored."), sse_text("Stored.")]).await;
+    let events = run_one_turn(url, ws.clone(), "store victim").await;
+    assert_eq!(
+        std::fs::read_to_string(ws.join("victim")).expect("created"),
+        "safe"
+    );
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::TurnFinished {
+            reason: TurnEndReason::Completed,
+            ..
+        }
+    )));
 }
 
 #[tokio::test]
@@ -367,11 +572,11 @@ async fn full_loop_writes_runs_and_finishes() {
         json!({"include_usage": true})
     );
     // The tool-call assistant message of this turn carries its reasoning back.
-    let replayed = &requests[2]["messages"][2];
+    let replayed = &requests[2]["messages"][3];
     assert_eq!(replayed["role"], "assistant");
     assert_eq!(replayed["reasoning_content"], "plan c1");
     assert_eq!(
-        requests[2]["messages"][3],
+        requests[2]["messages"][4],
         json!({"role": "tool", "tool_call_id": "c1", "content": "Created a.txt (+1 -0)"})
     );
 }
@@ -448,6 +653,159 @@ async fn verify_nudge_fires_when_no_command_follows_an_edit() {
 }
 
 #[tokio::test]
+async fn a_jev_verdict_that_confirms_an_edit_reaches_the_event_stream() {
+    let (_guard, ws) = temp_workspace();
+    let (url, _) = mock_server(vec![
+        sse_tool_call(
+            "c1",
+            "write_file",
+            json!({"path": "a.py", "content": "x = 1\n"}),
+        ),
+        sse_text("Done."),
+        sse_text("No tests exist; nothing to run."),
+    ])
+    .await;
+    let (judge_url, judged) = mock_judge(0.1).await;
+    let mut config = test_config(url, ws);
+    config.jev = Some(crate::JevConfig {
+        api_key: "judge-key".to_string(),
+        base_url: judge_url,
+        model: "jev-test".to_string(),
+    });
+    let events = run_one_turn_config(config, "fix the value in a.py").await;
+
+    assert_eq!(
+        events.iter().find_map(|event| match event {
+            AgentEvent::JevVerdict {
+                question,
+                probability,
+                confirmed,
+            } => Some((*question, *probability, *confirmed)),
+            _ => None,
+        }),
+        Some((JevQuestion::Verified, 0.1, true))
+    );
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::HarnessNudge {
+            reason: NudgeReason::Verify,
+            ..
+        }
+    )));
+
+    let judged = judged.lock().expect("judge requests").clone();
+    assert_eq!(judged.len(), 1);
+    assert_eq!(judged[0]["model"], "jev-test");
+    assert_eq!(
+        judged[0]["questions"]
+            .as_object()
+            .expect("questions")
+            .keys()
+            .collect::<Vec<_>>(),
+        vec!["verified"]
+    );
+}
+
+#[tokio::test]
+async fn a_jev_verdict_that_clears_an_edit_skips_the_nudge() {
+    let (_guard, ws) = temp_workspace();
+    let (url, _) = mock_server(vec![
+        sse_tool_call(
+            "c1",
+            "write_file",
+            json!({"path": "a.py", "content": "x = 1\n"}),
+        ),
+        sse_text("Done."),
+    ])
+    .await;
+    let (judge_url, judged) = mock_judge(0.9).await;
+    let mut config = test_config(url, ws);
+    config.jev = Some(crate::JevConfig {
+        api_key: "judge-key".to_string(),
+        base_url: judge_url,
+        model: "jev-test".to_string(),
+    });
+    let events = run_one_turn_config(config, "fix the value in a.py").await;
+
+    assert_eq!(
+        events.iter().find_map(|event| match event {
+            AgentEvent::JevVerdict {
+                question,
+                probability,
+                confirmed,
+            } => Some((*question, *probability, *confirmed)),
+            _ => None,
+        }),
+        Some((JevQuestion::Verified, 0.9, false))
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::HarnessNudge { .. }))
+    );
+    assert_eq!(
+        outline(&events),
+        vec![
+            "turn",
+            "step 0",
+            "call write_file a.py",
+            "done ok=true",
+            "step 1",
+            "finished Completed",
+        ]
+    );
+    assert_eq!(judged.lock().expect("judge requests").len(), 1);
+}
+
+#[tokio::test]
+async fn a_jev_verdict_on_a_stuck_loop_reaches_the_event_stream() {
+    let (_guard, ws) = temp_workspace();
+    std::fs::write(ws.join("a.txt"), "hi\n").expect("seed file");
+    let (url, _) = mock_server(vec![
+        sse_tool_call("r1", "read_file", json!({"path": "a.txt"})),
+        sse_tool_call("r2", "read_file", json!({"path": "a.txt"})),
+        sse_text("It says hi."),
+    ])
+    .await;
+    let (judge_url, judged) = mock_judge(0.9).await;
+    let mut config = test_config(url, ws);
+    config.jev = Some(crate::JevConfig {
+        api_key: "judge-key".to_string(),
+        base_url: judge_url,
+        model: "jev-test".to_string(),
+    });
+    let events = run_one_turn_config(config, "what does a.txt say?").await;
+
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            AgentEvent::JevVerdict {
+                question: JevQuestion::Stuck,
+                confirmed: true,
+                ..
+            }
+        )),
+        "the stuck verdict should reach the stream: {events:?}"
+    );
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::HarnessNudge {
+            reason: NudgeReason::Stuck,
+            ..
+        }
+    )));
+    let judged = judged.lock().expect("judge requests").clone();
+    assert_eq!(
+        judged[0]["questions"]
+            .as_object()
+            .expect("questions")
+            .keys()
+            .collect::<Vec<_>>(),
+        vec!["stuck"]
+    );
+}
+
+#[tokio::test]
 async fn repairs_names_and_arguments() {
     let (_guard, ws) = temp_workspace();
     let (url, _requests) = mock_server(vec![
@@ -502,7 +860,7 @@ async fn saved_session_continues_after_restart() {
         .as_array()
         .expect("messages")
         .iter()
-        .skip(1)
+        .filter(|m| m["role"] != "system")
         .map(|m| {
             (
                 m["role"].as_str().unwrap_or_default().to_string(),
@@ -521,7 +879,7 @@ async fn saved_session_continues_after_restart() {
 }
 
 #[tokio::test]
-async fn corrupt_history_starts_fresh_with_an_error() {
+async fn corrupt_history_is_preserved_and_blocks_provider_execution() {
     let (_guard, ws) = temp_workspace();
     let sessions = tempfile::tempdir().expect("tempdir");
     std::fs::write(
@@ -534,17 +892,33 @@ async fn corrupt_history_starts_fresh_with_an_error() {
         session_dir: Some(sessions.path().to_path_buf()),
         ..test_config(url, ws)
     };
-    let events = run_turns(config, &["hello"]).await;
+    let handle = crate::spawn_session(config);
+    let mut events = Vec::new();
+    while let Ok(Ok(event)) =
+        tokio::time::timeout(Duration::from_secs(5), handle.events.recv()).await
+    {
+        events.push(event);
+    }
     assert!(
-        matches!(&events[0], AgentEvent::Error(m) if m.starts_with("Couldn't restore the saved conversation"))
+        matches!(&events[0], AgentEvent::Error(message) if message.contains("History") || message.contains("history"))
     );
-    assert_eq!(events[1], AgentEvent::TurnStarted { turn_id: 1 });
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::SessionStopped {
+            history_saved: false
+        }
+    )));
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::TurnStarted { .. }))
+    );
+    assert!(requests.lock().unwrap().is_empty());
     assert_eq!(
-        requests.lock().expect("lock")[0]["messages"]
-            .as_array()
-            .map(Vec::len),
-        Some(2)
+        std::fs::read_to_string(sessions.path().join("history.json")).unwrap(),
+        "{\"version\":1,\"turn_id\":3,\"messa"
     );
+    assert!(!sessions.path().join("history.json.corrupt").exists());
 }
 
 #[tokio::test]
@@ -584,6 +958,127 @@ async fn reasoning_effort_is_sent_and_dropped_once_rejected() {
         .map(|r| r["reasoning_effort"].clone())
         .collect();
     assert_eq!(efforts, vec![json!("high"), Value::Null, Value::Null]);
+}
+
+fn fallback_error_response(status: u16, message: &str) -> String {
+    let body = json!({"error": {"message": message}}).to_string();
+    format!(
+        "HTTP/1.1 {status} Test Error\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+        body.len()
+    )
+}
+
+async fn assert_effort_fallback_failure(response: String, expected: &str) {
+    let (_guard, ws) = temp_workspace();
+    let (url, requests) = mock_server(vec![
+        fallback_error_response(400, "initial reasoning_effort rejection"),
+        response,
+    ])
+    .await;
+    let config = AgentConfig {
+        reasoning_effort: Some(ReasoningEffort::High),
+        ..test_config(url, ws)
+    };
+    let events = run_one_turn_config(config, "hello").await;
+    let message = events
+        .iter()
+        .find_map(|event| match event {
+            AgentEvent::TurnFinished {
+                reason: TurnEndReason::Failed(message),
+                ..
+            } => Some(message),
+            _ => None,
+        })
+        .expect("failed turn");
+    assert!(
+        message.contains(expected),
+        "fallback diagnostic missing: {message}"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::Error(message) if message.contains(expected)))
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::ToolCallStarted { .. }))
+    );
+    let efforts: Vec<Value> = requests
+        .lock()
+        .expect("requests")
+        .iter()
+        .map(|request| request["reasoning_effort"].clone())
+        .collect();
+    assert_eq!(efforts, vec![json!("high"), Value::Null]);
+}
+
+#[tokio::test]
+async fn reasoning_effort_fallback_reports_rejected_failure() {
+    assert_effort_fallback_failure(
+        fallback_error_response(422, "fallback rejected"),
+        "fallback rejected",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn reasoning_effort_fallback_reports_retryable_failure() {
+    assert_effort_fallback_failure(
+        fallback_error_response(500, "fallback retryable"),
+        "fallback retryable",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn reasoning_effort_fallback_reports_throttled_failure() {
+    assert_effort_fallback_failure(
+        fallback_error_response(429, "fallback throttled"),
+        "fallback throttled",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn reasoning_effort_fallback_reports_fatal_failure() {
+    assert_effort_fallback_failure("data: {\n\n".into(), "invalid JSON").await;
+}
+
+#[tokio::test]
+async fn reasoning_effort_fallback_failure_can_recover_without_poisoning_negotiation() {
+    let (_guard, ws) = temp_workspace();
+    let (url, requests) = mock_server(vec![
+        fallback_error_response(400, "initial reasoning_effort rejection"),
+        fallback_error_response(500, "fallback recovery failure"),
+        sse_text("Recovered."),
+    ])
+    .await;
+    let config = AgentConfig {
+        reasoning_effort: Some(ReasoningEffort::High),
+        ..test_config(url, ws)
+    };
+    let events = run_turns(config, &["hello", "hello again"]).await;
+    let reasons: Vec<&TurnEndReason> = events
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::TurnFinished { reason, .. } => Some(reason),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        matches!(reasons.first(), Some(TurnEndReason::Failed(message))
+            if message.contains("fallback recovery failure")),
+        "fallback diagnostic missing: {reasons:?}"
+    );
+    assert!(matches!(reasons.get(1), Some(TurnEndReason::Completed)));
+    let efforts: Vec<Value> = requests
+        .lock()
+        .expect("requests")
+        .iter()
+        .map(|request| request["reasoning_effort"].clone())
+        .collect();
+    assert_eq!(efforts, vec![json!("high"), Value::Null, json!("high")]);
 }
 
 #[tokio::test]

@@ -39,7 +39,11 @@ async fn bounded_regular_read(full: &Path, cancel: &CancellationToken) -> std::i
                 "file tools require a regular file of at most 8 MiB",
             ));
         }
-        let file = tokio::fs::File::open(full).await?;
+        let path = full.to_path_buf();
+        let file = tokio::task::spawn_blocking(move || crate::file_io::open_regular_file(&path))
+            .await
+            .map_err(std::io::Error::other)??;
+        let file = tokio::fs::File::from_std(file);
         let metadata = file.metadata().await?;
         if !metadata.is_file() || metadata.len() > MAX_READ_BYTES {
             return Err(std::io::Error::other(

@@ -352,7 +352,9 @@ fn composer_query_reads_keep_large_unicode_drafts_mentions_and_slash_selection(
         ui.click(cx, "send");
         let sent = engine.sent();
         assert!(
-            matches!(sent.as_slice(), [Op::UserMessage(text)] if text.contains(expected.trim_end()) && text.contains("# Fixture guide")),
+            matches!(sent.as_slice(), [Op::UserMessageWithContext { request,text,images,steering_id:None }]
+                if request==expected.trim_end() && text.contains(expected.trim_end())
+                    && text.contains("# Fixture guide") && images.is_empty()),
             "{sent:?}"
         );
         assert_eq!(ui.composer_text(cx), "");

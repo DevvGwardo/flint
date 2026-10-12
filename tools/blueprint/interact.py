@@ -29,14 +29,25 @@ def main() -> None:
     proc = subprocess.run(cmd, cwd=args.src, env=env, capture_output=True, text=True)
     log = bp.LOGS / f"interact-{args.tag}.log"
     log.write_text(proc.stdout + "\n--- stderr ---\n" + proc.stderr)
-    results = re.findall(r"^test (\S+) \.\.\. (ok|FAILED|ignored)$", proc.stdout, re.M)
+    report.check("UI test process exits successfully", proc.returncode == 0, f"exit {proc.returncode}; log: {log}")
+    results = re.findall(r"^test (\S+) \.\.\. (ok|FAILED|ignored)(?:, [^\n]*)?$", proc.stdout, re.M)
     if not results:
         report.check("UI test suite compiles and runs", False, proc.stderr.strip().splitlines()[-1:] or "no output")
     failures = dict(re.findall(r"---- (\S+) stdout ----\n(.*?)(?=\n----|\nfailures:|\Z)", proc.stdout, re.S))
     for name, status in results:
+        if status == "ignored":
+            report.skip(name.replace("_", " "), "ignored by the Rust test harness")
+            continue
         detail = "passed" if status == "ok" else _first_assert(failures.get(name, "failed"))
         report.check(name.replace("_", " "), status == "ok", detail)
-    report.metrics = {"tests": len(results), "log": str(log)}
+    report.metrics = {
+        "tests": len(results),
+        "passed": sum(status == "ok" for _, status in results),
+        "failed": sum(status == "FAILED" for _, status in results),
+        "skipped": sum(status == "ignored" for _, status in results),
+        "returncode": proc.returncode,
+        "log": str(log),
+    }
     report.finish()
 
 

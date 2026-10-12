@@ -29,13 +29,13 @@ pub const COMMANDS: &[(SlashCommand, &str, &str)] = &[
     (
         SlashCommand::Agent,
         "/agent",
-        "Switch agent: /agent claude, codex, droid or flint",
+        "Switch agent: /agent claude, codex, droid or hooter",
     ),
     (SlashCommand::Effort, "/effort", "Reasoning effort"),
     (
         SlashCommand::Mode,
         "/mode",
-        "The agent's mode (or flint's auto-run)",
+        "The agent's mode (or Hooter's auto-run)",
     ),
     (
         SlashCommand::Approval,

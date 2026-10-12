@@ -20,6 +20,7 @@ use serde_json::Value;
 use serde_json::json;
 
 use crate::protocol::JevConfig;
+use crate::protocol::JevQuestion;
 
 const TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -56,6 +57,17 @@ pub const WATCHDOG_QUESTION: NoulQuestion = NoulQuestion {
     no: "does not require changes — the user only asked a question or no file modifications are \
          needed",
 };
+
+impl JevQuestion {
+    /// The calibrated question this verdict answers.
+    pub fn noul(self) -> NoulQuestion {
+        match self {
+            JevQuestion::Stuck => STUCK_QUESTION,
+            JevQuestion::Verified => VERIFY_QUESTION,
+            JevQuestion::Watchdog => WATCHDOG_QUESTION,
+        }
+    }
+}
 
 /// HTTP client for the System One endpoint.
 #[derive(Debug, Clone)]
@@ -108,5 +120,25 @@ impl JevClient {
             .or_else(|| answer.get("p_yes"))?
             .as_f64()?;
         value.is_finite().then(|| value.clamp(0.0, 1.0))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_question_maps_to_its_wire_name_and_question() {
+        for (question, name, expected) in [
+            (JevQuestion::Stuck, "stuck", STUCK_QUESTION),
+            (JevQuestion::Verified, "verified", VERIFY_QUESTION),
+            (JevQuestion::Watchdog, "watchdog", WATCHDOG_QUESTION),
+        ] {
+            assert_eq!(question.name(), name);
+            let mapped = question.noul();
+            assert_eq!(mapped.instructions, expected.instructions);
+            assert_eq!(mapped.yes, expected.yes);
+            assert_eq!(mapped.no, expected.no);
+        }
     }
 }

@@ -17,6 +17,8 @@ use crate::protocol::ReasoningEffort;
 #[serde(rename_all = "snake_case")]
 pub enum Message {
     System(String),
+    /// Regenerated from the host task, not model history. Never compacted.
+    TaskContext(String),
     User(String),
     UserWithImages {
         text: String,
@@ -61,7 +63,7 @@ impl Serialize for WireMessage<'_> {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let mut map = serializer.serialize_map(None)?;
         match self.message {
-            Message::System(text) => {
+            Message::System(text) | Message::TaskContext(text) => {
                 map.serialize_entry("role", "system")?;
                 map.serialize_entry("content", text)?;
             }
@@ -174,6 +176,7 @@ impl ChatRequest<'_> {
                 .iter()
                 .map(|m| match m {
                     Message::System(t)
+                    | Message::TaskContext(t)
                     | Message::User(t)
                     | Message::Nudge(t)
                     | Message::Summary(t) => t.len(),

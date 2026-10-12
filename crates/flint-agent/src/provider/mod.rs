@@ -4,6 +4,7 @@
 pub mod stream;
 pub mod wire;
 
+use std::collections::HashSet;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -177,7 +178,7 @@ impl Provider {
             {
                 Ok(completion) => return Ok(completion),
                 Err(Attempt::Cancelled) => return Err(ProviderError::Cancelled),
-                Err(Attempt::Rejected(message)) if effort.is_some() => {
+                Err(Attempt::Rejected(_)) if effort.is_some() => {
                     effort = None;
                     body = Bytes::from(ChatRequest { effort, ..*request }.body(&self.model));
                     let mut retried_shown = false;
@@ -191,10 +192,10 @@ impl Provider {
                         }
                         Err(Attempt::Cancelled) => Err(ProviderError::Cancelled),
                         Err(
-                            Attempt::Rejected(_)
-                            | Attempt::Retryable(_)
-                            | Attempt::Throttled(..)
-                            | Attempt::Fatal(_),
+                            Attempt::Rejected(message)
+                            | Attempt::Retryable(message)
+                            | Attempt::Throttled(message, _)
+                            | Attempt::Fatal(message),
                         ) => Err(ProviderError::Failed(message)),
                     };
                 }
@@ -337,6 +338,16 @@ impl Provider {
                 )));
             }
         }
+        let mut ids = HashSet::new();
+        if completion
+            .tool_calls
+            .iter()
+            .any(|call| !ids.insert(call.id.as_str()))
+        {
+            return Err(Attempt::Fatal(
+                "provider returned duplicate tool-call IDs; no tools were executed".into(),
+            ));
+        }
         completion.timing = timing;
         Ok(completion)
     }
@@ -370,12 +381,16 @@ fn handle_payload(
     on_delta: &mut (dyn FnMut(StreamDelta) + Send),
     shown: &mut bool,
 ) -> Result<bool, Attempt> {
-    if payload.trim() == "[DONE]" {
+    let payload = payload.trim();
+    if payload.is_empty() {
+        return Ok(false);
+    }
+    if payload == "[DONE]" {
         return Ok(true);
     }
-    let Ok(chunk) = serde_json::from_str::<Value>(payload) else {
-        return Ok(false);
-    };
+    let chunk = serde_json::from_str::<Value>(payload).map_err(|_| {
+        Attempt::Fatal("invalid JSON in provider stream; no tools were executed".into())
+    })?;
     if let Some(error) = chunk.get("error") {
         let message = error
             .get("message")

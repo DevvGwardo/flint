@@ -38,9 +38,12 @@ fn unicode_filename_match_is_first_and_keyboard_attaches_the_exact_path(cx: &mut
         assert_eq!(ui.read(cx, |app, _| app.attachments.clone()), ["目录/x.rs"]);
         ui.press(cx, "enter");
         let sent = engine.sent();
-        assert!(matches!(sent.as_slice(), [Op::UserMessage(message)]
-            if message.contains("[Attached file 目录/x.rs (1 lines)]")
-                && message.contains("// chosen Unicode filename fixture")
-                && !message.contains("// directory-only match fixture")));
+        assert!(
+            matches!(sent.as_slice(), [Op::UserMessageWithContext { request,text,images,steering_id:None }]
+            if request=="explain @目录/x.rs"
+                && text.contains("[Attached file 目录/x.rs (1 lines)]")
+                && text.contains("// chosen Unicode filename fixture")
+                && !text.contains("// directory-only match fixture") && images.is_empty())
+        );
     }
 }

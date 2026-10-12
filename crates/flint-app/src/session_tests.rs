@@ -736,7 +736,8 @@ fn failed_stopped_and_starting_sessions_have_their_own_status() {
     assert_eq!(broken.status(), Status::Failed { seen: true });
     // A new turn clears it.
     finished(&mut broken, TurnEndReason::Completed);
-    assert_eq!(broken.status(), Status::Done);
+    assert_eq!(broken.status(), Status::NeedsReview);
+    assert!(broken.failure().is_none());
 
     // Notices don't fail a session: one inside a completed turn, or one
     // after it (e.g. undo had nothing to restore).
@@ -756,7 +757,8 @@ fn failed_stopped_and_starting_sessions_have_their_own_status() {
         AgentEvent::Error("There are no file changes to undo.".into()),
         secs(2),
     );
-    assert_eq!(fine.status(), Status::Done);
+    assert_eq!(fine.status(), Status::NeedsReview);
+    assert!(fine.failure().is_none());
 
     assert_eq!(Status::Starting.bucket(), Bucket::Working);
 }

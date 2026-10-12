@@ -183,12 +183,12 @@ fn item_label(item: &ProjectItem) -> (IconName, String, Option<String>) {
         ProjectItem::OpenFolder => (
             IconName::FolderOpen,
             "Open project folder…".to_string(),
-            Some("⌘O".to_string()),
+            Some(crate::shortcuts::label("⌘O").into_owned()),
         ),
         ProjectItem::Worktrees => (
-            IconName::Folder,
-            "Git worktrees…".to_string(),
-            Some("Isolated checkouts".to_string()),
+            IconName::GitBranch,
+            "Git branches & worktrees…".to_string(),
+            Some("Local · remote".to_string()),
         ),
         ProjectItem::Recent(path) => (IconName::Folder, folder_name(path), Some(short_path(path))),
         ProjectItem::AttachFile => (
@@ -211,7 +211,7 @@ fn item_label(item: &ProjectItem) -> (IconName, String, Option<String>) {
 
 /// `~/code/app` style path for the menu.
 fn short_path(path: &Path) -> String {
-    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let home = flint_platform::home_dir();
     match home
         .as_deref()
         .and_then(|home| path.strip_prefix(home).ok())

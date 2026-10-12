@@ -185,7 +185,7 @@ pub fn pinned(
                 if native {
                     "This approves ALL pending parent and subagent requests and skips future approvals in this native engine, including later turns. It does not change other sessions or your saved setting."
                 } else {
-                    "This asks the ACP agent to allow this request broadly and makes Flint auto-approve later requests in this ACP session. The agent may apply its own permission rules. It does not change other sessions."
+                    "This asks the ACP agent to allow this request broadly and makes Hooter auto-approve later requests in this ACP session. The agent may apply its own permission rules. It does not change other sessions."
                 },
                 size::SM,
                 p.warning,
@@ -205,7 +205,7 @@ pub fn pinned(
                 .child(div().id("deny-button").child(deny).test_support())
                 .child(key("N"))
                 .child(div().flex_1())
-                .child(ui::label("or ⌘⏎ to approve", size::XS, p.text_subtle)),
+                .child(ui::label(crate::shortcuts::label("or ⌘⏎ to approve").into_owned(), size::XS, p.text_subtle)),
         )
         .test_support()
         .into_any_element()

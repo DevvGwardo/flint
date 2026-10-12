@@ -78,11 +78,19 @@ impl SubagentView {
             Status::Running
         } else if matches!(
             self.view.last_reason,
-            Some(TurnEndReason::Failed(_) | TurnEndReason::StepLimit)
+            Some(
+                TurnEndReason::Failed(_)
+                    | TurnEndReason::StepLimit
+                    | TurnEndReason::ContinuationLimit
+            )
         ) {
             Status::Failed { seen: !self.unread }
         } else if self.view.last_reason == Some(TurnEndReason::Interrupted) {
             Status::Stopped
+        } else if self.view.outcome() == flint_agent::TaskOutcome::Blocked {
+            Status::Blocked
+        } else if !self.view.outcome().allows_queue() {
+            Status::NeedsReview
         } else if self.unread {
             Status::Unread
         } else {
@@ -93,11 +101,13 @@ impl SubagentView {
     pub fn status_text(&self, parent: &SessionView) -> &'static str {
         match self.status(parent) {
             Status::NeedsApproval => "Needs approval",
+            Status::NeedsReview => self.view.outcome().label(),
+            Status::Blocked => "Blocked",
             Status::Running if self.queued => "Queued",
             Status::Running => "Running",
             Status::Failed { .. } => "Failed",
             Status::Stopped => "Stopped",
-            Status::Unread | Status::Done => "Done",
+            Status::Unread | Status::Done => self.view.outcome().label(),
             Status::Idle | Status::Starting => "Ready",
         }
     }

@@ -762,7 +762,9 @@ async fn run_command_reports_exit_code_and_streams() {
     let outcome = execute(
         &agent(&ws),
         RUN_COMMAND,
-        &args(json!({"command": "echo hi; echo oops >&2; exit 3"})),
+        &args(json!({"command": if cfg!(windows) {
+            "echo hi & echo oops 1>&2 & exit /b 3"
+        } else { "echo hi; echo oops >&2; exit 3" }})),
         &on_output,
         &CancellationToken::new(),
     )
@@ -780,7 +782,9 @@ async fn run_command_times_out_and_returns_after_background_children() {
     let slow = run(
         &ws,
         RUN_COMMAND,
-        json!({"command": "sleep 5", "timeout_secs": 1}),
+        json!({"command": if cfg!(windows) {
+            "powershell.exe -NoProfile -NonInteractive -Command \"Start-Sleep -Seconds 5\""
+        } else { "sleep 5" }, "timeout_secs": 1}),
     )
     .await;
     assert_eq!(slow.output, "[timed out after 1s; process killed]");
@@ -788,13 +792,16 @@ async fn run_command_times_out_and_returns_after_background_children() {
     let bg = run(
         &ws,
         RUN_COMMAND,
-        json!({"command": "(sleep 5 &) ; echo started"}),
+        json!({"command": if cfg!(windows) {
+            "start /b powershell.exe -NoProfile -NonInteractive -Command \"Start-Sleep -Seconds 5\" & echo started"
+        } else { "(sleep 5 &) ; echo started" }}),
     )
     .await;
     assert!(bg.success, "{}", bg.output);
     assert!(started.elapsed() < std::time::Duration::from_secs(3));
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn run_command_timeout_still_applies_after_both_pipes_close() {
     let (_guard, ws) = workspace();
@@ -812,6 +819,7 @@ async fn run_command_timeout_still_applies_after_both_pipes_close() {
     assert!(!outcome.success);
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn run_command_cancellation_still_applies_after_both_pipes_close() {
     let (_guard, ws) = workspace();

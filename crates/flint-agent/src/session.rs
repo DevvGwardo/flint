@@ -18,6 +18,7 @@ use tokio_util::sync::CancellationToken;
 use crate::approvals::Approvals;
 use crate::approvals::Request;
 use crate::context::ContextTracker;
+use crate::harness::FinishDecision;
 use crate::harness::Harness;
 use crate::harness::args::RepairedArgs;
 use crate::harness::args::closest_tool_name;
@@ -34,6 +35,7 @@ use crate::protocol::ApprovalDecision;
 use crate::protocol::ApprovalMode;
 use crate::protocol::FALLBACK_CONTEXT_WINDOW_TOKENS;
 use crate::protocol::ImageAttachment;
+use crate::protocol::JevConfig;
 use crate::protocol::NudgeReason;
 use crate::protocol::Op;
 use crate::protocol::ReasoningEffort;
@@ -48,6 +50,7 @@ use crate::provider::ProviderError;
 use crate::provider::RawToolCall;
 use crate::provider::StreamDelta;
 use crate::subagents::Subagents;
+use crate::task::{self, CommandTiming, TaskEdit, TaskMode, TaskRecord, TaskReview};
 use crate::tools;
 
 /// Model calls allowed in one user turn: a cost backstop, not a working
@@ -64,33 +67,95 @@ pub const MAX_STEPS_PER_TURN: u32 = 600;
 pub const MAX_CHILD_STEPS_PER_TURN: u32 = 200;
 
 /// Runs a session until `Shutdown` or until the front end drops its sender.
-pub(crate) async fn run(config: AgentConfig, ops: Receiver<Op>, events: Sender<AgentEvent>) {
+pub(crate) async fn run(
+    config: AgentConfig,
+    options: crate::ExecutionOptions,
+    ops: Receiver<Op>,
+    events: Sender<AgentEvent>,
+) {
+    let saver = match config.session_dir.clone().map(Saver::try_new).transpose() {
+        Ok(saver) => saver,
+        Err(error) => {
+            ops.close();
+            let _ = events.try_send(AgentEvent::Error(format!(
+                "Couldn't restore the saved conversation: {error}. Execution is held."
+            )));
+            let _ = events.try_send(AgentEvent::SessionStopped {
+                history_saved: false,
+            });
+            return;
+        }
+    };
     let current = Arc::new(Mutex::new(CancellationToken::new()));
+    // Interrupt cancels a turn, not the session's MCP inventory. Only
+    // Shutdown/closed intake should abandon startup and its owned servers.
+    let shutdown = CancellationToken::new();
     let effort = Arc::new(Mutex::new(config.reasoning_effort));
+    let jev_settings = Arc::new(Mutex::new(config.jev.clone()));
     let approvals = Arc::new(Approvals::default());
     let stopping = Arc::new(AtomicBool::new(false));
+    let tools = tools::ToolContext::new(config.workspace.clone(), config.sandbox);
     let (messages_tx, messages_rx) = async_channel::unbounded::<Input>();
 
     // Ops are handled on their own task so Interrupt and Approval reach a
     // running turn, and user messages queue while one is in flight.
     let ops_current = Arc::clone(&current);
     let ops_effort = Arc::clone(&effort);
+    let ops_jev = Arc::clone(&jev_settings);
     let ops_approvals = Arc::clone(&approvals);
     let ops_stopping = Arc::clone(&stopping);
+    let ops_shutdown = shutdown.clone();
+    let ops_work_clock = tools.work_clock.clone();
     tokio::spawn(async move {
         while let Ok(op) = ops.recv().await {
             match op {
                 Op::UserMessage(text) => {
+                    ops_work_clock.queue_restriction(&text);
                     let _ = messages_tx.send(Input::Message(text, Vec::new())).await;
                 }
                 Op::UserMessageWithImages { text, images } => {
+                    ops_work_clock.queue_restriction(&text);
                     let _ = messages_tx.send(Input::Message(text, images)).await;
                 }
+                Op::UserMessageWithContext {
+                    request,
+                    text,
+                    images,
+                    steering_id,
+                } => {
+                    ops_work_clock.queue_restriction(&request);
+                    let _ = messages_tx
+                        .send(Input::ContextMessage {
+                            request,
+                            text,
+                            images,
+                            steering_id,
+                        })
+                        .await;
+                }
                 Op::SteerMessage { id, text, images } => {
+                    ops_work_clock.queue_restriction(&text);
                     let _ = messages_tx.send(Input::Steer { id, text, images }).await;
                 }
                 Op::UndoLastTurn => {
                     let _ = messages_tx.send(Input::Undo).await;
+                }
+                Op::EditTask(edit) => {
+                    let _ = messages_tx.send(Input::EditTask(edit)).await;
+                }
+                Op::ReviewTask(review) => {
+                    let _ = messages_tx.send(Input::ReviewTask(review)).await;
+                }
+                Op::ContinueTask {
+                    task_id,
+                    expected_revision,
+                } => {
+                    let _ = messages_tx
+                        .send(Input::ContinueTask {
+                            task_id,
+                            expected_revision,
+                        })
+                        .await;
                 }
                 Op::Interrupt => cancel_current(&ops_current),
                 Op::Approval { call_id, decision } => {
@@ -101,6 +166,9 @@ pub(crate) async fn run(config: AgentConfig, ops: Receiver<Op>, events: Sender<A
                         *slot = level;
                     }
                 }
+                Op::SetJev(config) => {
+                    *ops_jev.lock().unwrap_or_else(|error| error.into_inner()) = config;
+                }
                 // flint's engine exposes no options beyond effort (its own op).
                 Op::SetSessionOption { .. } => {}
                 Op::Shutdown => break,
@@ -108,6 +176,7 @@ pub(crate) async fn run(config: AgentConfig, ops: Receiver<Op>, events: Sender<A
         }
         ops_stopping.store(true, Ordering::SeqCst);
         cancel_current(&ops_current);
+        ops_shutdown.cancel();
         messages_tx.close();
     });
 
@@ -115,28 +184,93 @@ pub(crate) async fn run(config: AgentConfig, ops: Receiver<Op>, events: Sender<A
     let mcp = if config.mcp_servers.is_empty() {
         None
     } else {
-        let (hub, errors) = McpHub::start(&config.mcp_servers, &config.workspace).await;
-        for error in errors {
-            let _ = events.try_send(AgentEvent::Error(error));
+        tokio::select! {
+            biased;
+            () = shutdown.cancelled() => None,
+            (hub, errors) = McpHub::start(&config.mcp_servers, &config.workspace) => {
+                for error in errors {
+                    let _ = events.try_send(AgentEvent::Error(error));
+                }
+                Some(Arc::new(hub))
+            }
         }
-        Some(Arc::new(hub))
     };
-    let tools = tools::ToolContext::new(config.workspace.clone(), config.sandbox);
-    let mut session = Session::new(config, events, approvals, effort, tools, mcp, false);
+    let mut session = Session::new_with_saver(
+        config,
+        events,
+        approvals,
+        effort,
+        tools,
+        mcp,
+        false,
+        Ok(saver),
+    );
+    session.jev_settings = jev_settings;
+    if !options.allow_subagents {
+        session.subagents = None;
+        session.tool_names.retain(|name| name != tools::SPAWN_AGENT);
+        let mut specs = tools::tool_specs();
+        specs.retain(|spec| spec["function"]["name"] != tools::SPAWN_AGENT);
+        if let Some(hub) = &session.mcp {
+            specs.extend(hub.specs());
+        }
+        session.tools_json = serde_json::to_string(&specs).unwrap_or_default();
+    }
     session.inbox = Some(messages_rx);
     if auto_budget {
-        let limits = session.provider.model_limits().await;
+        // Shutdown/closed prompt intake must interrupt bootstrap network
+        // waits too, before a first turn owns its cancellation token.
+        let bootstrap = current
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone();
+        let limits = tokio::select! {
+            biased;
+            () = bootstrap.cancelled() => None,
+            limits = session.provider.model_limits() => limits,
+        };
         session.context.set_budget(budget_for_window(limits));
     }
     while let Some(input) = session.next_input().await {
-        let (text, images, steering) = match input {
-            Input::Message(text, images) => (text, images, None),
-            Input::Steer { id, text, images } => (text, images, Some(id)),
+        let (request, text, images, steering) = match input {
+            Input::Message(text, images) => (text.clone(), text, images, None),
+            Input::Steer { id, text, images } => (text.clone(), text, images, Some(id)),
+            Input::ContextMessage {
+                request,
+                text,
+                images,
+                steering_id,
+            } => (request, text, images, steering_id),
             Input::Undo => {
-                session.undo();
+                session.undo().await;
                 continue;
             }
+            Input::EditTask(edit) => {
+                session.edit_task(edit).await;
+                continue;
+            }
+            Input::ReviewTask(review) => {
+                session.review_task(review).await;
+                continue;
+            }
+            Input::ContinueTask {
+                task_id,
+                expected_revision,
+            } => {
+                if session.task.as_ref().is_none_or(|task| {
+                    task.contract.id != task_id || task.contract.revision != expected_revision
+                }) {
+                    session.emit(AgentEvent::Error(
+                        "The task changed. Reopen its details before continuing.".into(),
+                    ));
+                    continue;
+                }
+                session.continuing_task = true;
+                let text: String = "Continue the protected task. Address its outstanding requirements and blockers.".into();
+                (text.clone(), text, Vec::new(), None)
+            }
         };
+        session.tools.work_clock.consume_restriction(&request);
         let token = CancellationToken::new();
         if let Ok(mut slot) = current.lock() {
             *slot = token.clone();
@@ -147,7 +281,9 @@ pub(crate) async fn run(config: AgentConfig, ops: Receiver<Op>, events: Sender<A
         if let Some(id) = steering {
             session.emit(AgentEvent::SteeringAccepted { id });
         }
-        session.run_turn_with_images(text, images, &token).await;
+        session
+            .run_turn_with_request(request, text, images, &token)
+            .await;
     }
     let mut history_saved = true;
     if let Some(saver) = session.saver.take()
@@ -188,12 +324,24 @@ pub(crate) fn budget_for_window(limits: Option<ModelLimits>) -> u64 {
 /// What the front end sends a session between (or during) turns.
 pub(super) enum Input {
     Message(String, Vec<ImageAttachment>),
+    ContextMessage {
+        request: String,
+        text: String,
+        images: Vec<ImageAttachment>,
+        steering_id: Option<u64>,
+    },
     Steer {
         id: u64,
         text: String,
         images: Vec<ImageAttachment>,
     },
     Undo,
+    EditTask(TaskEdit),
+    ReviewTask(TaskReview),
+    ContinueTask {
+        task_id: u64,
+        expected_revision: u64,
+    },
 }
 
 /// Retries of one step after the stream broke mid-reply.
@@ -210,6 +358,7 @@ pub(super) struct Session {
     config: AgentConfig,
     provider: Provider,
     jev: Option<JevClient>,
+    jev_settings: Arc<Mutex<Option<JevConfig>>>,
     pub(super) history: Vec<Message>,
     pub(super) events: Sender<AgentEvent>,
     approvals: Arc<Approvals>,
@@ -236,9 +385,54 @@ pub(super) struct Session {
     deferred: VecDeque<Input>,
     /// Told to the model with the next user message (e.g. an undo).
     pending_note: Option<String>,
+    pub(super) task: Option<TaskRecord>,
+    pub(super) inherited_read_only: bool,
+    pub(super) inherited_restrictions: Vec<String>,
+    /// Call-start epochs, so parallel child edits cannot turn a stale check
+    /// into current verification. This is live observation, not report order.
+    call_epochs: std::collections::HashMap<String, (u64, bool)>,
+    continuing_task: bool,
+    last_task_projection: Option<(u64, TaskRecord)>,
+    restore_error: Option<String>,
+}
+
+async fn scan_task_files(
+    mut task: TaskRecord,
+    workspace: std::path::PathBuf,
+    scan: impl FnOnce(&mut TaskRecord, &std::path::Path) -> bool + Send + 'static,
+) -> Result<(TaskRecord, bool), tokio::task::JoinError> {
+    // One awaited scanner per session, at most four active children. Keep
+    // disk reads and bytewise hashing off the parent/child polling loop.
+    tokio::task::spawn_blocking(move || {
+        let changed = scan(&mut task, &workspace);
+        (task, changed)
+    })
+    .await
 }
 
 impl Session {
+    pub(super) fn stage_jev(&mut self, config: Option<JevConfig>) {
+        *self
+            .jev_settings
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = config;
+    }
+
+    fn apply_jev_settings(&mut self) {
+        let config = self
+            .jev_settings
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone();
+        if config != self.config.jev {
+            self.jev = config.clone().map(JevClient::new);
+            self.config.jev = config.clone();
+            if let Some(children) = &mut self.subagents {
+                children.set_jev(config);
+            }
+        }
+    }
+
     pub(super) fn new(
         config: AgentConfig,
         events: Sender<AgentEvent>,
@@ -248,6 +442,30 @@ impl Session {
         mcp: Option<Arc<McpHub>>,
         child: bool,
     ) -> Self {
+        let saver = config
+            .session_dir
+            .clone()
+            .map(Saver::try_new)
+            .transpose()
+            .map_err(|error| error.to_string());
+        Self::new_with_saver(config, events, approvals, effort, tools, mcp, child, saver)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_with_saver(
+        config: AgentConfig,
+        events: Sender<AgentEvent>,
+        approvals: Arc<Approvals>,
+        effort: Arc<Mutex<Option<ReasoningEffort>>>,
+        tools: tools::ToolContext,
+        mcp: Option<Arc<McpHub>>,
+        child: bool,
+        saved: Result<Option<Saver>, String>,
+    ) -> Self {
+        let (saver, mut restore_error) = match saved {
+            Ok(saver) => (saver, None),
+            Err(error) => (None, Some(error)),
+        };
         let mut specs = tools::tool_specs();
         if child {
             specs.retain(|spec| spec["function"]["name"] != tools::SPAWN_AGENT);
@@ -269,24 +487,33 @@ impl Session {
         };
         let mut history = vec![Message::System(prompt)];
         let mut turn_id = 0;
-        if let Some(dir) = &config.session_dir {
+        let mut task = None;
+        if restore_error.is_none()
+            && let Some(dir) = &config.session_dir
+        {
             match persist::load(dir) {
                 Ok(Some(restored)) => {
                     turn_id = restored.turn_id;
                     history.extend(restored.messages);
+                    task = restored.task;
                 }
                 Ok(None) => {}
                 Err(message) => {
-                    let _ = events.try_send(AgentEvent::Error(format!(
-                        "Couldn't restore the saved conversation: {message}. Starting fresh."
-                    )));
+                    restore_error = Some(message);
                 }
             }
+        }
+        if let Some(task) = &task {
+            tools.work_clock.restore(
+                task.work_revision,
+                task.checks.iter().map(|check| check.id).max().unwrap_or(0),
+            );
         }
         Self {
             subagents: (!child).then(|| Subagents::new(config.clone(), tools.child(), mcp.clone())),
             provider: Provider::new(&config.base_url, &config.model, &config.api_key),
             jev: config.jev.clone().map(JevClient::new),
+            jev_settings: Arc::new(Mutex::new(config.jev.clone())),
             context: ContextTracker::new(
                 if config.context_budget_tokens == 0 {
                     budget_for_window(None)
@@ -295,7 +522,7 @@ impl Session {
                 },
                 tools_json.len(),
             ),
-            saver: config.session_dir.clone().map(Saver::new),
+            saver,
             history,
             approval: config.approval,
             config,
@@ -319,6 +546,13 @@ impl Session {
             inbox: None,
             deferred: VecDeque::new(),
             pending_note: None,
+            task,
+            inherited_read_only: false,
+            inherited_restrictions: Vec::new(),
+            call_epochs: Default::default(),
+            continuing_task: false,
+            last_task_projection: None,
+            restore_error,
         }
     }
 
@@ -332,33 +566,50 @@ impl Session {
 
     /// Messages the user sent while this turn runs. Undo requests wait for
     /// the turn to end.
-    fn take_steering(&mut self) -> Vec<(String, Vec<ImageAttachment>)> {
+    async fn take_steering(&mut self) -> Vec<(String, String, Vec<ImageAttachment>)> {
         let mut messages = Vec::new();
         if !self.deferred.is_empty() {
             return messages;
         }
-        let Some(inbox) = &self.inbox else {
+        let Some(inbox) = self.inbox.clone() else {
             return messages;
         };
         while let Ok(input) = inbox.try_recv() {
             match input {
                 Input::Message(text, images) if self.deferred.is_empty() => {
-                    messages.push((text, images));
+                    messages.push((text.clone(), text, images));
                 }
                 Input::Steer { id, text, images } if self.deferred.is_empty() => {
                     self.events
                         .try_send(AgentEvent::SteeringAccepted { id })
                         .ok();
-                    messages.push((text, images));
+                    messages.push((text.clone(), text, images));
                 }
+                Input::ContextMessage {
+                    request,
+                    text,
+                    images,
+                    steering_id,
+                } if self.deferred.is_empty() => {
+                    if let Some(id) = steering_id {
+                        self.events
+                            .try_send(AgentEvent::SteeringAccepted { id })
+                            .ok();
+                    }
+                    messages.push((request, text, images));
+                }
+                Input::EditTask(edit) if self.deferred.is_empty() => self.edit_task(edit).await,
                 other => self.deferred.push_back(other),
             }
+        }
+        for (request, _, _) in &messages {
+            self.tools.work_clock.consume_restriction(request);
         }
         messages
     }
 
     /// Restores the files the last turn with changes edited.
-    fn undo(&mut self) {
+    async fn undo(&mut self) {
         let report = match self.tools.seen.journal().lock() {
             Ok(mut journal) => journal.undo_last(&self.tools.seen),
             Err(_) => Err("The undo journal is unavailable.".to_string()),
@@ -372,6 +623,19 @@ impl Session {
                          are back to how they were before it: {}. Re-read them before editing.]",
                         files.join(", ")
                     ));
+                    let reason = self
+                        .task
+                        .as_ref()
+                        .and_then(|task| task.assessment.as_ref())
+                        .map(|assessment| assessment.reason.clone());
+                    self.tools.work_clock.advance();
+                    self.refresh_task_files().await;
+                    if let (Some(task), Some(reason)) = (&mut self.task, reason) {
+                        task.assess(reason, true);
+                    }
+                    self.update_task_context();
+                    self.save();
+                    self.emit_task(true);
                 }
                 self.emit(AgentEvent::FilesReverted {
                     turn_id: report.turn_id,
@@ -394,7 +658,226 @@ impl Session {
     /// Queues a snapshot of the history for the background writer.
     fn save(&self) {
         if let Some(saver) = &self.saver {
-            saver.save(persist::snapshot(self.turn_id, &self.history));
+            saver.save(persist::snapshot_with_task(
+                self.turn_id,
+                &self.history,
+                self.task.as_ref(),
+            ));
+        }
+    }
+
+    async fn edit_task(&mut self, edit: TaskEdit) {
+        let previous = self.task.clone();
+        let result = self
+            .task
+            .as_mut()
+            .ok_or_else(|| "There is no task to revise.".to_string())
+            .and_then(|task| task.edit(edit));
+        match result {
+            Ok(()) => {
+                if let Some(reason) = previous
+                    .as_ref()
+                    .and_then(|task| task.assessment.as_ref())
+                    .map(|assessment| assessment.reason.clone())
+                    && let Some(task) = &mut self.task
+                {
+                    task.assess(reason, true);
+                }
+                self.update_task_context();
+                if !self.child {
+                    self.tools.work_clock.set_read_only(
+                        self.task
+                            .as_ref()
+                            .is_some_and(|task| task.contract.mode == TaskMode::ReadOnly),
+                    );
+                }
+                self.save();
+                if self.checkpoint_task().await {
+                    self.emit_task(false);
+                } else {
+                    self.task = previous;
+                    if !self.child {
+                        self.tools.work_clock.set_read_only(
+                            self.task
+                                .as_ref()
+                                .is_some_and(|task| task.contract.mode == TaskMode::ReadOnly),
+                        );
+                    }
+                    self.update_task_context();
+                    self.save();
+                }
+            }
+            Err(error) => self.emit(AgentEvent::Error(error)),
+        }
+    }
+
+    async fn review_task(&mut self, review: TaskReview) {
+        if review.turn_id != self.turn_id {
+            self.emit(AgentEvent::Error(
+                "This review belongs to an earlier turn. Review the latest result first.".into(),
+            ));
+            return;
+        }
+        let previous_reason = self
+            .task
+            .as_ref()
+            .and_then(|task| task.assessment.as_ref())
+            .map(|assessment| assessment.reason.clone());
+        self.refresh_task_files().await;
+        let revision = self.tools.work_clock.revision();
+        if let Some(task) = &mut self.task
+            && task.assessment.is_none()
+            && let Some(reason) = previous_reason
+        {
+            task.assess(reason, true);
+        }
+        let previous = self.task.clone();
+        let result = self
+            .task
+            .as_mut()
+            .ok_or_else(|| "There is no task to review.".to_string())
+            .and_then(|task| {
+                task.set_work_revision(revision);
+                task.review(&review)
+            });
+        match result {
+            Ok(()) => {
+                self.save();
+                if self.checkpoint_task().await {
+                    self.emit_task(true);
+                } else {
+                    self.task = previous;
+                    self.save();
+                }
+            }
+            Err(error) => {
+                self.save();
+                self.emit_task(true);
+                self.emit(AgentEvent::Error(error));
+            }
+        }
+    }
+
+    async fn checkpoint_task(&self) -> bool {
+        if let Some(saver) = &self.saver
+            && saver.checkpoint().await.is_err()
+        {
+            self.emit(AgentEvent::Error(
+                "Couldn't save engine history. The task change was not confirmed; keep queued work paused.".into(),
+            ));
+            false
+        } else {
+            true
+        }
+    }
+
+    async fn refresh_task_files(&mut self) {
+        if let Some(task) = self.task.clone() {
+            match scan_task_files(
+                task,
+                self.tools.workspace.clone(),
+                TaskRecord::refresh_files,
+            )
+            .await
+            {
+                Ok((task, changed)) => {
+                    self.task = Some(task);
+                    if changed {
+                        self.tools.work_clock.advance();
+                    }
+                }
+                Err(_) => {
+                    if let Some(task) = &mut self.task {
+                        task.evidence_overflow = true;
+                    }
+                    self.emit(AgentEvent::Error("File evidence could not be refreshed. Existing scope has been kept; review the unknown evidence.".into()));
+                }
+            }
+        }
+        if let Some(task) = &mut self.task {
+            task.set_work_revision(self.tools.work_clock.revision());
+        }
+    }
+
+    fn update_task_context(&mut self) {
+        self.history
+            .retain(|message| !matches!(message, Message::TaskContext(_)));
+        if let Some(task) = &self.task {
+            let inherited =
+                if self.inherited_read_only || (self.child && self.tools.work_clock.read_only()) {
+                    "\nInherited parent policy: read-only. No edits or non-inspection commands."
+                } else {
+                    ""
+                };
+            let context = format!(
+                "{}{}\nParent restrictions: {:?}",
+                task.context(),
+                inherited,
+                self.inherited_restrictions
+            );
+            self.history
+                .insert(1.min(self.history.len()), Message::TaskContext(context));
+        }
+    }
+
+    fn read_only_scope(&self) -> bool {
+        self.inherited_read_only
+            || self.tools.work_clock.read_only()
+            || self
+                .task
+                .as_ref()
+                .is_some_and(|task| task.contract.mode == TaskMode::ReadOnly)
+    }
+
+    /// Tool visibility helps the model follow scope; the execution boundary
+    /// still rejects stale/hallucinated calls and policy changes while waiting.
+    fn scoped_tools_json(&self) -> std::borrow::Cow<'_, str> {
+        if !self.read_only_scope() {
+            return std::borrow::Cow::Borrowed(&self.tools_json);
+        }
+        let mut specs: Vec<Value> =
+            serde_json::from_str(&self.tools_json).expect("host tool specs are valid JSON");
+        specs.retain(|spec| {
+            let name = spec["function"]["name"].as_str().unwrap_or_default();
+            !matches!(name, tools::WRITE_FILE | tools::EDIT_FILE)
+                && !name.starts_with(crate::mcp::PREFIX)
+        });
+        for spec in &mut specs {
+            if spec["function"]["name"] == tools::RUN_COMMAND {
+                spec["function"]["description"] = Value::String(
+                    "Inspect only: simple pwd, ls, cat, rg or read-only git commands. \
+                     No shell chains, redirection, interpreters, tests, builds or writes. \
+                     Prefer read_file, list_dir and grep. Return review findings in chat."
+                        .into(),
+                );
+            }
+        }
+        std::borrow::Cow::Owned(serde_json::to_string(&specs).expect("specs serialize"))
+    }
+
+    fn emit_task(&mut self, assessed: bool) {
+        if let Some(task) = &self.task {
+            if !assessed
+                && self
+                    .last_task_projection
+                    .as_ref()
+                    .is_some_and(|(turn_id, previous)| *turn_id == self.turn_id && previous == task)
+            {
+                return;
+            }
+            self.last_task_projection = Some((self.turn_id, task.clone()));
+            let task = Box::new(task.clone());
+            self.emit(if assessed {
+                AgentEvent::TaskAssessed {
+                    turn_id: self.turn_id,
+                    task,
+                }
+            } else {
+                AgentEvent::TaskUpdated {
+                    turn_id: self.turn_id,
+                    task,
+                }
+            });
         }
     }
 
@@ -426,11 +909,79 @@ impl Session {
         images: Vec<ImageAttachment>,
         cancel: &CancellationToken,
     ) -> TurnEndReason {
+        self.run_turn_with_request(text.clone(), text, images, cancel)
+            .await
+    }
+
+    async fn run_turn_with_request(
+        &mut self,
+        request: String,
+        text: String,
+        images: Vec<ImageAttachment>,
+        cancel: &CancellationToken,
+    ) -> TurnEndReason {
+        if let Some(error) = &self.restore_error {
+            let reason = TurnEndReason::Failed(format!(
+                "Couldn't restore the saved conversation: {error}. Execution is held."
+            ));
+            if let TurnEndReason::Failed(message) = &reason {
+                self.emit(AgentEvent::Error(message.clone()));
+            }
+            return reason;
+        }
+        self.apply_jev_settings();
         self.turn_id += 1;
         let turn_id = self.turn_id;
         self.emit(AgentEvent::TurnStarted { turn_id });
+        // Short follow-ups resume an unresolved protected goal. Ordinary new
+        // requests start a new task; old raw requests remain in history/logs.
+        let resume = self.continuing_task || task::is_continue_request(&request);
+        self.continuing_task = false;
+        if !resume || self.task.is_none() {
+            self.task = Some(TaskRecord::new(
+                turn_id,
+                request,
+                self.tools.work_clock.revision(),
+            ));
+        } else if let Some(task) = &mut self.task {
+            task.acceptance = None;
+            task.assessment = None;
+            task.continuation_stop = None;
+        }
+        self.refresh_task_files().await;
+        if !self.child {
+            self.tools.work_clock.set_read_only(
+                self.task
+                    .as_ref()
+                    .is_some_and(|task| task.contract.mode == TaskMode::ReadOnly),
+            );
+        }
+        self.update_task_context();
+        self.emit_task(false);
         let reason = self.turn_loop(text, images, turn_id, cancel).await;
+        self.refresh_task_files().await;
+        let final_text = self
+            .history
+            .iter()
+            .rev()
+            .take_while(|message| {
+                !matches!(message, Message::User(_) | Message::UserWithImages { .. })
+            })
+            .find_map(|message| match message {
+                Message::Assistant {
+                    content,
+                    tool_calls,
+                    ..
+                } if tool_calls.is_empty() => Some(content.clone()),
+                _ => None,
+            })
+            .unwrap_or_default();
+        if let Some(task) = &mut self.task {
+            task.note_final(&final_text);
+            task.assess(reason.clone(), !final_text.trim().is_empty());
+        }
         self.save();
+        self.emit_task(true);
         self.emit(AgentEvent::TurnFinished {
             turn_id,
             reason: reason.clone(),
@@ -450,7 +1001,14 @@ impl Session {
         {
             journal.begin_turn(turn_id);
         }
-        let mut harness = Harness::new(&text, self.jev.clone());
+        let goal = self
+            .task
+            .as_ref()
+            .map_or(text.as_str(), |task| task.contract.objective.as_str());
+        let mut harness = Harness::new(goal, self.jev.clone());
+        if let Some(task) = &self.task {
+            harness.set_task_record(task);
+        }
         self.push_user(text, images);
         let mut usage = Usage::default();
         self.last_usage = usage;
@@ -460,13 +1018,25 @@ impl Session {
             if cancel.is_cancelled() {
                 return TurnEndReason::Interrupted;
             }
-            for (text, images) in self.take_steering() {
-                harness.add_user_message(&text);
+            for (request, text, images) in self.take_steering().await {
+                harness.add_user_message(&request);
+                if let Some(task) = &mut self.task {
+                    task.add_instruction(request);
+                }
                 self.push_user(text, images);
             }
-            if let Some(nudge) = harness.before_step().await {
+            if let Some(task) = &self.task {
+                harness.set_task_record(task);
+            }
+            let stuck = tokio::select! {
+                _ = cancel.cancelled() => return TurnEndReason::Interrupted,
+                stuck = harness.before_step() => stuck,
+            };
+            self.emit_jev_verdicts(&mut harness);
+            if let Some(nudge) = stuck {
                 self.nudge(NudgeReason::Stuck, nudge);
             }
+            self.update_task_context();
             self.compact_if_needed();
             self.emit(AgentEvent::StepStarted { turn_id, step });
             // DeepSeek thinking mode needs reasoning back on tool-call
@@ -484,10 +1054,12 @@ impl Session {
                 };
                 let _ = events.try_send(event);
             };
+            let scoped_tools = self.scoped_tools_json();
+            let requested_revision = self.task.as_ref().map(|task| task.contract.revision);
             let request = ChatRequest {
                 messages: &self.history,
                 replay_reasoning_from,
-                tools_json: &self.tools_json,
+                tools_json: &scoped_tools,
                 effort,
             };
             let completion = match self
@@ -559,23 +1131,65 @@ impl Session {
             if calls.is_empty() {
                 // A message the user sent while the model was finishing
                 // starts another pass of the same turn.
-                let steered = self.take_steering();
+                let steered = self.take_steering().await;
                 if !steered.is_empty() {
-                    for (text, images) in steered {
-                        harness.add_user_message(&text);
+                    for (request, text, images) in steered {
+                        harness.add_user_message(&request);
+                        if let Some(task) = &mut self.task {
+                            task.add_instruction(request);
+                        }
                         self.push_user(text, images);
                     }
                     self.save();
                     continue;
                 }
+                if self.task.as_ref().map(|task| task.contract.revision) != requested_revision {
+                    // A successfully checkpointed EditTask is intake too.
+                    // This response answered the old scope; give the model
+                    // the revised contract before recording final blockers.
+                    // The history boundary also prevents that old response
+                    // from becoming the final if the next request fails.
+                    self.push_user(
+                        "[Host note: the user revised the protected task while you were answering. \
+                         Continue against the current host task contract before concluding.]"
+                            .into(),
+                        Vec::new(),
+                    );
+                    self.save();
+                    continue;
+                }
+                // Files may drift while inference is in flight. Let the
+                // bounded finish recovery see that drift, not just the later
+                // final assessment after the opportunity to recheck is gone.
+                self.refresh_task_files().await;
+                if let Some(task) = &self.task {
+                    harness.set_task_record(task);
+                }
+                if let Some(task) = &mut self.task {
+                    task.note_final(&completion.text);
+                    if !task.blockers.is_empty() {
+                        return TurnEndReason::Completed;
+                    }
+                }
                 let names = self.tool_name_refs();
-                match harness.continuation(&completion.text, &names).await {
-                    Some((reason, message)) => {
+                let decision = tokio::select! {
+                    _ = cancel.cancelled() => return TurnEndReason::Interrupted,
+                    decision = harness.finish_decision(&completion.text, &names) => decision,
+                };
+                self.emit_jev_verdicts(&mut harness);
+                match decision {
+                    FinishDecision::Continue { reason, message } => {
                         self.nudge(reason, message);
                         self.save();
                         continue;
                     }
-                    None => return TurnEndReason::Completed,
+                    FinishDecision::Stop => return TurnEndReason::Completed,
+                    FinishDecision::BudgetExhausted | FinishDecision::NoProgress => {
+                        if let Some(task) = &mut self.task {
+                            task.continuation_stop = harness.continuation_stop();
+                        }
+                        return TurnEndReason::ContinuationLimit;
+                    }
                 }
             }
 
@@ -608,6 +1222,7 @@ impl Session {
                 }
             }
             self.save();
+            self.emit_task(false);
             if cancel.is_cancelled() {
                 return TurnEndReason::Interrupted;
             }
@@ -634,6 +1249,18 @@ impl Session {
             message: message.clone(),
         });
         self.history.push(Message::Nudge(message));
+    }
+
+    /// Surfaces the judge's verdicts on the harness's suspicions to the front
+    /// end, so a guard decision can show whether the judge backed it.
+    fn emit_jev_verdicts(&self, harness: &mut Harness) {
+        for verdict in harness.take_jev_verdicts() {
+            self.emit(AgentEvent::JevVerdict {
+                question: verdict.question,
+                probability: verdict.probability,
+                confirmed: verdict.confirmed,
+            });
+        }
     }
 
     /// Repairs the tool name and arguments of a raw call.
@@ -688,23 +1315,49 @@ impl Session {
         let kind = tools::tool_kind(&call.name);
         let call_id = format!("{}{}", self.call_prefix, call.wire.id);
         let summary = tools::summary(&call.name, &call.args);
+        let mut execution_attempted = false;
         let outcome = if let Some(error) = &call.error {
             tools::ToolOutcome::error(format!(
                 "the arguments are not valid JSON ({error}). Send a JSON object."
             ))
-        } else if !self
-            .approved(&call_id, &call.name, kind, &summary, &call.args, cancel)
-            .await
+        } else if self.read_only_scope()
+            && !task::read_only_call_allowed(&call.name, kind, &Value::Object(call.args.clone()))
         {
+            if let Some(task) = &mut self.task {
+                task.note_scope_denial(&call.name, &Value::Object(call.args.clone()));
+            }
+            tools::ToolOutcome::error(format!(
+                "The protected task is read-only. This call was not run. {}",
+                self.task
+                    .as_ref()
+                    .map_or(TaskRecord::analysis_guidance(), TaskRecord::scope_guidance),
+            ))
+        } else if !self.approved(call, kind, &summary, false, cancel).await {
             let message = if cancel.is_cancelled() {
                 "Interrupted before this ran."
             } else {
                 "The user declined this action. Ask what they want instead, or try another approach."
             };
             tools::ToolOutcome::error(message)
+        } else if self.tools.work_clock.read_only()
+            && !task::read_only_call_allowed(&call.name, kind, &Value::Object(call.args.clone()))
+        {
+            if let Some(task) = &mut self.task {
+                task.note_scope_denial(&call.name, &Value::Object(call.args.clone()));
+            }
+            tools::ToolOutcome::error(format!(
+                "The user tightened the task to read-only while this call was waiting. \
+                 It was not run. {}",
+                self.task
+                    .as_ref()
+                    .map_or(TaskRecord::analysis_guidance(), TaskRecord::scope_guidance),
+            ))
         } else if call.name == tools::UPDATE_PLAN {
             match tools::parse_plan(&call.args) {
                 Ok(plan) => {
+                    if let Some(task) = &mut self.task {
+                        task.plan = plan.clone();
+                    }
                     harness.record_plan(
                         plan.iter()
                             .filter(|s| s.status.is_open())
@@ -713,6 +1366,18 @@ impl Session {
                     );
                     tools::ToolOutcome::ok(tools::render_plan(&plan))
                 }
+                Err(error) => tools::ToolOutcome::error(error),
+            }
+        } else if call.name == tools::REPORT_TASK {
+            match self
+                .task
+                .as_mut()
+                .ok_or_else(|| "No task is active.".to_string())
+                .and_then(|task| task.report(&Value::Object(call.args.clone())))
+            {
+                Ok(()) => tools::ToolOutcome::ok(
+                    "Task report recorded. Requirements and acceptance remain user-owned.",
+                ),
                 Err(error) => tools::ToolOutcome::error(error),
             }
         } else if call.name == tools::LIST_MODELS {
@@ -755,10 +1420,14 @@ impl Session {
                 call.name
             ))
         } else if call.name.starts_with(crate::mcp::PREFIX)
-            && let Some(hub) = &self.mcp
+            && let Some(hub) = self.mcp.clone()
         {
+            self.begin_execution(call);
+            execution_attempted = true;
             hub.call(&call.name, &call.args, cancel).await
         } else {
+            self.begin_execution(call);
+            execution_attempted = true;
             let events = self.events.clone();
             let output_id = call_id.clone();
             let on_output = move |chunk: String| {
@@ -769,7 +1438,8 @@ impl Session {
             };
             tools::execute(&self.tools, &call.name, &call.args, &on_output, cancel).await
         };
-        self.finish_call(call, outcome, harness, started);
+        self.finish_call(call, outcome, harness, started, execution_attempted)
+            .await;
     }
 
     /// Runs consecutive read-only calls (reads, listings, searches) at once.
@@ -795,11 +1465,12 @@ impl Session {
         )
         .await;
         for ((call, outcome), started) in calls.iter().zip(outcomes).zip(started) {
-            self.finish_call(call, outcome, harness, started);
+            self.finish_call(call, outcome, harness, started, true)
+                .await;
         }
     }
 
-    fn start_call(&self, call: &PreparedCall, harness: &mut Harness) -> Instant {
+    fn start_call(&mut self, call: &PreparedCall, harness: &mut Harness) -> Instant {
         let kind = tools::tool_kind(&call.name);
         let args_value = Value::Object(call.args.clone());
         let call_id = format!("{}{}", self.call_prefix, call.wire.id);
@@ -813,19 +1484,89 @@ impl Session {
         });
         let path = tools::edit_path(&call.name, &call.args);
         harness.record_tool_call(&call.name, kind, &args_value, path.as_deref());
+        let mutates = task::may_mutate(&call.name, kind, &args_value);
+        let revision = self.tools.work_clock.revision();
+        self.call_epochs.insert(call_id, (revision, mutates));
         Instant::now()
     }
 
-    fn finish_call(
+    fn begin_execution(&mut self, call: &PreparedCall) {
+        let call_id = format!("{}{}", self.call_prefix, call.wire.id);
+        if let Some((revision, true)) = self.call_epochs.get_mut(&call_id) {
+            // A real execution may partly mutate even when it fails. A
+            // malformed, unavailable, policy-denied or unapproved call cannot.
+            // Keep the finish epoch too, covering edits spanning a check.
+            *revision = self.tools.work_clock.advance();
+        }
+    }
+
+    async fn finish_call(
         &mut self,
         call: &PreparedCall,
         outcome: tools::ToolOutcome,
         harness: &mut Harness,
         started: Instant,
+        execution_attempted: bool,
     ) {
         let kind = tools::tool_kind(&call.name);
         let args_value = Value::Object(call.args.clone());
         let call_id = format!("{}{}", self.call_prefix, call.wire.id);
+        let (mut started_revision, mutates) = self
+            .call_epochs
+            .remove(&call_id)
+            .unwrap_or((self.tools.work_clock.revision(), false));
+        if mutates && execution_attempted {
+            // Own completion invalidates older checks, not the check that
+            // just ran. Any intervening sibling epoch still makes it stale.
+            let before_finish = self.tools.work_clock.revision();
+            let finished = self.tools.work_clock.advance();
+            if before_finish == started_revision {
+                started_revision = finished;
+            }
+        }
+        // Observe content changes before stamping command results; a later
+        // final assessment must not discover our own earlier write as a new
+        // post-check edit.
+        if kind == ToolKind::Edit
+            && outcome.success
+            && let Some(path) = tools::edit_path(&call.name, &call.args)
+            && let Some(task) = &mut self.task
+        {
+            task.note_file(&path, false);
+        }
+        self.refresh_task_files().await;
+        let revision = self.tools.work_clock.revision();
+        if let Some(task) = &mut self.task {
+            task.set_work_revision(revision);
+            if kind == ToolKind::Edit && outcome.success {
+                task.observed_edits += 1;
+            }
+            if kind == ToolKind::Command {
+                let command = call
+                    .args
+                    .get("command")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let verification = execution_attempted && (task::is_verification(command)
+                    || task.contract.requirements.iter().any(|requirement| {
+                        matches!(&requirement.spec, task::RequirementSpec::Command(required) if required.trim() == command.trim())
+                    }));
+                task.observe_command(
+                    &call_id,
+                    command,
+                    CommandTiming {
+                        started: started_revision,
+                        finished: revision,
+                        order: self.tools.work_clock.next_observation(),
+                    },
+                    &outcome,
+                    verification,
+                );
+            }
+            if mutates && execution_attempted && kind != ToolKind::Edit {
+                task.unknown_effects = true;
+            }
+        }
         harness.record_tool_result(
             &call.name,
             kind,
@@ -865,15 +1606,52 @@ impl Session {
             None
         };
         let effort = self.effort.lock().ok().and_then(|slot| *slot);
+        let read_only = self.inherited_read_only
+            || self
+                .task
+                .as_ref()
+                .is_some_and(|task| task.contract.mode == TaskMode::ReadOnly);
+        let restrictions = self
+            .task
+            .as_ref()
+            .map_or_else(Vec::new, |task| task.contract.restrictions.clone());
         let mut jobs = Vec::new();
         for call in calls {
             let started = self.start_call(call, harness);
+            let scope = children.worktree_scope(&call.args);
             let prepared = if let Some(error) = &call.error {
                 Err(format!("Invalid arguments: {error}"))
             } else if cancel.is_cancelled() {
                 Err("Interrupted before this ran.".to_string())
+            } else if self.read_only_scope()
+                && call
+                    .args
+                    .get("worktree")
+                    .is_some_and(|value| !value.is_null())
+            {
+                if let Some(task) = &mut self.task {
+                    task.note_scope_denial(&call.name, &Value::Object(call.args.clone()));
+                }
+                Err("The protected task is read-only. No worktree was created or opened.".into())
+            } else if let Some(summary) = scope.as_ref()
+                && !self
+                    .approved(call, ToolKind::Other, summary, true, cancel)
+                    .await
+            {
+                Err("Worktree access was not approved. No checkout was prepared.".into())
+            } else if cancel.is_cancelled()
+                || (self.read_only_scope()
+                    && call
+                        .args
+                        .get("worktree")
+                        .is_some_and(|value| !value.is_null()))
+            {
+                Err("Interrupted or restricted to read-only before preparing the worktree.".into())
             } else {
-                children.prepare(&call.args, models.as_ref(), self.approvals.clone(), effort)
+                tokio::select! {
+                    result = children.prepare(&call.args, models.as_ref(), self.approvals.clone(), effort) => result,
+                    () = cancel.cancelled() => Err("Interrupted while preparing the subagent; inspect the worktree before retrying.".into()),
+                }
             };
             match prepared {
                 Ok((child, message)) => {
@@ -882,7 +1660,14 @@ impl Session {
                         session_id: child.id.clone(),
                         model: child.model.clone(),
                     });
+                    if let Some(checkout) = &child.worktree {
+                        self.emit(AgentEvent::SubagentWorkspace {
+                            session_id: child.id.clone(),
+                            workspace: checkout.workspace.clone(),
+                        });
+                    }
                     let events = self.events.clone();
+                    let restrictions = restrictions.clone();
                     jobs.push(async move {
                         let result = crate::subagents::run_child(
                             child,
@@ -890,22 +1675,46 @@ impl Session {
                             &call.wire.id,
                             events,
                             cancel,
+                            read_only,
+                            restrictions,
                         )
                         .await;
                         (call, started, result)
                     });
                 }
                 Err(error) => {
-                    self.finish_call(call, tools::ToolOutcome::error(error), harness, started)
+                    self.finish_call(
+                        call,
+                        tools::ToolOutcome::error(error),
+                        harness,
+                        started,
+                        false,
+                    )
+                    .await
                 }
             }
         }
         let mut running = futures_util::stream::iter(jobs)
             .buffer_unordered(crate::subagents::MAX_PARALLEL_SUBAGENTS);
         while let Some((call, started, result)) = running.next().await {
-            // Child edits and verification count as work by the parent too.
+            // Evidence carries its real shared epoch and observation order.
+            // Do not manufacture cross-child chronology from return order.
+            if let (Some(parent), Some(child_task)) = (&mut self.task, &result.child.session.task) {
+                parent.set_work_revision(self.tools.work_clock.revision());
+                // Child paths/checks belong to its checkout, not the parent.
+                // Never certify files in the source tree using worktree checks.
+                if result.child.worktree.is_none() {
+                    parent.absorb_child(child_task);
+                }
+                if let Some(assessment) = &child_task.assessment {
+                    parent.note_child(&result.child.id, assessment);
+                }
+            }
             let mut args = std::collections::HashMap::new();
             for event in result.work {
+                if result.child.worktree.is_some() {
+                    continue;
+                }
                 match event {
                     AgentEvent::ToolCallStarted {
                         call_id,
@@ -917,6 +1726,8 @@ impl Session {
                         let path = value
                             .as_object()
                             .and_then(|args| tools::edit_path(&name, args));
+                        // The legacy loop guard still observes child activity;
+                        // acceptance uses the structured evidence above.
                         harness.record_tool_call(&name, kind, &value, path.as_deref());
                         args.insert(call_id, (name, kind, value));
                     }
@@ -925,12 +1736,20 @@ impl Session {
                         output,
                         exit_code,
                         success,
+                        diff,
                         ..
                     } => {
                         if let Some((name, kind, value)) = args.remove(&call_id) {
                             harness.record_tool_result(
                                 &name, kind, &value, &output, exit_code, success,
                             );
+                        }
+                        if result.child.worktree.is_none()
+                            && let Some(diff) = diff
+                            && let Some(task) = &mut self.task
+                        {
+                            task.observed_edits += 1;
+                            task.note_file(&diff.path, false);
                         }
                     }
                     _ => {}
@@ -942,14 +1761,15 @@ impl Session {
             usage.reasoning_tokens += result.child.session.last_usage.reasoning_tokens;
             self.last_usage = *usage;
             self.emit(AgentEvent::Usage(*usage));
-            self.finish_call(call, result.outcome, harness, started);
+            self.finish_call(call, result.outcome, harness, started, true)
+                .await;
             children.put(result.child);
         }
         self.subagents = Some(children);
     }
 
     pub(super) async fn initialize_child_budget(&mut self, cancel: &CancellationToken) {
-        if self.config.context_budget_tokens == 0 {
+        if self.restore_error.is_none() && self.config.context_budget_tokens == 0 {
             let limits = tokio::select! {
                 limits = self.provider.model_limits() => limits,
                 () = cancel.cancelled() => None,
@@ -961,15 +1781,20 @@ impl Session {
     /// Asks the front end when the mode requires it. False means don't run.
     async fn approved(
         &mut self,
-        call_id: &str,
-        name: &str,
+        call: &PreparedCall,
         kind: ToolKind,
         summary: &str,
-        args: &Map<String, Value>,
+        worktree_scope: bool,
         cancel: &CancellationToken,
     ) -> bool {
+        let call_id = format!("{}{}", self.call_prefix, call.wire.id);
+        let name = call.name.as_str();
+        let args = &call.args;
         // Fetches can send data out; MCP tools can do anything.
-        let request = if name == tools::FETCH_URL {
+        let request = if worktree_scope {
+            // Exact scope approval cannot be satisfied by an "all edits" rule.
+            Some(Request::Command(summary.to_string()))
+        } else if name == tools::FETCH_URL {
             let url = args.get("url").and_then(Value::as_str).unwrap_or(summary);
             Some(Request::Fetch(
                 tools::fetch::url_host(url).unwrap_or_default(),
@@ -988,14 +1813,14 @@ impl Session {
         let Some(request) = request else {
             return true;
         };
-        if self.approval == ApprovalMode::Auto {
+        if self.approval == ApprovalMode::Auto && !worktree_scope {
             return true;
         }
-        let Some(answer) = self.approvals.register(call_id, request) else {
+        let Some(answer) = self.approvals.register(&call_id, request) else {
             return true;
         };
         self.emit(AgentEvent::ApprovalRequested {
-            call_id: call_id.to_string(),
+            call_id: call_id.clone(),
             kind,
             summary: summary.to_string(),
         });
@@ -1003,7 +1828,7 @@ impl Session {
             answer = answer => answer.ok(),
             () = cancel.cancelled() => None,
         };
-        self.approvals.remove(call_id);
+        self.approvals.remove(&call_id);
         matches!(
             decision,
             Some(ApprovalDecision::Approve | ApprovalDecision::ApproveAlways)

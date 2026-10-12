@@ -201,6 +201,9 @@ pub fn script(with_approval: bool) -> Vec<Beat> {
                 summary: "npm test".into(),
             },
         );
+        // Approval stays pending: do not start the command, so the transcript
+        // never shows a finished run while consent is still outstanding.
+        return s.beats;
     }
     s.tool(
         "c5",

@@ -41,7 +41,7 @@ fn config(name: &str, dir: &Path) -> McpServerConfig {
     std::fs::write(&script, SERVER).expect("script");
     McpServerConfig {
         name: name.to_string(),
-        command: "python3".into(),
+        command: if cfg!(windows) { "python" } else { "python3" }.into(),
         args: vec![script.display().to_string()],
         env: Vec::new(),
     }
@@ -121,17 +121,20 @@ async fn dropped_request_removes_pending_and_notifies_server() {
     assert_eq!(server.pending.lock().expect("pending").len(), 1);
     drop(request);
     assert!(server.pending.lock().expect("pending").is_empty());
-    tokio::time::timeout(Duration::from_secs(2), async {
-        while !dir.path().join("cancelled.json").exists() {
+    let notification: Value = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            // The Python fixture creates its file before write() completes.
+            // Readiness is valid JSON, not merely existence of the inode.
+            if let Ok(bytes) = std::fs::read(dir.path().join("cancelled.json"))
+                && let Ok(notification) = serde_json::from_slice(&bytes)
+            {
+                break notification;
+            }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
     .await
     .expect("cancellation notification");
-    let notification: Value = serde_json::from_slice(
-        &std::fs::read(dir.path().join("cancelled.json")).expect("notification"),
-    )
-    .expect("json");
     assert!(notification["requestId"].is_u64());
 }
 

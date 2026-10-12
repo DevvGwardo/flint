@@ -284,8 +284,14 @@ pub fn render(
                     "Y · A · N",
                     "Approve · always · deny (empty composer)",
                 ))
-                .child(line("⌘K · ⌘J · ⌘N", "Commands · changes · new agent"))
-                .child(line("esc · ⌘.", "Stop the running turn"))
+                .child(line(
+                    &crate::shortcuts::label("⌘K · ⌘J · ⌘N"),
+                    "Commands · changes · new agent",
+                ))
+                .child(line(
+                    &crate::shortcuts::label("esc · ⌘."),
+                    "Stop the running turn",
+                ))
                 .into_any_element(),
         );
     }

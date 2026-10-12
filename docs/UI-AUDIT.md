@@ -2,6 +2,73 @@
 
 Date: 2026-10-03. Scope: current working tree, including pre-existing changes.
 
+## Coastal home and portability checkpoint, 2026-10-06
+
+Evidence: `target/home-dashboard-validation-20261006/`. Earlier checkpoints
+below remain historical.
+
+The screenshot-inspired home uses a bundled original coastal panorama, a
+centered retained composer and four local overview cards. Working and recent
+rows address stable session IDs, show actual status and render at most two
+entries each. Their filters, workspace picker and terminal action use existing
+app behavior. No PR, connected-service, CPU or memory metrics are fabricated.
+
+The activity chart counts loaded, nonempty conversations once, grouped by
+their last-activity day across 14 UTC days. Empty, older and future-dated
+conversations do not create chart bars; a tooltip explains the basis. Finished
+turns are not advertised as verified or accepted work. Queued counts include
+real paused entries. The optimized 2048x706 JPEG is 153,916 bytes and is cached
+from embedded bytes; launch does not fetch an image.
+
+Wide panes retain the 960-pixel workbench and two even dashboard columns.
+Narrow panes stack and scroll. Panels shorter than 600 pixels omit the
+dashboard, retain all four suggestions and keep Send/setup actions reachable.
+Selecting a scrolled starter prompt returns to the visible composer without
+sending it. Existing agent/model menus, attachments and approval behavior
+remain in the actual composer.
+
+### Verified checks and limits
+
+- Focused welcome 18/18; portable UI 4/4; activity model 2/2.
+- Settings width changes retain transcript selection, focus and reading mode.
+  Save, Cancel and Escape restore normal pointer selection. An unchanged
+  effort setting no longer sends a spurious engine operation.
+- The final isolated serial workspace checkpoint passes ACP 74, agent 282,
+  app 205, blueprint UI 331, portable UI 4, platform 6 and terminal 19.
+  Twenty-three opt-in unit tests are ignored; provider-backed live/eval work
+  is disabled. `workspace-final-result.json` records exit 0 in 708.89 seconds,
+  with no source drift. Blueprint UI itself takes 645.02 seconds.
+- Offline formatting and strict workspace/all-target Clippy pass on macOS
+  and for the Windows MSVC target. The macOS release executable and Windows
+  debug PE32+ executable build. Windows workflow syntax and PowerShell smoke
+  syntax pass; neither native Windows CI nor the smoke has run here.
+  The first check-recorder attempt put the cargo-xwin cache in an isolated
+  path containing spaces and failed its rustflags serialization. Compiler-only
+  checks using the existing cache pass; both attempts are retained.
+- Native home captures at 1440x900, 1100x800 and 900x560 pass 12/12.
+  Inspected screenshots show the coastal hierarchy, unobstructed composer,
+  complete default-size dashboard and readable compact controls. Menus,
+  approval, expanded transcript and compact Settings screenshots were also
+  inspected. The final-source default preview passes another 4/4; its image
+  is `preview/ui/jevdex-home.png`.
+- The larger native sweep passes 102/105, not all checks. Running, done and
+  expanded demo captures unexpectedly became key. A scoped repeat passes
+  20/21: done and expanded remain inactive, but running still becomes key.
+  No focus assertion was relaxed, no production fix is claimed and no complete
+  native/performance pass or speedup is inferred.
+- Standalone patched native-base tests are blocked by excluded-package
+  dev-dependencies and the uncached locked `gpui-pre-reqwest-client` graph.
+  No graph regeneration or dependency download was attempted. The modal
+  change is covered through the app's real-view tests, not a claimed upstream
+  native test/lint pass.
+- All 606 preserved baseline copies match their original hashes and all
+  original paths remain present. Existing dirty work and the active user app
+  were retained. No commits, pushes, publishing or provider requests.
+
+Native Windows runtime/security/ConPTY/graphics checks, physical clipboard/
+keyboard input and VoiceOver remain unverified. See `docs/WINDOWS.md` for the
+explicit no-Windows-sandbox warning and native validation checklist.
+
 ## Current gap-closure checkpoint
 
 Evidence: `target/gap-closure-20261003.n8SJNS/`; current dispositions are in

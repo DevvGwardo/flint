@@ -16,7 +16,6 @@ use gpui_kit::component::input::InputState;
 use gpui_kit::component::input::TextareaState;
 use gpui_kit::*;
 
-use crate::engine;
 use crate::session::Session;
 use crate::settings::KeySources;
 use crate::settings::Settings;
@@ -201,6 +200,10 @@ pub struct FlintApp {
     pub key_path: Option<PathBuf>,
     pub key_sources: KeySources,
     pub settings: Settings,
+    /// Display-only key status; real agent startup still resolves credentials fresh.
+    pub(crate) key_status_cache: std::cell::RefCell<crate::settings::KeyStatusCache>,
+    /// Retained parent/child text entities; never part of persisted task/history.
+    pub chat_content: std::cell::RefCell<crate::chat_content::ChatContentCache>,
     /// Only the latest explicit choice can become a future-session default.
     pub(crate) agent_choice_requests:
         std::collections::HashMap<(flint_agent::AgentKind, String), (u64, String)>,
@@ -252,6 +255,7 @@ pub struct FlintApp {
     pub menu_scroll: ScrollHandle,
     pub(crate) menu_needs_scroll: std::cell::Cell<bool>,
     pub popover_scroll: ScrollHandle,
+    pub(crate) welcome_scroll: ScrollHandle,
     /// The chat panel and composer bounds that size the composer popover.
     pub popover_room: std::rc::Rc<crate::popover::Room>,
     pub settings_form: Option<crate::settings_view::SettingsForm>,
@@ -275,6 +279,8 @@ pub struct FlintApp {
     pub worktree_form: Option<crate::worktree_picker::WorktreeForm>,
     pub queue_popover: bool,
     pub queue_edit: Option<crate::queue_actions::QueueEdit>,
+    pub task_panel: Option<crate::task_ui::TaskPanel>,
+    pub queue_resume_confirm: Option<crate::task_ui::QueueConfirmation>,
     /// Summary row whose answer was just copied, and when.
     pub copied: Option<(usize, Instant)>,
     pub copied_conversation: Option<crate::subagent_ui::Conversation>,
@@ -309,6 +315,7 @@ pub struct FlintApp {
 
 impl FlintApp {
     pub fn new(options: Options, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        window.set_window_title(crate::brand::NAME);
         let home = options
             .home
             .clone()
@@ -385,6 +392,8 @@ impl FlintApp {
             effort_supported: true,
             approval: settings.approval_mode(),
             settings,
+            key_status_cache: Default::default(),
+            chat_content: Default::default(),
             agent_choice_requests: Default::default(),
             sidebar_open: true,
             sidebar_visible: true,
@@ -422,6 +431,7 @@ impl FlintApp {
             menu_scroll: ScrollHandle::new(),
             menu_needs_scroll: std::cell::Cell::new(false),
             popover_scroll: ScrollHandle::new(),
+            welcome_scroll: ScrollHandle::new(),
             popover_room: Default::default(),
             settings_form: None,
             permission_choice_open,
@@ -437,6 +447,8 @@ impl FlintApp {
             worktree_form: None,
             queue_popover: false,
             queue_edit: None,
+            task_panel: None,
+            queue_resume_confirm: None,
             copied: None,
             copied_conversation: None,
             session_menu: None,
@@ -479,7 +491,7 @@ impl FlintApp {
             }
             async {}
         }));
-        if options.demo {
+        if options.demo && !crate::automation::seed_task_scene(&mut app, window, cx) {
             app.start_demo(cx);
             crate::automation::seed_queue_editor(&mut app, window, cx);
         }
@@ -586,7 +598,7 @@ impl FlintApp {
         if self.session().general {
             None
         } else {
-            engine::git_branch(&self.session().workspace)
+            crate::project::branch(&self.session().workspace)
         }
     }
 

@@ -1,0 +1,11 @@
+; R0 only. Deprecated mechanism. No distribution/capability claim.
+(version 1)
+(deny default)
+(allow process-exec (literal (param "HELPER")))
+(allow file-read* (literal (param "HELPER"))
+    (subpath "/System/Library") (subpath "/usr/lib")
+    (subpath "/Library/Apple/System/Library")
+    (literal "/dev/null") (literal "/dev/random") (literal "/dev/urandom"))
+(allow file-read* file-write* (subpath (param "SCRATCH")))
+(allow sysctl-read)
+; No network, keychain, home/Volumes subtree, broad Mach/IPC, or process-control grants.

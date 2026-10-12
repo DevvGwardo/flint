@@ -3,6 +3,7 @@ use std::time::Duration;
 use flint_agent::AgentEvent;
 use flint_agent::ApprovalDecision;
 use flint_agent::FileDiff;
+use flint_agent::JevQuestion;
 use flint_agent::NudgeReason;
 use flint_agent::ToolKind;
 use flint_agent::TurnEndReason;
@@ -209,6 +210,126 @@ fn approval_preview_uses_full_arguments_not_a_truncated_summary() {
             ("Existing text", "before".into()),
             ("Replacement text", "after".into())
         ]
+    );
+}
+
+fn approval_call(call_id: &str, command: &str, cwd: &str) -> AgentEvent {
+    AgentEvent::ToolCallStarted {
+        call_id: call_id.into(),
+        name: "run_command".into(),
+        kind: ToolKind::Command,
+        args: json!({"command": command, "cwd": cwd}),
+        summary: "short command summary".into(),
+    }
+}
+
+#[test]
+fn approval_preview_uses_the_latest_reused_parent_call_id() {
+    let mut view = SessionView::default();
+    for (turn, command, cwd) in [
+        (1, "printf old", "/workspace/old"),
+        (2, "printf 'current\\nfull command'", "/workspace/current"),
+    ] {
+        view.fold(AgentEvent::TurnStarted { turn_id: turn }, secs(turn));
+        view.fold(approval_call("reused", command, cwd), secs(turn));
+        if turn == 1 {
+            view.fold(
+                AgentEvent::ToolCallFinished {
+                    call_id: "reused".into(),
+                    output: "old result".into(),
+                    exit_code: Some(0),
+                    success: true,
+                    diff: None,
+                    duration_ms: 1,
+                },
+                secs(turn),
+            );
+            view.fold(
+                AgentEvent::TurnFinished {
+                    turn_id: turn,
+                    reason: TurnEndReason::Completed,
+                },
+                secs(turn),
+            );
+        }
+    }
+    view.fold(
+        AgentEvent::ApprovalRequested {
+            call_id: "reused".into(),
+            kind: ToolKind::Command,
+            summary: "current command".into(),
+        },
+        secs(2),
+    );
+    assert_eq!(
+        view.approval_preview("reused", std::path::Path::new("/workspace"), true)
+            .fields,
+        [
+            ("Command", "printf 'current\\nfull command'".into()),
+            ("Working directory", "/workspace/current".into()),
+        ]
+    );
+    assert_eq!(view.pending_approvals, 1);
+}
+
+#[test]
+fn approval_preview_uses_the_latest_reused_child_call_id_after_resume() {
+    let mut view = SessionView::default();
+    for (delegation, command) in [("first", "printf old"), ("resume", "printf current")] {
+        view.fold(started(delegation, ToolKind::Other, "Research"), secs(0));
+        view.fold(
+            AgentEvent::SubagentStarted {
+                call_id: delegation.into(),
+                session_id: "agent-1".into(),
+                model: "child-model".into(),
+            },
+            secs(0),
+        );
+        view.fold(
+            AgentEvent::SubagentEvent {
+                call_id: delegation.into(),
+                event: Box::new(approval_call("agent-1:reused", command, "/child/workspace")),
+            },
+            secs(0),
+        );
+    }
+    let preview = view.approval_preview(
+        "agent-1:reused",
+        std::path::Path::new("/parent/workspace"),
+        true,
+    );
+    assert_eq!(preview.agent.as_deref(), Some("agent-1"));
+    assert_eq!(
+        preview.fields,
+        [
+            ("Command", "printf current".into()),
+            ("Working directory", "/child/workspace".into()),
+        ]
+    );
+    assert_eq!(view.subagents.len(), 1);
+}
+
+#[test]
+fn approval_preview_does_not_fall_back_to_old_details_for_a_reused_id() {
+    let mut view = SessionView::default();
+    view.fold(
+        approval_call("reused", "printf old", "/old/workspace"),
+        secs(0),
+    );
+    view.fold(
+        AgentEvent::ToolCallStarted {
+            call_id: "reused".into(),
+            name: "external-command".into(),
+            kind: ToolKind::Command,
+            args: serde_json::Value::Null,
+            summary: "current request without arguments".into(),
+        },
+        secs(1),
+    );
+    assert!(
+        view.approval_preview("reused", std::path::Path::new("/workspace"), false)
+            .fields
+            .is_empty()
     );
 }
 
@@ -523,6 +644,46 @@ fn approvals_and_nudges() {
                 expanded: false,
             },
         ]
+    );
+}
+
+#[test]
+fn jev_verdicts_become_transcript_rows() {
+    let mut view = SessionView::default();
+    view.fold(AgentEvent::TurnStarted { turn_id: 1 }, secs(0));
+    let change = view.fold(
+        AgentEvent::JevVerdict {
+            question: JevQuestion::Verified,
+            probability: 0.82,
+            confirmed: false,
+        },
+        secs(1),
+    );
+    assert_eq!(change.appended, 0..1);
+    assert_eq!(
+        view.items,
+        vec![Item::Jev {
+            question: JevQuestion::Verified,
+            probability: 0.82,
+            confirmed: false,
+        }]
+    );
+    // A confirmed suspicion is a warning row, not a cleared one.
+    view.fold(
+        AgentEvent::JevVerdict {
+            question: JevQuestion::Stuck,
+            probability: 0.91,
+            confirmed: true,
+        },
+        secs(2),
+    );
+    assert_eq!(
+        view.items[1],
+        Item::Jev {
+            question: JevQuestion::Stuck,
+            probability: 0.91,
+            confirmed: true,
+        }
     );
 }
 
@@ -905,4 +1066,64 @@ fn approve_always_resolves_parallel_child_approvals_and_interrupt_expires_them()
     );
     assert_eq!(view.pending_approvals, 0);
     assert!(view.pending_approval().is_none());
+}
+
+#[test]
+fn chat_row_identity_survives_append_promotion_and_explicit_replacement() {
+    let mut view = SessionView::default();
+    view.push_user("request".into());
+    view.fold(AgentEvent::TurnStarted { turn_id: 1 }, secs(0));
+    view.fold(AgentEvent::TextDelta("界".into()), secs(1));
+    let first = view.row_identity(1).unwrap();
+    view.fold(AgentEvent::TextDelta("🙂".into()), secs(2));
+    let appended = view.row_identity(1).unwrap();
+    assert_eq!(first.id, appended.id);
+    assert_eq!(appended.revision, first.revision + 1);
+    assert_eq!(appended.replacement, first.replacement);
+    view.fold(
+        AgentEvent::TurnFinished {
+            turn_id: 1,
+            reason: TurnEndReason::Completed,
+        },
+        secs(3),
+    );
+    assert_eq!(view.row_identity(1), Some(appended));
+    view.replace_assistant_text(1, "界🙂 replacement".into());
+    let replaced = view.row_identity(1).unwrap();
+    assert_eq!(replaced.id, first.id);
+    assert_eq!(replaced.replacement, first.replacement + 1);
+    assert_eq!(view.row_index(first.id), Some(1));
+    assert!(view.row_identity(2).unwrap().id > first.id);
+}
+
+#[test]
+fn chat_row_identity_is_deterministic_across_ordered_replay() {
+    let events = [
+        AgentEvent::TurnStarted { turn_id: 4 },
+        AgentEvent::TextDelta("first".into()),
+        AgentEvent::TextDelta(" **second**".into()),
+        AgentEvent::StepStarted {
+            turn_id: 4,
+            step: 2,
+        },
+        AgentEvent::TextDelta("final".into()),
+        AgentEvent::TurnFinished {
+            turn_id: 4,
+            reason: TurnEndReason::Completed,
+        },
+    ];
+    let mut first = SessionView::default();
+    let mut replay = SessionView::default();
+    for event in &events {
+        first.fold(event.clone(), secs(1));
+    }
+    for batch in events.chunks(3) {
+        for event in batch {
+            replay.fold(event.clone(), secs(1));
+        }
+    }
+    assert_eq!(first, replay);
+    for ix in 0..first.items.len() {
+        assert_eq!(first.row_identity(ix), replay.row_identity(ix));
+    }
 }

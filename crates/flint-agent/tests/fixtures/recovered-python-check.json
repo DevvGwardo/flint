@@ -1,0 +1,125 @@
+{
+  "version": 1,
+  "source": "native",
+  "contract": {
+    "id": 1,
+    "revision": 1,
+    "original_request": "Implement normalize_name(value) in left.py as strip then lowercase. Implement clamp(value, low, high) in right.py, including ValueError when low > high. Preserve test_left.py and test_right.py. If spawn_agent is available, delegate the two disjoint write sets separately; otherwise implement both directly. Run python3 -m unittest -q yourself after both changes and report the result.",
+    "objective": "Implement normalize_name(value) in left.py as strip then lowercase. Implement clamp(value, low, high) in right.py, including ValueError when low > high. Preserve test_left.py and test_right.py. If spawn_agent is available, delegate the two disjoint write sets separately; otherwise implement both directly. Run python3 -m unittest -q yourself after both changes and report the result.",
+    "mode": "work",
+    "requirements": [
+      {
+        "id": 1,
+        "spec": {
+          "review": "Deliver the requested result"
+        }
+      }
+    ],
+    "restrictions": [],
+    "instructions": []
+  },
+  "work_revision": 10,
+  "checks": [
+    {
+      "id": 7,
+      "call_id": "call_13001",
+      "command": "python3 -m unittest -q",
+      "contract_revision": 1,
+      "work_revision": 10,
+      "started_revision": 10,
+      "success": true,
+      "exit_code": 0,
+      "detail": "----------------------------------------------------------------------\nRan 2 tests in 0.000s\n\nOK\n[exit code: 0]",
+      "verification": true
+    },
+    {
+      "id": 5,
+      "call_id": "call_59024",
+      "command": "python3 -c \"import left, right; assert left.normalize_name(' Ada ') == 'ada'; assert right.clamp(5, 0, 10) == 5; assert right.clamp(-1, 0, 10) == 0; assert right.clamp(15, 0, 10) == 10; \\\ntry:\\n right.clamp(1, 10, 0)\\n assert False\\nexcept ValueError:\\n pass\"",
+      "contract_revision": 1,
+      "work_revision": 10,
+      "started_revision": 10,
+      "success": false,
+      "exit_code": 1,
+      "detail": "  File \"<string>\", line 1\n    import left, right; assert left.normalize_name(' Ada ') == 'ada'; assert right.clamp(5, 0, 10) == 5; assert right.clamp(-1, 0, 10) == 0; assert right.clamp(15, 0, 10) == 10; try:\\n right.clamp(1, 10, 0)\\n assert False\\nexcept ValueError:\\n pass\n                                                                                                                                                                                  ^^^\nSyntaxError: invalid syntax\n[exit code: 1]",
+      "verification": true
+    },
+    {
+      "id": 3,
+      "call_id": "call_16760",
+      "command": "python3 -c \"import left, right\nassert left.normalize_name(' Ada ') == 'ada'\nassert right.clamp(5, 0, 10) == 5\nassert right.clamp(-1, 0, 10) == 0\nassert right.clamp(15, 0, 10) == 10\ntry:\n    right.clamp(1, 10, 0)\n    assert False\nexcept ValueError:\n    pass\n\"",
+      "contract_revision": 1,
+      "work_revision": 8,
+      "started_revision": 8,
+      "success": true,
+      "exit_code": 0,
+      "detail": "[exit code: 0]",
+      "verification": true
+    }
+  ],
+  "files": [
+    {
+      "path": "left.py",
+      "state": {
+        "present": {
+          "bytes": 60,
+          "fingerprint": 6278063722065961289
+        }
+      },
+      "reported": true
+    },
+    {
+      "path": "right.py",
+      "state": {
+        "present": {
+          "bytes": 205,
+          "fingerprint": 3439254422599191278
+        }
+      },
+      "reported": true
+    }
+  ],
+  "blockers": [],
+  "children": [],
+  "plan": [
+    {
+      "step": "Inspect existing files and tests",
+      "status": "completed"
+    },
+    {
+      "step": "Implement normalize_name in left.py and clamp in right.py",
+      "status": "completed"
+    },
+    {
+      "step": "Run unittest and verify results",
+      "status": "completed"
+    },
+    {
+      "step": "Report task deliverables and conclusion",
+      "status": "completed"
+    }
+  ],
+  "report": "Implemented normalize_name(value) in left.py as strip then lowercase. Implemented clamp(value, low, high) in right.py returning clamped values and raising ValueError when low > high. Preserved test_left.py and test_right.py. Verified with python3 -m unittest -q and custom assertions.",
+  "assessment": {
+    "task_id": 1,
+    "contract_revision": 1,
+    "work_revision": 10,
+    "outcome": "partial",
+    "reason": "Completed",
+    "requirements": [
+      {
+        "requirement_id": 1,
+        "state": "needs_review",
+        "detail": "Content and scope need your review.",
+        "evidence_id": null
+      }
+    ],
+    "issues": [
+      "Command failed: python3 -c \"import left, right; assert left.normalize_name(' Ada ') == 'ada'; assert right.clamp(5, 0, 10) == 5; assert right.clamp(-1, 0, 10) == 0; assert right.clamp(15, 0, 10) == 10; \\\ntry:\\n right.clamp(1, 10, 0)\\n assert False\\nexcept ValueError:\\n pass\""
+    ]
+  },
+  "acceptance": null,
+  "observed_edits": 2,
+  "unknown_effects": true,
+  "evidence_overflow": false
+}

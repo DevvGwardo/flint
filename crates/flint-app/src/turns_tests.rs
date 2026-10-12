@@ -15,6 +15,36 @@ fn secs(s: u64) -> Duration {
     Duration::from_secs(s)
 }
 
+#[test]
+fn finished_turn_counter_matches_history_including_unfinished_and_duplicate_events() {
+    let mut view = SessionView::default();
+    for event in [
+        AgentEvent::TurnStarted { turn_id: 1 },
+        AgentEvent::TurnFinished {
+            turn_id: 1,
+            reason: TurnEndReason::Completed,
+        },
+        AgentEvent::TurnFinished {
+            turn_id: 1,
+            reason: TurnEndReason::Completed,
+        },
+        AgentEvent::TurnStarted { turn_id: 2 },
+        AgentEvent::TurnStarted { turn_id: 3 },
+        AgentEvent::TurnFinished {
+            turn_id: 3,
+            reason: TurnEndReason::Interrupted,
+        },
+        AgentEvent::TurnStarted { turn_id: 4 },
+    ] {
+        view.fold(event, Duration::ZERO);
+        assert_eq!(
+            view.finished_turns,
+            view.turns.iter().filter(|turn| turn.end.is_some()).count()
+        );
+    }
+    assert_eq!(view.finished_turns, 2);
+}
+
 fn task_fixture(commands: usize, finished: usize) -> SessionView {
     let mut view = SessionView::default();
     view.fold(AgentEvent::TurnStarted { turn_id: 1 }, secs(0));
@@ -338,6 +368,8 @@ fn finishing_collapses_work_and_promotes_the_answer() {
     assert_eq!(
         view.turns,
         vec![TurnInfo {
+            turn_id: 1,
+            task: view.task.clone(),
             first: 1,
             end: Some(6),
             final_answer: Some(5),

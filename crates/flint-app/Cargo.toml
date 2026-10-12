@@ -1,5 +1,6 @@
 [package]
 name = "flint-app"
+default-run = "hooter"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -12,7 +13,16 @@ path = "src/lib.rs"
 name = "flint"
 path = "src/main.rs"
 
+[[bin]]
+name = "hooter"
+path = "src/bin/hooter.rs"
+
+[[bin]]
+name = "jevdex"
+path = "src/bin/jevdex.rs"
+
 [dependencies]
+flint-platform.workspace = true
 flint-agent.workspace = true
 flint-acp.workspace = true
 anyhow.workspace = true

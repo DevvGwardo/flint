@@ -92,7 +92,7 @@ pub enum ApprovalMode {
     AskForChanges,
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct JevConfig {
     pub api_key: String,
     pub base_url: String,
@@ -132,6 +132,41 @@ impl std::fmt::Debug for JevConfig {
     }
 }
 
+/// Which harness suspicion the JEV judge ruled on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JevQuestion {
+    /// Is the turn looping — repeating an action or failure without progress?
+    Stuck,
+    /// Is the turn's work actually verified by a check that ran after the edits?
+    Verified,
+    /// Does the task still need file changes?
+    Watchdog,
+}
+
+impl JevQuestion {
+    /// The question's wire key, also carried by [`JevVerdict`].
+    pub fn name(self) -> &'static str {
+        match self {
+            JevQuestion::Stuck => "stuck",
+            JevQuestion::Verified => "verified",
+            JevQuestion::Watchdog => "watchdog",
+        }
+    }
+}
+
+/// The optional JEV judge's verdict on one harness suspicion, surfaced to a
+/// front end so a guard decision can carry its judge status.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct JevVerdict {
+    pub question: JevQuestion,
+    /// Probability in `[0, 1]` that the judge answered yes.
+    pub probability: f64,
+    /// Whether the guard acted on the verdict — the suspicion was confirmed
+    /// rather than cleared.
+    pub confirmed: bool,
+}
+
 /// Front end -> engine.
 #[derive(Debug, Clone)]
 pub enum Op {
@@ -141,6 +176,14 @@ pub enum Op {
     UserMessageWithImages {
         text: String,
         images: Vec<ImageAttachment>,
+    },
+    /// Keep attached files/output separate from the user's authoritative
+    /// request. Context can inform the model, not rewrite native task scope.
+    UserMessageWithContext {
+        request: String,
+        text: String,
+        images: Vec<ImageAttachment>,
+        steering_id: Option<u64>,
     },
     /// Add a user instruction at the next safe model boundary. Native only;
     /// SteeringAccepted acknowledges when it enters the conversation.
@@ -158,6 +201,9 @@ pub enum Op {
     },
     /// Change the reasoning effort for later model calls (`None` = provider default).
     SetReasoningEffort(Option<ReasoningEffort>),
+    /// Native only. Apply optional judge configuration at the next turn,
+    /// without changing the running turn, task scope, or tool approvals.
+    SetJev(Option<JevConfig>),
     /// Restore the files the agent changed in its most recent turn with
     /// changes (flint's own engine; queued behind a running turn). Answered
     /// by [`AgentEvent::FilesReverted`] or an [`AgentEvent::Error`].
@@ -166,6 +212,15 @@ pub enum Op {
     SetSessionOption {
         id: String,
         value: String,
+    },
+    /// Explicit user scope revision, applied at a safe native boundary.
+    EditTask(crate::task::TaskEdit),
+    /// Explicit user review, never a model-authored tool call.
+    ReviewTask(crate::task::TaskReview),
+    /// Resume the protected goal rather than creating a task called "continue".
+    ContinueTask {
+        task_id: u64,
+        expected_revision: u64,
     },
     Shutdown,
 }
@@ -205,6 +260,17 @@ pub enum AgentEvent {
     TurnStarted {
         turn_id: u64,
     },
+    /// Host-owned scope/evidence, including after an explicit scope revision.
+    TaskUpdated {
+        turn_id: u64,
+        task: Box<crate::task::TaskRecord>,
+    },
+    /// Distinct from TurnFinished: normal execution termination does not
+    /// imply acceptance of the user's deliverable.
+    TaskAssessed {
+        turn_id: u64,
+        task: Box<crate::task::TaskRecord>,
+    },
     /// A new model call within the turn (one per agent-loop step). Text and
     /// reasoning deltas that follow belong to this step's assistant message.
     StepStarted {
@@ -243,6 +309,11 @@ pub enum AgentEvent {
         session_id: String,
         model: String,
     },
+    /// The real checkout for an isolated child; parent paths stay unchanged.
+    SubagentWorkspace {
+        session_id: String,
+        workspace: PathBuf,
+    },
     /// Child activity, kept separate from the parent's conversation.
     SubagentEvent {
         call_id: String,
@@ -257,6 +328,16 @@ pub enum AgentEvent {
     HarnessNudge {
         reason: NudgeReason,
         message: String,
+    },
+    /// The optional JEV judge ruled on a harness suspicion. Shown in the
+    /// transcript so a guard decision carries its judge status.
+    JevVerdict {
+        question: JevQuestion,
+        /// Probability in `[0, 1]` that the judge answered yes.
+        probability: f64,
+        /// Whether the guard acted on the verdict — the suspicion was
+        /// confirmed rather than cleared.
+        confirmed: bool,
     },
     /// The harness fixed a malformed tool call instead of failing it.
     ToolRepaired {
@@ -376,8 +457,12 @@ pub enum TurnEndReason {
     Interrupted,
     /// Hit the step limit for one turn.
     StepLimit,
+    /// The bounded continuation budget ended with unresolved finish rules.
+    ContinuationLimit,
     Failed(String),
 }
+
+pub const NATIVE_AGENT_NAME: &str = "Hooter";
 
 /// Which agent runs a session: flint's own engine or an ACP agent. Saved in
 /// the session's metadata so the UI can badge it and reopen it the same way.
@@ -395,10 +480,44 @@ impl AgentKind {
     /// Display name.
     pub fn label(self) -> &'static str {
         match self {
-            AgentKind::Flint => "flint",
+            AgentKind::Flint => NATIVE_AGENT_NAME,
             AgentKind::ClaudeCode => "Claude Code",
             AgentKind::Codex => "Codex",
             AgentKind::Droid => "Droid",
         }
+    }
+}
+
+#[cfg(test)]
+mod branding_tests {
+    use super::AgentKind;
+
+    #[test]
+    fn hooter_keeps_the_legacy_saved_agent_key() {
+        assert_eq!(AgentKind::Flint.label(), "Hooter");
+        assert_eq!(
+            serde_json::to_string(&AgentKind::Flint).unwrap(),
+            "\"flint\""
+        );
+        assert_eq!(
+            serde_json::from_str::<AgentKind>("\"flint\"").unwrap(),
+            AgentKind::Flint
+        );
+    }
+}
+
+#[cfg(test)]
+mod jev_tests {
+    use super::*;
+
+    #[test]
+    fn jev_verdict_round_trips_through_serde() {
+        let event = AgentEvent::JevVerdict {
+            question: JevQuestion::Verified,
+            probability: 0.42,
+            confirmed: false,
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        assert_eq!(serde_json::from_str::<AgentEvent>(&json).unwrap(), event);
     }
 }

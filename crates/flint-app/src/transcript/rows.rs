@@ -4,6 +4,7 @@
 
 use std::time::Duration;
 
+use flint_agent::JevQuestion;
 use flint_agent::NudgeReason;
 use flint_agent::ToolKind;
 use gpui_kit::assets::IconName;
@@ -35,24 +36,16 @@ pub fn render(
     item: &Item,
     now: Duration,
     base_url: &str,
-    workspace: &std::path::Path,
+    markdown: Option<AnyElement>,
     cx: &mut Context<FlintApp>,
 ) -> AnyElement {
     match item {
         Item::User(text) => user(text).into_any_element(),
-        Item::Assistant { text, streaming } => bullet(
+        Item::Assistant { .. } => bullet(
             dot(palette().text_muted),
             div()
                 .id(("assistant-text", ix))
-                .child(
-                    crate::file_preview::markdown(
-                        ("md", ix),
-                        text.clone(),
-                        workspace.to_path_buf(),
-                        cx,
-                    )
-                    .stream_fade(*streaming),
-                )
+                .child(markdown.unwrap_or_else(|| div().into_any_element()))
                 .test_support(),
         )
         .text_size(px(size::PROSE))
@@ -70,6 +63,11 @@ pub fn render(
             message,
             expanded,
         } => nudge(target, ix, *reason, message, *expanded, cx).into_any_element(),
+        Item::Jev {
+            question,
+            probability,
+            confirmed,
+        } => jev(ix, *question, *probability, *confirmed).into_any_element(),
         Item::Compacted {
             before_tokens,
             after_tokens,
@@ -454,7 +452,13 @@ fn tool(
                     .into_any_element()
             } else {
                 match (diff, call.kind) {
-                    (Some(d), _) => diff::render(&d.unified, usize::MAX).0.into_any_element(),
+                    (Some(d), _) => div()
+                        .id(("tool-diff", ix))
+                        .max_h(px(320.))
+                        .overflow_x_scroll()
+                        .overflow_y_scroll()
+                        .child(diff::render_wide(&d.unified))
+                        .into_any_element(),
                     _ => div()
                         .px(px(16.))
                         .py(px(12.))
@@ -603,6 +607,43 @@ fn is_exit_code_line(line: &str) -> bool {
         && line.ends_with(']')
 }
 
+/// The optional JEV judge's verdict on a guard suspicion: what it judged, how
+/// confident it was, and whether the guard acted on it. Cleared suspicions are
+/// neutral execution evidence, not task acceptance.
+fn jev(ix: usize, question: JevQuestion, probability: f64, confirmed: bool) -> impl IntoElement {
+    let subject = match question {
+        JevQuestion::Stuck => "loop check",
+        JevQuestion::Verified => "verification",
+        JevQuestion::Watchdog => "edit check",
+    };
+    let status = match (question, confirmed) {
+        (JevQuestion::Stuck, true) => "stuck",
+        (JevQuestion::Stuck, false) => "moving",
+        (JevQuestion::Verified, true) => "unverified",
+        (JevQuestion::Verified, false) => "verified",
+        (JevQuestion::Watchdog, true) => "edits still needed",
+        (JevQuestion::Watchdog, false) => "no edits needed",
+    };
+    let (icon, color) = guard_style(confirmed);
+    let label = format!("JEV · {subject} · {:.0}% · {status}", probability * 100.0);
+    bullet(
+        ui::icon(icon, 12., color),
+        ui::label(label.clone(), size::SM, color),
+    )
+    .id(("jev", ix))
+    .aria_label(label)
+    .test_support()
+}
+
+fn guard_style(intervened: bool) -> (IconName, Hsla) {
+    let p = palette();
+    if intervened {
+        (IconName::ShieldAlert, p.warning)
+    } else {
+        (IconName::ShieldCheck, p.text_subtle)
+    }
+}
+
 fn nudge(
     target: &Conversation,
     ix: usize,
@@ -612,6 +653,10 @@ fn nudge(
     cx: &mut Context<FlintApp>,
 ) -> impl IntoElement {
     let p = palette();
+    // Guidance is a recoverable execution step, not a task failure. The
+    // outcome strip, failed tools, errors and permission cards keep their
+    // independent warning/error styling.
+    let color = p.text_muted;
     let target = target.clone();
     let title = match reason {
         NudgeReason::Stuck => "loop detected",
@@ -622,13 +667,16 @@ fn nudge(
     let tip = message.to_string();
     div()
         .id(("nudge", ix))
+        .role(gpui_kit::Role::Button)
+        .aria_label(format!("Guard guidance · {title}"))
         .cursor_pointer()
-        .rounded(px(5.))
-        .hover(|style| style.bg(hsla(0., 0., 1., 0.025)))
+        .px(px(10.))
+        .py(px(8.))
+        .hover(|style| style.bg(p.surface))
         .on_click(cx.listener(move |this, _, _, cx| this.toggle_conversation_item(&target, ix, cx)))
         .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
         .child(bullet(
-            ui::icon(IconName::ShieldAlert, 12., p.warning),
+            ui::icon(IconName::Shield, 12., color),
             div()
                 .min_h(px(26.))
                 .flex()
@@ -636,23 +684,25 @@ fn nudge(
                 .gap(px(10.))
                 .child(
                     div()
-                        .h(px(26.))
+                        .flex_shrink_0()
                         .flex()
                         .items_center()
-                        .child(ui::label(format!("Guard · {title}"), size::BASE, p.warning))
-                        .flex_shrink_0(),
+                        .min_h(px(26.))
+                        .child(ui::label(format!("Guard · {title}"), size::SM, color)),
                 )
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .pt(px(4.))
-                        .text_size(px(size::SM))
-                        .line_height(px(20.))
-                        .text_color(p.text_subtle)
-                        .when(!expanded, |text| text.truncate())
-                        .child(message.to_string()),
-                )
+                .when(expanded, |row| {
+                    row.child(
+                        div()
+                            .id(("nudge-evidence", ix))
+                            .flex_1()
+                            .min_w_0()
+                            .text_size(px(size::SM))
+                            .line_height(px(20.))
+                            .text_color(p.text)
+                            .child(message.to_string())
+                            .test_support(),
+                    )
+                })
                 .child(div().pt(px(6.)).child(chevron(expanded))),
         ))
         .test_support()
@@ -661,3 +711,15 @@ fn nudge(
 #[cfg(test)]
 #[path = "rows_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod guard_tests {
+    use super::{guard_style, palette};
+
+    #[test]
+    fn cleared_verdicts_are_neutral_and_interventions_keep_their_warning() {
+        let p = palette();
+        assert_eq!(guard_style(false).1, p.text_subtle);
+        assert_eq!(guard_style(true).1, p.warning);
+    }
+}

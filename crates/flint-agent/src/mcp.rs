@@ -24,7 +24,6 @@ use tokio::io::AsyncWriteExt;
 use tokio::io::BufReader;
 use tokio::process::Child;
 use tokio::process::ChildStdin;
-use tokio::process::Command;
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
@@ -100,6 +99,7 @@ struct Server {
     pending: Pending,
     next_id: AtomicU64,
     /// Held so the process is killed when the hub is dropped.
+    _tree: flint_platform::ProcessTree,
     _child: Child,
 }
 
@@ -312,17 +312,31 @@ async fn start_server(
     config: &McpServerConfig,
     workspace: &Path,
 ) -> Result<(Server, Vec<ToolInfo>), String> {
-    let mut command = Command::new(&config.command);
+    let home = flint_platform::home_dir();
+    let path = config
+        .env
+        .iter()
+        .rev()
+        .find(|(name, _)| {
+            if cfg!(windows) {
+                name.eq_ignore_ascii_case("PATH")
+            } else {
+                name == "PATH"
+            }
+        })
+        .map(|(_, value)| std::ffi::OsString::from(value))
+        .unwrap_or_else(|| flint_platform::search_path(home.as_deref()));
+    let mut command = flint_platform::executable_command(&config.command, &path, workspace);
     command
         .args(&config.args)
+        .env("PATH", &path)
         .envs(config.env.iter().map(|(k, v)| (k, v)))
         .current_dir(workspace)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .kill_on_drop(true);
-    let mut child = command
-        .spawn()
+    let (mut child, tree) = flint_platform::spawn(&mut command)
         .map_err(|e| format!("cannot start `{}`: {e}", config.command))?;
     let stdin = child.stdin.take().ok_or("no stdin")?;
     let stdout = child.stdout.take().ok_or("no stdout")?;
@@ -405,6 +419,7 @@ async fn start_server(
         stdin,
         pending,
         next_id: AtomicU64::new(1),
+        _tree: tree,
         _child: child,
     };
     server

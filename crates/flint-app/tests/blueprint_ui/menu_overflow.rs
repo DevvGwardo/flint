@@ -52,8 +52,11 @@ fn long_picker_query_and_filename_fit_without_changing_the_attachment(cx: &mut T
         });
         ui.press(cx, "enter");
         let sent = engine.sent();
-        assert!(matches!(sent.as_slice(), [Op::UserMessage(message)]
-            if message.contains(&format!("[Attached file {path} (1 lines)]"))
-                && message.contains("// full-path fixture")));
+        assert!(
+            matches!(sent.as_slice(), [Op::UserMessageWithContext { request,text,images,steering_id:None }]
+            if request==&format!("explain @{path}")
+                && text.contains(&format!("[Attached file {path} (1 lines)]"))
+                && text.contains("// full-path fixture") && images.is_empty())
+        );
     }
 }

@@ -1,6 +1,7 @@
 //! Pure parsing for Chat Completions streams: SSE framing and assembly of
 //! chunk deltas (text, reasoning, tool calls by index, trailing usage).
 
+use std::collections::HashSet;
 use std::time::Duration;
 
 use serde_json::Value;
@@ -247,9 +248,24 @@ impl CompletionBuilder {
 
     /// The finished completion; calls without ids get synthetic ones.
     pub fn finish(mut self) -> Completion {
+        let mut used_ids: HashSet<String> = self
+            .completion
+            .tool_calls
+            .iter()
+            .filter(|call| !call.id.is_empty())
+            .map(|call| call.id.clone())
+            .collect();
         for (i, call) in self.completion.tool_calls.iter_mut().enumerate() {
             if call.id.is_empty() {
-                call.id = format!("call_{i}");
+                // Keep provider identities intact, including ones that use
+                // our fallback naming convention.
+                let mut next = i;
+                let mut id = format!("call_{next}");
+                while !used_ids.insert(id.clone()) {
+                    next += 1;
+                    id = format!("call_{next}");
+                }
+                call.id = id;
             }
         }
         self.completion.tool_calls.retain(|c| !c.name.is_empty());

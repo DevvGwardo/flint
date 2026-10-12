@@ -285,6 +285,9 @@ fn worktree_removal_rechecks_sessions_created_after_confirmation(cx: &mut TestAp
 fn worktree_picker_fits_a_short_window_and_does_not_leak_clicks(cx: &mut TestAppContext) {
     let tmp = tempfile::tempdir().unwrap();
     let cwd = repo(tmp.path());
+    for ix in 0..40 {
+        git(&cwd, &["branch", &format!("feature/branch-{ix:02}")]);
+    }
     let ui = open_with(
         cx,
         Options {
@@ -296,7 +299,13 @@ fn worktree_picker_fits_a_short_window_and_does_not_leak_clicks(cx: &mut TestApp
     show_picker(&ui, cx);
     ui.with(cx, |window, cx| {
         window.render_frame(cx);
-        for id in ["worktree-picker", "worktree-create", "worktree-close"] {
+        for id in [
+            "worktree-picker",
+            "worktree-create",
+            "worktree-close",
+            "branch-fetch",
+            "branch-search",
+        ] {
             let bounds = window.find(ElementId::Name(id.into())).bounds();
             assert!(
                 bounds.left() >= px(0.) && bounds.right() <= px(900.),
@@ -317,4 +326,253 @@ fn worktree_picker_fits_a_short_window_and_does_not_leak_clicks(cx: &mut TestApp
         ui.read(cx, |app, cx| app.composer.read(cx).value().to_string()),
         "back in the composer"
     );
+}
+
+fn branch_index(ui: &Ui, cx: &mut TestAppContext, name: &str) -> usize {
+    ui.read(cx, |app, _| {
+        app.worktree_form
+            .as_ref()
+            .unwrap()
+            .branches
+            .iter()
+            .position(|branch| branch.name == name)
+            .unwrap()
+    })
+}
+
+#[gpui_kit::test]
+fn branch_header_opens_picker_and_current_branch_preserves_subfolder_draft(
+    cx: &mut TestAppContext,
+) {
+    for (window_size, control) in [
+        ((1440., 900.), "branch-select"),
+        ((600., 560.), "header-branches"),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = repo(tmp.path());
+        let nested = cwd.join("nested");
+        std::fs::create_dir(&nested).unwrap();
+        let ui = open_with(
+            cx,
+            Options {
+                workspace: Some(nested.clone()),
+                window_size: Some(window_size),
+                ..test_options()
+            },
+        );
+        ui.input(cx, "keep this subfolder draft");
+        let uid = ui.read(cx, |app, _| app.session().uid);
+        ui.click(cx, control);
+        wait_for(&ui, cx, |app| {
+            app.worktree_form.as_ref().is_some_and(|form| !form.busy)
+        });
+        ui.click(cx, "branch-search");
+        ui.input(cx, "MAIN");
+        ui.press(cx, "enter");
+        wait_for(&ui, cx, |app| app.worktree_form.is_none());
+        ui.read(cx, |app, cx| {
+            assert_eq!(app.session().uid, uid);
+            assert_eq!(app.sessions.len(), 1);
+            assert_eq!(app.session().workspace, nested);
+            assert_eq!(
+                app.composer.read(cx).value().as_ref(),
+                "keep this subfolder draft"
+            );
+        });
+    }
+}
+
+#[gpui_kit::test]
+fn local_branch_selection_keeps_the_running_source_session_and_its_draft(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let cwd = repo(tmp.path());
+    git(&cwd, &["branch", "feature/api"]);
+    let ui = open_with(
+        cx,
+        Options {
+            workspace: Some(cwd.clone()),
+            ..test_options()
+        },
+    );
+    let engine = ui.engine(cx);
+    ui.input(cx, "source request");
+    ui.press(cx, "enter");
+    engine.sent();
+    engine.send(cx, AgentEvent::TurnStarted { turn_id: 1 });
+    ui.input(cx, "source draft");
+    let source_uid = ui.read(cx, |app, _| app.session().uid);
+    std::fs::write(cwd.join("tracked.txt"), "source changes\n").unwrap();
+    show_picker(&ui, cx);
+    let ix = branch_index(&ui, cx, "feature/api");
+    ui.click(cx, ("branch-open", ix));
+    wait_for(&ui, cx, |app| app.worktree_form.is_none());
+    ui.read(cx, |app, _| {
+        assert_ne!(app.session().uid, source_uid);
+        assert_eq!(app.branch().as_deref(), Some("feature/api"));
+        assert!(app.sessions[0].view.running);
+        assert!(app.sessions[0].ops.is_some());
+        assert_eq!(app.sessions[0].workspace, cwd);
+    });
+    assert_eq!(
+        std::fs::read_to_string(cwd.join("tracked.txt")).unwrap(),
+        "source changes\n"
+    );
+    assert_eq!(git(&cwd, &["branch", "--show-current"]), "main");
+    show_picker(&ui, cx);
+    let ix = branch_index(&ui, cx, "main");
+    ui.click(cx, ("branch-open", ix));
+    wait_for(&ui, cx, |app| app.worktree_form.is_none());
+    assert_eq!(ui.read(cx, |app, _| app.sessions.len()), 2);
+    assert_eq!(
+        ui.read(cx, |app, cx| app.composer.read(cx).value().to_string()),
+        "source draft"
+    );
+}
+
+#[gpui_kit::test]
+fn remote_branch_fetch_search_and_tracking_selection_use_configured_git_remote(
+    cx: &mut TestAppContext,
+) {
+    let tmp = tempfile::tempdir().unwrap();
+    let cwd = repo(&tmp.path().join("local"));
+    let upstream = repo(&tmp.path().join("upstream"));
+    git(&upstream, &["branch", "feature/github"]);
+    git(
+        &cwd,
+        &["remote", "add", "origin", upstream.to_str().unwrap()],
+    );
+    let ui = open_with(
+        cx,
+        Options {
+            workspace: Some(cwd.clone()),
+            ..test_options()
+        },
+    );
+    show_picker(&ui, cx);
+    assert!(ui.read(cx, |app, _| {
+        app.worktree_form
+            .as_ref()
+            .unwrap()
+            .branches
+            .iter()
+            .all(|branch| branch.remote.is_none())
+    }));
+    ui.click(cx, "branch-fetch");
+    wait_for(&ui, cx, |app| {
+        app.worktree_form.as_ref().is_some_and(|form| !form.busy)
+    });
+    assert_eq!(
+        ui.read(cx, |app, _| app
+            .worktree_form
+            .as_ref()
+            .unwrap()
+            .status
+            .clone()),
+        Some("Remote branches updated.".into())
+    );
+    ui.click(cx, "branch-search");
+    ui.input(cx, "ORIGIN/FEATURE/GITHUB");
+    ui.read(cx, |app, cx| {
+        let form = app.worktree_form.as_ref().unwrap();
+        let indices = form.branch_indices(cx);
+        assert_eq!(indices.len(), 1);
+        assert_eq!(form.branches[indices[0]].name, "origin/feature/github");
+    });
+    ui.press(cx, "enter");
+    wait_for(&ui, cx, |app| app.worktree_form.is_none());
+    let checkout = ui.read(cx, |app, _| app.session().workspace.clone());
+    assert_eq!(
+        git(&checkout, &["branch", "--show-current"]),
+        "feature/github"
+    );
+    assert_eq!(
+        git(
+            &checkout,
+            &["rev-parse", "--symbolic-full-name", "@{upstream}"]
+        ),
+        "refs/remotes/origin/feature/github"
+    );
+    assert_eq!(git(&cwd, &["branch", "--show-current"]), "main");
+}
+
+#[gpui_kit::test]
+fn branch_conflicts_and_empty_search_keep_the_original_session(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let cwd = repo(tmp.path());
+    git(&cwd, &["branch", "feature/conflict"]);
+    git(&cwd, &["remote", "add", "origin", cwd.to_str().unwrap()]);
+    let commit = git(&cwd, &["rev-parse", "HEAD"]);
+    git(
+        &cwd,
+        &[
+            "update-ref",
+            "refs/remotes/origin/feature/conflict",
+            &commit,
+        ],
+    );
+    let ui = open_with(
+        cx,
+        Options {
+            workspace: Some(cwd.clone()),
+            ..test_options()
+        },
+    );
+    ui.input(cx, "keep source");
+    show_picker(&ui, cx);
+    ui.click(cx, "branch-search");
+    ui.input(cx, "not-a-branch");
+    ui.press(cx, "enter");
+    assert!(has(&ui, cx, "worktree-picker"));
+    assert_eq!(ui.read(cx, |app, _| app.sessions.len()), 1);
+    ui.press(cx, "cmd-a");
+    ui.input(cx, "origin/feature/conflict");
+    ui.press(cx, "enter");
+    wait_for(&ui, cx, |app| {
+        app.worktree_form.as_ref().is_some_and(|form| !form.busy)
+    });
+    ui.read(cx, |app, _| {
+        assert!(
+            app.worktree_form
+                .as_ref()
+                .unwrap()
+                .error
+                .as_ref()
+                .unwrap()
+                .contains("already exists")
+        );
+        assert_eq!(app.session().workspace, cwd);
+        assert_eq!(app.sessions.len(), 1);
+    });
+    ui.press(cx, "escape");
+    assert_eq!(
+        ui.read(cx, |app, cx| app.composer.read(cx).value().to_string()),
+        "keep source"
+    );
+}
+
+#[gpui_kit::test]
+fn branch_refresh_reads_external_changes_without_fetching(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap();
+    let cwd = repo(tmp.path());
+    let ui = open_with(
+        cx,
+        Options {
+            workspace: Some(cwd.clone()),
+            ..test_options()
+        },
+    );
+    show_picker(&ui, cx);
+    git(&cwd, &["branch", "created-externally"]);
+    ui.click(cx, "branch-refresh");
+    wait_for(&ui, cx, |app| {
+        app.worktree_form.as_ref().is_some_and(|form| !form.busy)
+    });
+    branch_index(&ui, cx, "created-externally");
+    ui.click(cx, "branch-fetch");
+    ui.read(cx, |app, _| {
+        let form = app.worktree_form.as_ref().unwrap();
+        assert!(form.remotes.is_empty());
+        assert!(!form.busy);
+        assert!(form.error.is_none());
+    });
 }

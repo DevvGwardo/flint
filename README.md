@@ -1,16 +1,13 @@
+<h1 align="center">Hooter</h1>
+
 <p align="center">
-  <img src="assets/banner.jpg" alt="Flint Banner" width="100%" />
+  <img src="assets/welcome-coast.jpg" alt="Hooter: Your agent workspace. A coastal landscape." width="100%" />
 </p>
 
 <p align="center">
-  <img src="assets/logo.jpg" alt="Flint Logo" width="120" height="120" style="border-radius: 24px;" />
-</p>
-
-<h1 align="center">Flint</h1>
-
-<p align="center">
-  <strong>A native macOS desktop app for coding agents, written in Rust with <a href="https://github.com/zed-industries/zed">GPUI</a>.</strong><br />
-  Run Flint's own agent against any OpenAI-compatible model, or drive Claude Code, Codex, and Droid from the same window.
+  <strong>Your agent workspace.</strong><br />
+  A native desktop app for coding agents, written in Rust with <a href="https://github.com/zed-industries/zed">GPUI</a>.<br />
+  Run Hooter's own agent against an OpenAI-compatible endpoint, or bring Claude Code, Codex and Droid into the same window.
 </p>
 
 <p align="center">
@@ -26,24 +23,31 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Platform-macOS-black?style=flat-square&logo=apple" alt="macOS" />
-  <img src="https://img.shields.io/badge/Rust-2024-dea584?style=flat-square&logo=rust" alt="Rust" />
-  <img src="https://img.shields.io/badge/GUI-GPUI-blue?style=flat-square" alt="GPUI" />
-  <img src="https://img.shields.io/badge/License-Apache--2.0-green?style=flat-square" alt="License" />
+  <img src="https://img.shields.io/badge/Platform-macOS-1b1d1f?style=flat-square&logo=apple&logoColor=ece9e1" alt="macOS first" />
+  <img src="https://img.shields.io/badge/Rust-2024-f4b086?style=flat-square&logo=rust&logoColor=111315" alt="Rust 2024" />
+  <img src="https://img.shields.io/badge/GUI-GPUI-1b1d1f?style=flat-square" alt="GPUI" />
+  <img src="https://img.shields.io/badge/License-Apache--2.0-f4b086?style=flat-square" alt="Apache-2.0 license" />
 </p>
 
 ---
 
 <p align="center">
-  <img src="docs/screenshot.png" alt="Flint Interface Screenshot" width="100%" />
+  <img src="docs/jevdex.png" alt="Earlier interface screenshot, before the Hooter rename" width="100%" />
+  <br /><small>Historical screenshot with legacy Jevdex branding.</small>
 </p>
 
 > [!NOTE]
-> **Status: Early Preview.** macOS first. Linux and Windows are untested. Expect rough edges and breaking changes.
+> **Status: Early Preview.** macOS first, with experimental [Windows support](docs/WINDOWS.md). Native Windows runtime validation is still required; Linux is untested. Expect rough edges and breaking changes.
 
 ## Features
 
-- **General-agent mode.** Open Flint without a folder and ask questions, write,
+- **A coastal home dashboard.** Start with a panoramic, bundled background and
+  the real task composer. See working sessions, recent conversations, your
+  workspace, queued prompts and finished turns. The 14-day chart groups loaded
+  conversations by their last-activity day, not individual commits or turns.
+  Compact chat panels keep the composer and starter prompts instead of the
+  dashboard. No PR, service or machine metrics are invented.
+- **General-agent mode.** Open Hooter without a folder and ask questions, write,
   plan, or work on general tasks. No Git repository or project setup is needed.
   Created files live in the private `~/.flint/agent-workspace/` folder
   (`$FLINT_HOME/agent-workspace/` with a custom home). The native agent uses
@@ -52,7 +56,7 @@
   folder when you need project files. Existing project conversations stay intact.
 - **Its own agent.** A Chat Completions agent loop with tools: shell, read,
   write, edit and grep. It works with any OpenAI-compatible endpoint.
-- **Subagents.** Flint's native agent can delegate independent tasks to isolated,
+- **Subagents.** Hooter's native agent can delegate independent tasks to isolated,
   resumable child sessions, with up to four running in parallel. Choose a
   different default model in Settings, or let the agent select a model per task.
   Open **Subagents** beneath its parent in the sidebar to inspect a full,
@@ -63,6 +67,22 @@
   its draft. **⌘L** returns to the parent's composer. Expanded delegation cards
   also link to the child conversation. Direct child messaging and ACP child
   conversation discovery are not supported yet.
+- **Native worktree tasks.** Ask the native agent to do isolated project work
+  on a named branch. Its `spawn_agent` tool accepts `worktree.branch`, an optional
+  `worktree.base` (default `HEAD`), and an absolute `worktree.repository` when
+  working from general-agent mode. Hooter prepares a real Git worktree under
+  its managed worktree folder, or reuses a clean linked checkout. It never
+  switches the source tree, resets branches, or copies uncommitted source edits.
+  Worktree access needs a separate approval, even in Auto-run mode.
+  The child's shell, file tools, project instructions, and sandbox use that
+  checkout; the parent's workspace stays unchanged. Results include the checkout
+  path and branch. Resuming a child after restart retains its checkout and edits.
+  Read-only requests do not create or open new worktrees. Primary, dirty, locked,
+  and missing checkouts cannot be reused for a new child, and parallel children
+  in one parent cannot share a checkout. Child diffs and checks stay separate
+  from the source tree; parent Undo and parent-workspace MCP tools do not apply
+  to an isolated child. Referenced child checkouts are protected in the picker,
+  including archived conversations. ACP agents keep their own delegation rules.
 - **Harness guard rules** that help cheaper models finish the job: loop
   detection, test-before-done checks, a watchdog for turns that edit nothing,
   and tool-call repair. An optional [JEV judge](#optional-jev-judge) can confirm
@@ -74,9 +94,20 @@
   are restored on launch. Long conversations are trimmed to a context budget.
   Drafts stay with their session. **Jump to latest** resumes following output
   after you scroll back.
-- **Git worktrees.** Choose **Git worktrees…** from the composer's `+` menu
-  or command palette to open an existing checkout or create one on a new
-  branch. Enter a base branch or commit (default `HEAD`). New checkouts live
+- **Git branches and worktrees.** Click the branch in the header, or choose
+  **Git branches & worktrees…** from the composer's `+` menu or command
+  palette. Search local and remote branches, then **Open** one. Existing
+  checkouts are reused; other branches open in isolated worktrees rather
+  than switching underneath a running agent. Remote branches create a local
+  tracking branch, or reuse the matching local tracking branch without
+  pulling or resetting it. Name conflicts are reported, never overwritten.
+  **Refresh** rereads local state; **Fetch remotes** explicitly fetches
+  configured remotes, including GitHub, using your existing Git credentials.
+  No extra token is stored, and no push, pull, or pruning is performed.
+  Sign in through Git's credential helper or configure SSH outside the app
+  if fetching reports an authentication error.
+  To create a new branch, enter its name and a base branch or commit
+  (default `HEAD`). New checkouts live
   under `~/.flint/worktrees/` (or `$FLINT_HOME/worktrees/`) and inherit the
   selected agent without moving the original session or its draft.
   Sessions, terminals, file mentions and edits use the selected checkout;
@@ -148,84 +179,30 @@ See [current gap-closure evidence and remaining limits](docs/GAP-CLOSURE-2026100
 
 ## Architecture
 
-Flint couples high-frame-rate native macOS rendering (Metal via GPUI) with an asynchronous agent engine capable of orchestrating native LLM tool execution and external CLI coding agents through the [Agent Client Protocol (ACP)](https://agentclientprotocol.com).
+One native workspace, two agent paths. Hooter renders its chat, changes and
+terminal panels with GPUI (Metal on macOS), while the agent work runs
+asynchronously.
 
 <p align="center">
-  <img src="assets/architecture.jpg" alt="Flint System Architecture" width="100%" />
+  <img src="docs/brand/jevdex-repo-architecture.png" alt="Hooter architecture, retained from the earlier branding: a Rust and GPUI desktop connects either to the native agent and OpenAI-compatible providers, or through the ACP bridge to Claude Code, Codex and Droid. Both paths use local sessions, workspace files and terminal processes." width="100%" />
 </p>
 
-<details>
-  <summary><b>View Mermaid specification</b></summary>
-
-```mermaid
-%%{init: {
-  'theme': 'base',
-  'themeVariables': {
-    'darkMode': true,
-    'primaryColor': '#1b1b20',
-    'primaryTextColor': '#e7e7ea',
-    'primaryBorderColor': '#ff8a3d',
-    'lineColor': '#ff8a3d',
-    'secondaryColor': '#141418',
-    'tertiaryColor': '#0e0e10',
-    'mainBkg': '#141418',
-    'nodeBorder': '#ff8a3d',
-    'clusterBkg': '#141418',
-    'clusterBorder': '#222228',
-    'defaultLinkColor': '#ff8a3d',
-    'titleColor': '#e7e7ea',
-    'edgeLabelBackground': '#1b1b20'
-  }
-}}%%
-graph TD
-    classDef default fill:#141418,stroke:#222228,stroke-width:1.5px,color:#e7e7ea;
-    classDef ember fill:#1b1b20,stroke:#ff8a3d,stroke-width:2px,color:#e7e7ea;
-    classDef cyan fill:#141418,stroke:#00e5ff,stroke-width:2px,color:#e7e7ea;
-
-    subgraph UI ["Desktop UI (crates/flint-app & crates/flint-term)"]
-        GPUI["GPUI Metal Window"] --> Panels["Dockable Panels Layout"]
-        Panels --> Composer["Composer & Palette"]
-        Panels --> Diffs["Diffs & Changes"]
-        Panels --> Terminal["Terminal Dock (PTY)"]
-    end
-
-    subgraph Core ["Agent Engine Core (crates/flint-agent)"]
-        Engine["Session & Context Manager"]
-        Guard["Harness Guard (Loops, Watchdog, Tests)"]
-        Tools["Tool Runner (sh, read, write, edit, grep)"]
-        Subagents["Subagent Coordinator (1 to 4)"]
-        Engine --> Guard --> Tools
-        Engine -.-> Subagents
-    end
-
-    subgraph ACP ["ACP Gateway (crates/flint-acp)"]
-        Bridge["JSON-RPC over stdio"]
-    end
-
-    subgraph Providers ["Model Providers & External Agents"]
-        Endpoints["OpenAI / OpenRouter / DeepSeek / Ollama"]
-        ExternalAgents["Claude Code / Codex / Droid"]
-        JEV["Typesafe JEV Judge"]
-    end
-
-    Composer --> Engine
-    Composer --> Bridge
-    Tools --> Terminal
-    Engine <--> Endpoints
-    Bridge <--> ExternalAgents
-    Guard -.-> JEV
-
-    class GPUI,Engine,Guard,Bridge,Subagents ember;
-    class ExternalAgents,Endpoints cyan;
-```
-</details>
+- **Native agent:** `flint-agent` owns the tool loop, approvals, harness,
+  optional JEV judge and subagents. It connects to your configured
+  OpenAI-compatible provider.
+- **External agents:** `flint-acp` connects to Claude Code, Codex and Droid
+  through the [Agent Client Protocol](https://agentclientprotocol.com).
+  They keep their own models, tools, subscriptions and guardrails.
+- **Shared workspace:** both paths surface conversations, file changes and
+  command output in the same app. Settings and sessions stay local in `~/.flint/`.
 
 > [!NOTE]
 > For in-depth component specifications, sequence diagrams, and lifecycle flows, see [Architecture & Internals](docs/ARCHITECTURE.md).
 
 ### Turn Execution Lifecycle
 
-Every turn passes through context budgeting, streaming model evaluation, tool execution via Harness Guard, and UI state reconciliation.
+The native agent combines context budgeting, streaming model output, guarded
+tool execution and UI updates. External ACP agents manage their own turn loops.
 
 <p align="center">
   <img src="assets/turn_lifecycle.jpg" alt="Turn Execution Lifecycle" width="100%" />
@@ -233,7 +210,7 @@ Every turn passes through context budgeting, streaming model evaluation, tool ex
 
 ## Workspace & Interface
 
-Flint is designed around a responsive, low-latency macOS native interface powered by GPUI, combining modular dockable panels, a real PTY terminal dock, and an interactive changes reviewer.
+Hooter is designed around a responsive, low-latency macOS native interface powered by GPUI, combining modular dockable panels, a real PTY terminal dock, and an interactive changes reviewer.
 
 ### Dockable Panels & Dynamic Layout
 
@@ -243,46 +220,6 @@ Drag the six-dot grip on any panel header (Sidebar, Chat, Changes, or Terminal) 
   <img src="assets/dockable_panels_diagram.jpg" alt="Dockable Panels Layout System" width="100%" />
 </p>
 
-<details>
-  <summary><b>View Mermaid docking layout flow</b></summary>
-
-```mermaid
-%%{init: {
-  'theme': 'base',
-  'themeVariables': {
-    'darkMode': true,
-    'primaryColor': '#1b1b20',
-    'primaryTextColor': '#e7e7ea',
-    'primaryBorderColor': '#ff8a3d',
-    'lineColor': '#ff8a3d',
-    'secondaryColor': '#141418',
-    'tertiaryColor': '#0e0e10',
-    'mainBkg': '#141418',
-    'nodeBorder': '#ff8a3d',
-    'clusterBkg': '#141418',
-    'clusterBorder': '#222228',
-    'defaultLinkColor': '#ff8a3d',
-    'titleColor': '#e7e7ea',
-    'edgeLabelBackground': '#1b1b20'
-  }
-}}%%
-flowchart TD
-    classDef default fill:#141418,stroke:#222228,stroke-width:1.5px,color:#e7e7ea;
-    classDef ember fill:#1b1b20,stroke:#ff8a3d,stroke-width:2px,color:#e7e7ea;
-    classDef cyan fill:#141418,stroke:#00e5ff,stroke-width:2px,color:#e7e7ea;
-
-    Grip["Drag 6-Dot Panel Grip"] --> Drop{"Hover Drop Target Edge"}
-    Drop -->|Left / Right| HorizSplit["Create Horizontal Split View"]
-    Drop -->|Top / Bottom| VertSplit["Create Vertical Stack View"]
-    HorizSplit --> SaveLayout["Persist to ~/.flint/layout.json"]
-    VertSplit --> SaveLayout
-    SaveLayout --> Restore["Restore Custom Arrangement on Launch"]
-
-    class Grip,Drop ember;
-    class HorizSplit,VertSplit cyan;
-```
-</details>
-
 ### Integrated Terminal Dock
 
 The terminal dock embeds a full PTY shell session directly within your project workspace, complete with ANSI colours, full scrollback, and clickable links.
@@ -291,93 +228,14 @@ The terminal dock embeds a full PTY shell session directly within your project w
   <img src="assets/terminal_dock_diagram.jpg" alt="Integrated Terminal Dock Workflow" width="100%" />
 </p>
 
-<details>
-  <summary><b>View Mermaid terminal dock flow</b></summary>
-
-```mermaid
-%%{init: {
-  'theme': 'base',
-  'themeVariables': {
-    'darkMode': true,
-    'primaryColor': '#1b1b20',
-    'primaryTextColor': '#e7e7ea',
-    'primaryBorderColor': '#ff8a3d',
-    'lineColor': '#ff8a3d',
-    'secondaryColor': '#141418',
-    'tertiaryColor': '#0e0e10',
-    'mainBkg': '#141418',
-    'nodeBorder': '#ff8a3d',
-    'clusterBkg': '#141418',
-    'clusterBorder': '#222228',
-    'defaultLinkColor': '#ff8a3d',
-    'titleColor': '#e7e7ea',
-    'edgeLabelBackground': '#1b1b20'
-  }
-}}%%
-sequenceDiagram
-    autonumber
-    participant Agent as Agent Execution Turn
-    participant Dock as Terminal Dock (crates/flint-term)
-    participant Shell as Interactive PTY Shell
-    actor Dev as Developer
-
-    Agent->>Dock: Run command (read-only execution tab)
-    Dock-->>Agent: Live stdout/stderr stream
-    Dev->>Dock: Open interactive tab (`cmd-shift-t`)
-    Dev->>Shell: Run manual shell commands
-    Dev->>Agent: Send terminal card output back as composer prompt
-```
-</details>
-
 ### Diffs & Changes Inspector
 
-Review code changes turn-by-turn with syntax-highlighted unified and side-by-side diff viewers before applying changes or committing work.
+Review the agent's workspace edits turn-by-turn with syntax-highlighted unified
+and side-by-side diff viewers before staging or committing work.
 
 <p align="center">
   <img src="assets/diffs_changes_diagram.jpg" alt="Diffs & Changes Review Pipeline" width="100%" />
 </p>
-
-<details>
-  <summary><b>View Mermaid diff review flow</b></summary>
-
-```mermaid
-%%{init: {
-  'theme': 'base',
-  'themeVariables': {
-    'darkMode': true,
-    'primaryColor': '#1b1b20',
-    'primaryTextColor': '#e7e7ea',
-    'primaryBorderColor': '#ff8a3d',
-    'lineColor': '#ff8a3d',
-    'secondaryColor': '#141418',
-    'tertiaryColor': '#0e0e10',
-    'mainBkg': '#141418',
-    'nodeBorder': '#ff8a3d',
-    'clusterBkg': '#141418',
-    'clusterBorder': '#222228',
-    'defaultLinkColor': '#ff8a3d',
-    'titleColor': '#e7e7ea',
-    'edgeLabelBackground': '#1b1b20'
-  }
-}}%%
-flowchart LR
-    classDef default fill:#141418,stroke:#222228,stroke-width:1.5px,color:#e7e7ea;
-    classDef ember fill:#1b1b20,stroke:#ff8a3d,stroke-width:2px,color:#e7e7ea;
-    classDef green fill:#141418,stroke:#4cc38a,stroke-width:2px,color:#e7e7ea;
-    classDef cyan fill:#141418,stroke:#00e5ff,stroke-width:2px,color:#e7e7ea;
-
-    Edit["Agent Tool: Edit / Write"] --> Capture["Diff Snapshot Capture"]
-    Capture --> Card["Turn Card: Files Changed (+ / -)"]
-    Card --> Inspector["Changes Panel Inspector (cmd-j)"]
-    Inspector --> Review{"Developer Review"}
-    Review -->|Accept| Commit["Stage in Workspace Git"]
-    Review -->|Revert / Deny| Undo["Revert File Changes"]
-
-    class Edit,Capture,Review ember;
-    class Card,Inspector cyan;
-    class Commit green;
-```
-</details>
 
 ## Requirements
 
@@ -385,20 +243,33 @@ flowchart LR
   installs it automatically.
 - macOS with the Xcode command-line tools (`xcode-select --install`), which
   provide the Metal toolchain GPUI renders with.
+- On Windows: Visual Studio 2022 C++ Build Tools and a Windows SDK, including
+  `fxc.exe` for release builds. See [Windows setup and validation](docs/WINDOWS.md).
 
 ## Build and run
 
 ```sh
-cargo run --release -p flint-app            # opens flint in the current directory
+cargo run --release -p flint-app            # opens Hooter in general-agent mode
 cargo run --release -p flint-app -- ~/code/my-project
 cargo run -p flint-app -- --demo            # scripted demo, no model needed
 ```
 
-The binary is `flint`. The first release build takes several minutes.
+The primary binary is `hooter`. The first release build takes several minutes.
+The `jevdex` and `flint` binaries remain supported legacy aliases, as do
+`/agent jevdex` and `/agent flint`. `/agent hooter` selects the native agent.
+
+Hooter keeps the existing `~/.flint/` data directory, `FLINT_*` environment
+variables, and Rust crate names. Existing settings and saved sessions do not
+need to be moved or migrated.
+
+On Windows, the same Cargo commands build `hooter.exe`; pass project paths such
+as `"C:\code\my-project"`. Settings and sessions live in `%USERPROFILE%\.flint`.
+Native commands use `cmd.exe`, and app shortcuts use **Ctrl** instead of
+**Command**. Windows shell commands are **not sandboxed**.
 
 ## Configure a provider
 
-flint talks to any OpenAI-compatible Chat Completions endpoint. With nothing
+Hooter talks to any OpenAI-compatible Chat Completions endpoint. With nothing
 configured it uses `https://api.openai.com/v1` and `gpt-4.1-mini`; the model
 and endpoint can be changed in Settings (`cmd-,`) or in the config file.
 
@@ -415,6 +286,7 @@ subagent_model = ""                   # empty inherits the parent model
 base_url = "https://api.openai.com/v1"
 api_key_env = "OPENAI_API_KEY"        # or: api_key_file = "~/.config/flint/key"
 approval = "auto"                     # or "ask"
+queue_after_verification = false       # opt in to advance queued work after passing checks
 effort = "medium"                     # low, medium, high, or "" for the default
 ```
 
@@ -442,57 +314,9 @@ only its final answer plus a `session_id`. The parent can use that id for
 follow-ups, including after a saved session is reopened. Children cannot spawn
 more children. Interrupting a turn stops its children too.
 
-<details>
-  <summary><b>View Mermaid sequence flow</b></summary>
-
-```mermaid
-%%{init: {
-  'theme': 'base',
-  'themeVariables': {
-    'darkMode': true,
-    'actorBkg': '#1b1b20',
-    'actorBorder': '#ff8a3d',
-    'actorTextColor': '#e7e7ea',
-    'actorLineColor': '#ff8a3d',
-    'signalColor': '#ff8a3d',
-    'signalTextColor': '#e7e7ea',
-    'labelBoxBkgColor': '#1b1b20',
-    'labelBoxBorderColor': '#ff8a3d',
-    'labelTextColor': '#e7e7ea',
-    'loopTextColor': '#e7e7ea',
-    'noteBkgColor': '#141418',
-    'noteTextColor': '#e7e7ea',
-    'noteBorderColor': '#222228',
-    'activationBkgColor': '#222228',
-    'activationBorderColor': '#ff8a3d',
-    'sequenceNumberColor': '#0e0e10'
-  }
-}}%%
-sequenceDiagram
-    autonumber
-    participant Parent as Parent Agent
-    participant Orch as Subagent Coordinator
-    participant Sub1 as Subagent A (Isolated)
-    participant Sub2 as Subagent B (Isolated)
-    participant Disk as Workspace Filesystem
-
-    Parent->>Orch: spawn_agent(task, model)
-    par Up to 4 Parallel Subagents
-        Orch->>Sub1: Autonomous prompt loop
-        Sub1->>Disk: Read & edit targeted files
-        Sub1-->>Orch: Result + session_id_A
-    and
-        Orch->>Sub2: Autonomous prompt loop
-        Sub2->>Disk: Read & edit targeted files
-        Sub2-->>Orch: Result + session_id_B
-    end
-    Orch-->>Parent: Aggregated results & resumable IDs
-```
-</details>
-
 Set **Subagent model** in Settings (`cmd-,`) or `subagent_model` in the config
 file. `FLINT_SUBAGENT_MODEL` overrides it for one run. These settings apply when
-a new Flint engine session starts. Model selection for new children is:
+a new Hooter engine session starts. Model selection for new children is:
 explicit `spawn_agent.model`, then the configured subagent model, then the parent
 model. Resumed children keep their original model and reasoning effort.
 
@@ -505,11 +329,11 @@ Consecutive independent `spawn_agent` calls in one model response run in
 parallel (up to four at a time). Children edit the same workspace, not separate git worktrees,
 so delegated edits must target different files. A parent retains up to 32 child
 sessions; further tasks can resume an existing child. Claude Code, Codex and Droid
-still use their own delegation implementations, not Flint's tool.
+still use their own delegation implementations, not Hooter's tool.
 
 ### Approvals & Permission Security Gate
 
-Flint provides two execution modes configured via `approval`:
+Hooter provides two execution modes configured via `approval`:
 - **`auto` (Auto-Run):** The agent executes tools autonomously without interrupting you.
 - **`ask` (Ask-Before-Changes):** Actions that modify files or run shell commands are paused for review.
 
@@ -522,156 +346,22 @@ When `ask` mode is active, approvals are pinned directly above the composer with
   <img src="assets/approvals_workflow_diagram.jpg" alt="Approvals and Permission Security Gate" width="100%" />
 </p>
 
-<details>
-  <summary><b>View Mermaid approvals gate flow</b></summary>
-
-```mermaid
-%%{init: {
-  'theme': 'base',
-  'themeVariables': {
-    'darkMode': true,
-    'primaryColor': '#1b1b20',
-    'primaryTextColor': '#e7e7ea',
-    'primaryBorderColor': '#ff8a3d',
-    'lineColor': '#ff8a3d',
-    'secondaryColor': '#141418',
-    'tertiaryColor': '#0e0e10',
-    'mainBkg': '#141418',
-    'nodeBorder': '#ff8a3d',
-    'clusterBkg': '#141418',
-    'clusterBorder': '#222228',
-    'defaultLinkColor': '#ff8a3d',
-    'titleColor': '#e7e7ea',
-    'edgeLabelBackground': '#1b1b20'
-  }
-}}%%
-flowchart TD
-    classDef default fill:#141418,stroke:#222228,stroke-width:1.5px,color:#e7e7ea;
-    classDef ember fill:#1b1b20,stroke:#ff8a3d,stroke-width:2px,color:#e7e7ea;
-    classDef green fill:#141418,stroke:#4cc38a,stroke-width:2px,color:#e7e7ea;
-    classDef red fill:#141418,stroke:#f2555a,stroke-width:2px,color:#e7e7ea;
-
-    ToolReq["Agent Requests Tool Execution"] --> Mode{"Approval Mode"}
-    Mode -->|Auto| RunDirect["Execute in Workspace Sandbox"]
-    Mode -->|Ask| PromptBar["Show Pinned Banner in Composer"]
-    PromptBar --> KeyChoice{"User Keypress"}
-    KeyChoice -->|'y'| RunDirect
-    KeyChoice -->|'a'| Always["Set Session to Auto & Run"]
-    Always --> RunDirect
-    KeyChoice -->|'n'| Deny["Halt Tool & Inject User Feedback"]
-
-    class ToolReq,Mode,PromptBar ember;
-    class RunDirect,Always green;
-    class Deny red;
-```
-</details>
-
 ### Sessions & Context Token Budgeting
 
-Flint retains conversation history and automatically protects model context limits:
+Hooter retains conversation history and automatically protects model context limits:
 - **Local Persistence:** All conversations are durably saved to `~/.flint/sessions/<session_id>.json` and restored on app launch.
-- **Context Budgeting:** When conversation length approaches the model's context ceiling, Flint preserves the system instructions and recent turns while compacting earlier history into concise summaries.
+- **Context Budgeting:** When conversation length approaches the model's context ceiling, Hooter preserves the system instructions and recent turns while compacting earlier history into concise summaries.
 - **Dynamic Grouping:** Organize your active sessions by **Project**, **Status**, or **Agent Type** via the session sidebar with <kbd>⌘</kbd> <kbd>⇧</kbd> <kbd>G</kbd>.
 
 <p align="center">
   <img src="assets/session_context_diagram.jpg" alt="Session Persistence and Context Window Budgeting" width="100%" />
 </p>
 
-<details>
-  <summary><b>View Mermaid session context flow</b></summary>
-
-```mermaid
-%%{init: {
-  'theme': 'base',
-  'themeVariables': {
-    'darkMode': true,
-    'primaryColor': '#1b1b20',
-    'primaryTextColor': '#e7e7ea',
-    'primaryBorderColor': '#ff8a3d',
-    'lineColor': '#ff8a3d',
-    'secondaryColor': '#141418',
-    'tertiaryColor': '#0e0e10',
-    'mainBkg': '#141418',
-    'nodeBorder': '#ff8a3d',
-    'clusterBkg': '#141418',
-    'clusterBorder': '#222228',
-    'defaultLinkColor': '#ff8a3d',
-    'titleColor': '#e7e7ea',
-    'edgeLabelBackground': '#1b1b20'
-  }
-}}%%
-flowchart LR
-    classDef default fill:#141418,stroke:#222228,stroke-width:1.5px,color:#e7e7ea;
-    classDef ember fill:#1b1b20,stroke:#ff8a3d,stroke-width:2px,color:#e7e7ea;
-    classDef cyan fill:#141418,stroke:#00e5ff,stroke-width:2px,color:#e7e7ea;
-
-    Turn["New Turn Completed"] --> Disk["Save to ~/.flint/sessions/"]
-    Turn --> TokenCheck{"Context Token Utilization"}
-    TokenCheck -->|Within Limit| Normal["Full Turn History"]
-    TokenCheck -->|Approaching Budget| Compact["Prune & Summarize Older Turns"]
-    Compact --> ContextWindow["Assemble Next Prompt Frame"]
-    Normal --> ContextWindow
-    Disk --> Sidebar["Sidebar Grouping (cmd-shift-g)"]
-
-    class Turn,TokenCheck ember;
-    class Compact,ContextWindow,Sidebar cyan;
-```
-</details>
-
 ## Claude Code, Codex and Droid
 
 <p align="center">
   <img src="assets/acp_diagram.jpg" alt="Agent Client Protocol Architecture" width="100%" />
 </p>
-
-<details>
-  <summary><b>View Mermaid protocol flow</b></summary>
-
-```mermaid
-%%{init: {
-  'theme': 'base',
-  'themeVariables': {
-    'darkMode': true,
-    'primaryColor': '#1b1b20',
-    'primaryTextColor': '#e7e7ea',
-    'primaryBorderColor': '#ff8a3d',
-    'lineColor': '#ff8a3d',
-    'secondaryColor': '#141418',
-    'tertiaryColor': '#0e0e10',
-    'mainBkg': '#141418',
-    'nodeBorder': '#ff8a3d',
-    'clusterBkg': '#141418',
-    'clusterBorder': '#222228',
-    'defaultLinkColor': '#ff8a3d',
-    'titleColor': '#e7e7ea',
-    'edgeLabelBackground': '#1b1b20'
-  }
-}}%%
-flowchart LR
-    classDef default fill:#141418,stroke:#222228,stroke-width:1.5px,color:#e7e7ea;
-    classDef ember fill:#1b1b20,stroke:#ff8a3d,stroke-width:2px,color:#e7e7ea;
-    classDef cyan fill:#141418,stroke:#00e5ff,stroke-width:2px,color:#e7e7ea;
-
-    subgraph FlintApp ["Flint Native Host (macOS)"]
-        UI["GPUI Unified Window"]
-        Client["crates/flint-acp Gateway"]
-        UI <--> Client
-    end
-
-    subgraph Agents ["External Agents (stdio JSON-RPC)"]
-        Claude["Claude Code\n(claude-agent-acp)"]
-        Codex["Codex\n(codex-acp)"]
-        Droid["Droid\n(native ACP)"]
-    end
-
-    Client <==> Claude
-    Client <==> Codex
-    Client <==> Droid
-
-    class UI,Client ember;
-    class Claude,Codex,Droid cyan;
-```
-</details>
 
 For Claude Code and Codex, install the ACP adapters, then sign in once with
 each CLI so the adapter can reuse your login:
@@ -684,9 +374,9 @@ codex     # log in once
 ```
 
 Pick the agent for a session from the agent picker, with `/agent claude`,
-`/agent codex`, `/agent droid` or `/agent flint`, or from the command palette.
-These agents run their own loops, so flint's harness guard rules do not apply
-to them. They use your own agent accounts, not an API key from flint.
+`/agent codex`, `/agent droid` or `/agent hooter`, or from the command palette.
+These agents run their own loops, so Hooter's harness guard rules do not apply
+to them. They use your own agent accounts, not an API key from Hooter.
 
 Droid speaks ACP natively, so it needs no adapter. Install Droid and sign in
 once in a terminal:
@@ -697,20 +387,22 @@ droid                              # log in to Factory
 ```
 
 Choose **Droid** in the agent picker, type `/agent droid`, or use **New Droid
-session** in the command palette. Flint launches `droid exec --output-format acp`
+session** in the command palette. Hooter launches `droid exec --output-format acp`
 and uses Droid's own model and mode options when it reports them. Droid runs
-its own tools, settings, and subagents; Flint's native `subagent_model` setting
+its own tools, settings, and subagents; Hooter's native `subagent_model` setting
 does not change Droid's subagent models.
 
 Claude Code prefers `ANTHROPIC_API_KEY` over a subscription login whenever it
-is set, so flint removes `ANTHROPIC_API_KEY` and `ANTHROPIC_AUTH_TOKEN` from the
+is set, so Hooter removes `ANTHROPIC_API_KEY` and `ANTHROPIC_AUTH_TOKEN` from the
 adapter's environment and Claude Code uses your plan. To bill an API key
-instead, launch flint with `FLINT_CLAUDE_USE_API_KEY=1`.
+instead, launch Hooter with `FLINT_CLAUDE_USE_API_KEY=1`.
 
 The first message in a new Claude Code or Codex session can take 20–50 seconds
 while the adapter starts.
 
 ## Keyboard shortcuts
+
+On Windows, replace **⌘** with **Ctrl**. Workspace reveal opens File Explorer.
 
 | Shortcut | Action |
 | --- | --- |
@@ -735,65 +427,16 @@ dismiss.
 
 ## Harness Guard & JEV Judge
 
-Flint equips models with autonomous **harness guard rules** that prevent runaway execution and guarantee completion quality:
+Hooter's native agent uses **harness guard rules** to catch repeated work,
+missing verification and malformed tool calls:
 - **Loop Detection:** Detects repeated cyclical tool invocation patterns and breaks out before tokens are wasted.
-- **Watchdog:** Monitors turns that execute without editing code or making forward progress.
+- **Watchdog:** Catches change requests with no observed work, while accounting for shell effects and checked deliverables.
 - **Test-Before-Done:** Requires execution and verification of tests before concluding tasks that touched source files.
 - **Tool-Call Repair:** Automatically repairs malformed JSON or invalid parameter signatures from cheaper models.
 
 <p align="center">
   <img src="assets/harness_guard.jpg" alt="Harness Guard System" width="100%" />
 </p>
-
-<details>
-  <summary><b>View Mermaid guard logic tree</b></summary>
-
-```mermaid
-%%{init: {
-  'theme': 'base',
-  'themeVariables': {
-    'darkMode': true,
-    'primaryColor': '#1b1b20',
-    'primaryTextColor': '#e7e7ea',
-    'primaryBorderColor': '#ff8a3d',
-    'lineColor': '#ff8a3d',
-    'secondaryColor': '#141418',
-    'tertiaryColor': '#0e0e10',
-    'mainBkg': '#141418',
-    'nodeBorder': '#ff8a3d',
-    'clusterBkg': '#141418',
-    'clusterBorder': '#222228',
-    'defaultLinkColor': '#ff8a3d',
-    'titleColor': '#e7e7ea',
-    'edgeLabelBackground': '#1b1b20'
-  }
-}}%%
-flowchart TD
-    classDef default fill:#141418,stroke:#222228,stroke-width:1.5px,color:#e7e7ea;
-    classDef ember fill:#1b1b20,stroke:#ff8a3d,stroke-width:2px,color:#e7e7ea;
-    classDef green fill:#141418,stroke:#4cc38a,stroke-width:2px,color:#e7e7ea;
-    classDef red fill:#141418,stroke:#f2555a,stroke-width:2px,color:#e7e7ea;
-    classDef cyan fill:#141418,stroke:#00e5ff,stroke-width:2px,color:#e7e7ea;
-
-    In["Agent Action Proposal"] --> Guard{"Guard Rules Inspection"}
-    Guard -->|Cyclic Loops| BreakLoop["Break Infinite Loop"]
-    Guard -->|Malformed Syntax| Repair["Automatic Tool-Call Repair"]
-    Guard -->|No Edits Made| Warn["Watchdog Guidance Nudge"]
-    Guard -->|Clean Request| Execute["Execute Action via Sandbox"]
-
-    BreakLoop --> JEV{"Optional JEV Judge?"}
-    Warn --> JEV
-    JEV -->|Yes| Consult["Typesafe JEV Confirmation"]
-    Consult -->|Confirmed| Intervene["Intervene / Re-prompt Turn"]
-    Consult -->|False Alarm| Execute
-    JEV -->|No (Heuristic)| Intervene
-
-    class In,Guard,JEV ember;
-    class Execute green;
-    class BreakLoop,Warn,Intervene red;
-    class Repair,Consult cyan;
-```
-</details>
 
 ### Optional JEV judge
 
@@ -805,14 +448,42 @@ Keep the `keys` directory private (`chmod 700`) and the key file at `chmod 600`.
 The key is never displayed in Settings and is only used for the JEV judge,
 not as a fallback for the main model's credential.
 `TYPESAFE_BASE_URL` and `JEV_MODEL` override its endpoint and model. Without
-the key the harness uses its heuristics; flint works fine either way.
+the key the harness uses its heuristics; Hooter works fine either way.
+Use the **JEV** toggle beside the native chat options, or the
+**JEV judge** toggle in Settings: even
+with a credential present, `Off` keeps the harness on its own heuristics, and
+`On` re-enables the judge. The setting lives in `~/.flint/config.toml` as
+`jev_judge`. Changes apply on the next turn in native sessions, including
+already-started engines and their resumed subagents. A running turn keeps
+its configuration. JEV does not grant or remove edit permissions: task scope,
+approvals, sandboxing, and deterministic completion checks remain active.
+External ACP agents use their own guardrails.
+When the judge rules, the transcript shows a `JEV` status row — what it judged,
+its confidence, and whether the guard acted on the verdict.
+Passing, current verification does not need another JEV verdict. The judge and
+the completion guard use the same revision-aware check evidence. Routine
+guard guidance stays in the work disclosure, with details available on demand;
+unresolved blockers and failed outcomes remain visible.
+Run dependency setup before final verification. An install or edit afterward
+makes previous checks stale and triggers bounded recovery. Successfully
+executed checks still count as recovery activity, but stale evidence never
+certifies the current work. The UI distinguishes a repeated condition without
+recovery progress from exhausting the four-follow-up budget and keeps the
+unresolved condition in task details.
+
+Queued work still waits for review by default. In Settings, opt into
+**Continue queued work after passing checks** to advance after a native result
+has current passing verification and no unresolved evidence issues. This does
+not accept the result, change permissions or disable the sandbox. Partial,
+blocked, interrupted and external-agent results still hold the queue, and
+reloaded queues remain paused.
 
 ## Project layout
 
 ```
 crates/flint-agent/   the agent engine: provider client, tools, harness, sessions
 crates/flint-acp/     Claude Code, Codex and Droid over the Agent Client Protocol
-crates/flint-app/     the GPUI app (binary: flint)
+crates/flint-app/     the GPUI app (binary: hooter; legacy aliases: jevdex, flint)
 tools/blueprint/      evidence harness that drives the real app (Python + Swift)
 ```
 
@@ -834,6 +505,10 @@ cargo test --workspace
 Tests never need a key or network access. The live tests in
 `crates/flint-agent/tests/live.rs` are opt-in: set `FLINT_LIVE=1`,
 `FLINT_API_KEY`, and optionally `FLINT_LIVE_BASE_URL` / `FLINT_LIVE_MODEL`.
+
+For bounded task-completion benchmarks with independent grading, use the
+[orchestrator evaluator](docs/ORCHESTRATOR-EVAL.md). Its offline mode needs no
+provider credentials. Live subscription usage requires explicit authorization.
 
 ## License
 

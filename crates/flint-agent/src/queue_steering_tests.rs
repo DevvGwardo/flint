@@ -8,7 +8,9 @@ async fn queue_steering_is_acknowledged_between_steps_without_cancelling_tools()
         sse_tool_call(
             "working",
             "run_command",
-            json!({"command": "sleep 0.15; printf 'fixture complete'"}),
+            json!({"command": if cfg!(windows) {
+                "powershell.exe -NoProfile -NonInteractive -Command \"Start-Sleep -Milliseconds 150; Write-Output 'fixture complete'\""
+            } else { "sleep 0.15; printf 'fixture complete'" }}),
         ),
         sse_text("Follow-up applied."),
     ])

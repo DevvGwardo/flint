@@ -5,7 +5,7 @@ use pretty_assertions::assert_eq;
 
 use super::*;
 
-fn run(cwd: &Path, args: &[&str]) -> Vec<u8> {
+pub(crate) fn run(cwd: &Path, args: &[&str]) -> Vec<u8> {
     let output = Command::new("git")
         .current_dir(cwd)
         .args(args)
@@ -21,7 +21,7 @@ fn run(cwd: &Path, args: &[&str]) -> Vec<u8> {
 
 /// Static commit objects avoid depending on, or changing, the user's author
 /// identity. All Git writes target this disposable fixture.
-fn commit(cwd: &Path) -> String {
+pub(crate) fn commit(cwd: &Path) -> String {
     run(cwd, &["add", "."]);
     let tree = String::from_utf8(run(cwd, &["write-tree"])).unwrap();
     let object = format!(
@@ -48,10 +48,11 @@ fn commit(cwd: &Path) -> String {
     id
 }
 
-fn repository(root: &Path) -> PathBuf {
+pub(crate) fn repository(root: &Path) -> PathBuf {
     let cwd = root.join("repo");
     std::fs::create_dir_all(&cwd).unwrap();
     run(&cwd, &["init", "--quiet", "--template="]);
+    run(&cwd, &["config", "core.autocrlf", "false"]);
     run(&cwd, &["symbolic-ref", "HEAD", "refs/heads/main"]);
     std::fs::write(cwd.join("tracked.txt"), "base\n").unwrap();
     std::fs::write(cwd.join(".gitignore"), "ignored\n").unwrap();

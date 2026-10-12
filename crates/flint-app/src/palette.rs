@@ -119,8 +119,8 @@ pub fn render(
                     Box::new(OpenWorkspace),
                 ))
                 .item(item(
-                    "Git worktrees…",
-                    IconName::Folder,
+                    "Git branches & worktrees…",
+                    IconName::GitBranch,
                     Box::new(OpenWorktrees),
                 ))
                 .item(item(

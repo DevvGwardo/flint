@@ -1,6 +1,6 @@
-//! flint's visual system: a near-black, neutral, dark-first palette with one
-//! restrained ember accent, hairline borders, system UI type and JetBrains
-//! Mono for code. Installed over gpui-component's dark theme so stock
+//! Hooter's visual system: layered charcoal, warm ivory, and a restrained
+//! apricot accent. Avenir Next for UI and JetBrains Mono for code.
+//! Installed over gpui-component's dark theme so stock
 //! components (buttons, inputs, palette) match the custom surfaces.
 
 use std::sync::LazyLock;
@@ -55,23 +55,23 @@ fn hexa(value: u32, alpha: f32) -> Hsla {
 }
 
 pub static PALETTE: LazyLock<Palette> = LazyLock::new(|| Palette {
-    window_tint: hexa(0x0b0b0d, 0.78),
-    sidebar_fill: hexa(0xffffff, 0.035),
-    bubble: hex(0x1c1c21),
-    bg: hex(0x0e0e10),
-    chrome: hex(0x0f0f12),
-    surface: hex(0x141418),
-    raised: hex(0x1b1b20),
-    border: hex(0x222228),
-    border_strong: hex(0x2f2f37),
-    text: hex(0xe7e7ea),
-    text_muted: hex(0x9a9aa4),
+    window_tint: hexa(0x101113, 0.96),
+    sidebar_fill: hex(0x191a1d),
+    bubble: hex(0x222327),
+    bg: hex(0x131416),
+    chrome: hex(0x17181b),
+    surface: hex(0x1b1c20),
+    raised: hex(0x25262b),
+    border: hex(0x2c2d32),
+    border_strong: hex(0x3a3b42),
+    text: hex(0xf1eee8),
+    text_muted: hex(0xb0b0b8),
     // >= 4.5:1 even against the raised and message-bubble surfaces.
-    text_subtle: hex(0x8a8a95),
-    accent: hex(0xff8a3d),
-    accent_soft: hexa(0xff8a3d, 0.14),
-    on_accent: hex(0x1a0d04),
-    success: hex(0x4cc38a),
+    text_subtle: hex(0x999aa5),
+    accent: hex(0xf3b58b),
+    accent_soft: hexa(0xf3b58b, 0.12),
+    on_accent: hex(0x241912),
+    success: hex(0x8cba9b),
     danger: hex(0xf2555a),
     warning: hex(0xe5b454),
     info: hex(0x6aa6ff),
@@ -87,15 +87,16 @@ pub fn palette() -> &'static Palette {
 }
 
 pub const MONO_FONT: &str = "JetBrains Mono";
+pub const DISPLAY_FONT: &str = "Avenir Next";
 
 /// Text sizes used across the app (px).
 pub mod size {
-    pub const XS: f32 = 12.5;
+    pub const XS: f32 = 13.;
     /// Mono text: code, paths, commands.
-    pub const SM: f32 = 13.5;
-    pub const BASE: f32 = 15.;
-    pub const MD: f32 = 15.;
-    pub const PROSE: f32 = 16.;
+    pub const SM: f32 = 14.;
+    pub const BASE: f32 = 16.;
+    pub const MD: f32 = 16.;
+    pub const PROSE: f32 = 17.;
 }
 
 /// Installs the dark theme and overrides its colors with the palette.
@@ -104,6 +105,10 @@ pub fn install(cx: &mut App) {
     let p = palette();
     Theme::update(cx, |theme| {
         theme.font_size = px(size::BASE);
+        #[cfg(target_os = "macos")]
+        {
+            theme.font_family = DISPLAY_FONT.into();
+        }
         theme.mono_font_family = MONO_FONT.into();
         theme.mono_font_size = px(13.5);
         theme.radius = px(8.);
@@ -115,31 +120,31 @@ pub fn install(cx: &mut App) {
         c.foreground = p.text;
         c.border = p.border;
         c.input = p.border_strong;
-        c.ring = hexa(0xff8a3d, 0.45);
+        c.ring = p.accent.opacity(0.45);
         c.caret = p.accent;
-        c.selection = hexa(0xff8a3d, 0.22);
+        c.selection = p.accent.opacity(0.22);
         c.muted = p.surface;
         c.muted_foreground = p.text_muted;
         c.accent = p.raised;
         c.accent_foreground = p.text;
-        c.popover = hex(0x151519);
+        c.popover = p.surface;
         c.popover_foreground = p.text;
         c.overlay = hexa(0x000000, 0.55);
         c.primary = p.accent;
-        c.primary_hover = hex(0xff9a55);
-        c.primary_active = hex(0xf07a2c);
-        c.primary_foreground = hex(0x1a0d04);
+        c.primary_hover = hex(0xffc7a1);
+        c.primary_active = hex(0xe5a57a);
+        c.primary_foreground = p.on_accent;
         c.button_primary = p.accent;
-        c.button_primary_hover = hex(0xff9a55);
-        c.button_primary_active = hex(0xf07a2c);
-        c.button_primary_foreground = hex(0x1a0d04);
+        c.button_primary_hover = c.primary_hover;
+        c.button_primary_active = c.primary_active;
+        c.button_primary_foreground = p.on_accent;
         c.secondary = p.raised;
-        c.secondary_hover = hex(0x232329);
-        c.secondary_active = hex(0x2a2a31);
+        c.secondary_hover = hex(0x2e2f35);
+        c.secondary_active = hex(0x35363d);
         c.secondary_foreground = p.text;
         c.button = p.raised;
-        c.button_hover = hex(0x232329);
-        c.button_active = hex(0x2a2a31);
+        c.button_hover = c.secondary_hover;
+        c.button_active = c.secondary_active;
         c.button_foreground = p.text;
         c.danger = p.danger;
         c.danger_foreground = p.text;
@@ -149,8 +154,8 @@ pub fn install(cx: &mut App) {
         c.link = p.info;
         c.list = p.chrome;
         c.list_hover = p.raised;
-        c.list_active = hexa(0xff8a3d, 0.12);
-        c.list_active_border = hexa(0xff8a3d, 0.35);
+        c.list_active = p.accent_soft;
+        c.list_active_border = p.accent.opacity(0.35);
         c.sidebar = p.chrome;
         c.sidebar_foreground = p.text;
         c.sidebar_border = p.border;

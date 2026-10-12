@@ -558,7 +558,7 @@ fn render_node(
                     .size_full()
                     .p(px(crate::layout::SIDEBAR_INSET))
                     .bg(palette().window_tint)
-                    .child(crate::sidebar::render(app, cx))
+                    .child(crate::sidebar::render(app, window, cx))
                     .into_any_element(),
                 Panel::Chat if app.session_workspace.tiled() => {
                     crate::session_workspace::render(app, window, cx)

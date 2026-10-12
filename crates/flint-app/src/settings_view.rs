@@ -1,5 +1,5 @@
-//! The Settings sheet: model, endpoint, key status (never the key), JEV
-//! status, default approval mode, reasoning effort and theme, saved to
+//! The Settings sheet: model, endpoint, key status (never the key), the JEV
+//! toggle, default approval mode, reasoning effort and theme, saved to
 //! `~/.flint/config.toml`.
 
 use flint_agent::ApprovalMode;
@@ -7,6 +7,7 @@ use flint_agent::ReasoningEffort;
 use gpui_kit::assets::IconName;
 use gpui_kit::base::Disableable as _;
 use gpui_kit::base::FocusTrapElement as _;
+use gpui_kit::base::Selectable as _;
 use gpui_kit::component::button::*;
 use gpui_kit::component::input::Input;
 use gpui_kit::component::input::InputEvent;
@@ -30,6 +31,9 @@ pub struct SettingsForm {
     pub api_key_env: Entity<InputState>,
     pub approval: ApprovalMode,
     pub effort: Option<ReasoningEffort>,
+    pub transcript_width: settings::TranscriptWidth,
+    pub jev_judge: bool,
+    pub queue_after_verification: bool,
     pub error: Option<String>,
     pub subscriptions: Vec<Subscription>,
     pub focus: FocusHandle,
@@ -48,6 +52,9 @@ impl SettingsForm {
         draft.base_url = self.base_url.read(cx).value().trim().to_string();
         draft.api_key_file = self.api_key_file.read(cx).value().trim().to_string();
         draft.api_key_env = self.api_key_env.read(cx).value().trim().to_string();
+        draft.transcript_width = self.transcript_width;
+        draft.jev_judge = self.jev_judge;
+        draft.queue_after_verification = self.queue_after_verification;
         draft
     }
 
@@ -126,6 +133,7 @@ impl FlintApp {
         cx.notify();
     }
     pub fn open_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        gpui_kit::base::TextSelection::suspend_mouse(window, true, cx);
         let model = self.settings.model.clone();
         let base_url = self.settings.base_url.clone();
         let model = cx.new(|cx| InputState::new(window, cx).default_value(model));
@@ -199,6 +207,9 @@ impl FlintApp {
             api_key_env,
             approval: self.approval,
             effort: self.effort,
+            transcript_width: self.settings.transcript_width,
+            jev_judge: self.settings.jev_judge,
+            queue_after_verification: self.settings.queue_after_verification,
             error: None,
             subscriptions,
             focus: cx.focus_handle(),
@@ -225,6 +236,7 @@ impl FlintApp {
     }
 
     pub fn close_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        gpui_kit::base::TextSelection::suspend_mouse(window, false, cx);
         let return_focus = self.settings_form.take().and_then(|form| form.return_focus);
         if let Some(focus) = return_focus {
             focus.focus(window, cx);
@@ -257,12 +269,65 @@ impl FlintApp {
             cx.notify();
             return;
         }
+        let effort_changed = self.effort != form.effort;
         self.model = next.model.clone();
         self.approval = form.approval;
         self.effort = form.effort;
+        let width_changed = self.settings.transcript_width != next.transcript_width;
+        let queue_policy_changed =
+            self.settings.queue_after_verification != next.queue_after_verification;
+        let jev_changed = self.settings.jev_judge != next.jev_judge;
         self.settings = next;
-        self.broadcast_effort();
+        if jev_changed {
+            self.broadcast_jev();
+        }
+        if width_changed {
+            self.remeasure_chat_layout(cx);
+        }
+        if effort_changed {
+            self.broadcast_effort();
+        }
+        if queue_policy_changed {
+            for ix in 0..self.sessions.len() {
+                self.queue_task_reviewed(ix, cx);
+            }
+        }
         self.close_settings(window, cx);
+    }
+
+    /// Save the preference and stage it for existing native engines' next turn.
+    pub fn toggle_jev_judge(&mut self, cx: &mut Context<Self>) {
+        if self.session().agent != flint_agent::AgentKind::Flint || self.settings_form.is_some() {
+            return;
+        }
+        let mut next = self.settings.clone();
+        next.jev_judge = !next.jev_judge;
+        if let Err(err) = next.save(&self.home) {
+            self.store_error = Some(format!("Couldn't save JEV setting: {err}"));
+            cx.notify();
+            return;
+        }
+        self.settings = next;
+        self.broadcast_jev();
+        if self
+            .store_error
+            .as_deref()
+            .is_some_and(|error| error.starts_with("Couldn't save JEV setting:"))
+        {
+            self.store_error = None;
+        }
+        cx.notify();
+    }
+
+    fn broadcast_jev(&mut self) {
+        let config = crate::engine::jev_config(&self.settings, &self.key_sources);
+        for session in &self.sessions {
+            if session.agent == flint_agent::AgentKind::Flint
+                && let Some(ops) = &session.ops
+            {
+                ops.try_send(flint_agent::Op::SetJev(config.clone())).ok();
+            }
+        }
     }
 
     pub fn dismiss_tip(&mut self, cx: &mut Context<Self>) {
@@ -321,7 +386,11 @@ fn row(label: &str, hint: Option<&str>, control: impl IntoElement) -> Div {
                 .gap(px(2.))
                 .child(ui::label(label.to_string(), size::BASE, p.text))
                 .when_some(hint.map(str::to_string), |col, hint| {
-                    col.child(ui::label(hint, size::XS, p.text_subtle))
+                    col.child(
+                        ui::label(hint, size::XS, p.text_subtle)
+                            .id(ElementId::Name(format!("settings-hint-{label}").into()))
+                            .test_support(),
+                    )
                 }),
         )
         .child(div().flex_1().min_w_0().child(control))
@@ -348,13 +417,15 @@ pub fn render(
                 p.danger,
             ),
         };
-    let (jev_text, jev_color) = if settings::jev_key_set(&app.key_sources) {
-        ("On — TypeSafe credential found", p.success)
-    } else {
+    let (jev_text, jev_color) = if !form.jev_judge {
         (
-            "Off — set TYPESAFE_API_KEY or add ~/.flint/keys/typesafe.key",
+            "Off — the harness uses its own heuristics only",
             p.text_subtle,
         )
+    } else if settings::jev_key_set(&app.key_sources) {
+        ("On — TypeSafe credential found", p.success)
+    } else {
+        ("On, waiting for a TypeSafe key", p.text_subtle)
     };
     let approvals = [
         (ApprovalMode::Auto, "Auto-run"),
@@ -404,6 +475,34 @@ pub fn render(
         .flex_col()
         .gap(px(20.))
         .child(row(
+            "Chat width",
+            Some("Global; clamped to each pane. Welcome stays separate."),
+            div().flex().flex_wrap().gap(px(6.)).children(
+                [
+                    (settings::TranscriptWidth::Readable, "Readable · 760"),
+                    (settings::TranscriptWidth::Wide, "Wide · 1040"),
+                    (settings::TranscriptWidth::Fill, "Fill pane"),
+                ]
+                .into_iter()
+                .enumerate()
+                .map(|(n, (width, label))| {
+                    Button::new(("settings-chat-width", n))
+                        .label(label)
+                        .selected(form.transcript_width == width)
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                            gpui_kit::base::GlobalState::suppress_text_selection(cx);
+                            cx.stop_propagation();
+                        })
+                        .on_click(cx.listener(move |app, _, _, cx| {
+                            if let Some(form) = &mut app.settings_form {
+                                form.transcript_width = width;
+                            }
+                            cx.notify();
+                        }))
+                }),
+            ),
+        ))
+        .child(row(
             "Provider",
             Some("Presets fill the endpoint; confirm the model before saving"),
             div()
@@ -448,7 +547,7 @@ pub fn render(
         ))
         .child(row(
             "Subagent model",
-            Some("New Flint sessions; same endpoint"),
+            Some("New Hooter sessions; same endpoint"),
             Input::new(&form.subagent_model)
                 .id("settings-subagent-model")
                 .aria_label("Subagent model"),
@@ -491,17 +590,78 @@ pub fn render(
         ))
         .child(row(
             "JEV judge",
-            Some("Smarter guard checks"),
+            Some("Applies on the next native turn"),
             div()
-                .pt(px(7.))
-                .child(ui::label(jev_text, size::BASE - 1., jev_color)),
+                .flex()
+                .flex_col()
+                .gap(px(8.))
+                .child(div().flex().gap(px(6.)).children(
+                    [(true, "On"), (false, "Off")].into_iter().enumerate().map(
+                        |(n, (on, label))| {
+                            segment(("settings-jev", n), label, form.jev_judge == on)
+                                .aria_label(format!("JEV judge {label}"))
+                                .aria_toggled(if form.jev_judge == on {
+                                    Toggled::True
+                                } else {
+                                    Toggled::False
+                                })
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    if let Some(form) = &mut this.settings_form {
+                                        form.jev_judge = on;
+                                    }
+                                    cx.notify();
+                                }))
+                                .test_support()
+                        },
+                    ),
+                ))
+                .child(ui::label(jev_text, size::BASE - 1., jev_color))
+                .child(ui::label(
+                    "Requires TYPESAFE_API_KEY or $FLINT_HOME/keys/typesafe.key. Applies on the next native turn.",
+                    size::XS,
+                    p.text_subtle,
+                )),
         ))
         .child(row(
             "Approval",
-            Some("Default for new native engines; ACP modes are separate"),
+            Some(if cfg!(windows) {
+                "New native engines only; Windows commands are not sandboxed"
+            } else {
+                "Default for new native engines; ACP modes are separate"
+            }),
             approval_row,
         ))
         .child(row("Reasoning effort", None, effort_row))
+        .child(row(
+            "Queued work",
+            Some("Opt-in; native tasks only"),
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(8.))
+                .child(
+                    Button::new("settings-queue-verification")
+                        .label("Continue queued work after passing checks")
+                        .icon(if form.queue_after_verification {
+                            IconName::Check
+                        } else {
+                            IconName::Minus
+                        })
+                        .selected(form.queue_after_verification)
+                        .toggled(form.queue_after_verification)
+                        .on_click(cx.listener(|app, _, _, cx| {
+                            if let Some(form) = &mut app.settings_form {
+                                form.queue_after_verification = !form.queue_after_verification;
+                            }
+                            cx.notify();
+                        })),
+                )
+                .child(ui::label(
+                    "Off: wait for your review. On: completed native tasks with current passing verification and no unresolved issues may continue the queue. This does not accept the result or change tool approvals or sandboxing. Manual and restored pauses stay paused.",
+                    size::XS,
+                    p.text_subtle,
+                )),
+        ))
         .child(row(
             "Theme",
             None,
@@ -615,9 +775,18 @@ pub fn render(
                 .child(
                     div()
                         .id("settings-save")
-                        .child(Button::new("save").primary().label("Save").on_click(
-                            cx.listener(|this, _, window, cx| this.save_settings(window, cx)),
-                        ))
+                        .child(
+                            Button::new("save")
+                                .primary()
+                                .label("Save")
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                    gpui_kit::base::GlobalState::suppress_text_selection(cx);
+                                    cx.stop_propagation();
+                                })
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.save_settings(window, cx)
+                                })),
+                        )
                         .test_support(),
                 ),
         );

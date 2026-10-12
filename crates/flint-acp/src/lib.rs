@@ -35,7 +35,6 @@ use flint_agent::AgentEvent;
 use flint_agent::ApprovalMode;
 use flint_agent::SessionHandle;
 use tokio::io::AsyncReadExt;
-use tokio::process::Command;
 use tokio_util::compat::TokioAsyncReadCompatExt;
 use tokio_util::compat::TokioAsyncWriteCompatExt;
 
@@ -105,7 +104,7 @@ async fn run_process(
     ops: async_channel::Receiver<flint_agent::Op>,
     events: async_channel::Sender<AgentEvent>,
 ) {
-    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let home = flint_platform::home_dir();
     let path = launch::search_path(home.as_deref());
     let (program, args) = match agent.command(&path) {
         Ok(command) => command,
@@ -114,7 +113,7 @@ async fn run_process(
             return;
         }
     };
-    let mut command = Command::new(&program);
+    let mut command = flint_platform::executable_command(&program, &path, &config.workspace);
     command
         .args(&args)
         .current_dir(&config.workspace)
@@ -131,9 +130,7 @@ async fn run_process(
             command.env_remove(name);
         }
     }
-    #[cfg(unix)]
-    command.process_group(0);
-    let mut child = match command.spawn() {
+    let (mut child, mut group) = match flint_platform::spawn(&mut command) {
         Ok(child) => child,
         Err(err) => {
             let _ = events.try_send(AgentEvent::Error(format!(
@@ -145,8 +142,6 @@ async fn run_process(
             return;
         }
     };
-    let pid = child.id();
-    let mut group = process::GroupGuard::new(pid);
     let (Some(stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
         let _ = events.try_send(AgentEvent::Error(format!(
             "{} started without stdio pipes",
@@ -173,7 +168,7 @@ async fn run_process(
     runner::run(stdout.compat(), stdin.compat_write(), context).await;
     // The session is over (shutdown or the agent went away): stop the
     // adapter and anything it started.
-    process::stop(&mut child, pid, std::time::Duration::from_secs(2)).await;
+    process::stop(&mut child, &group, std::time::Duration::from_secs(2)).await;
     group.disarm();
     if let Some(mut task) = stderr_task
         && tokio::time::timeout(process::DRAIN_GRACE, &mut task)

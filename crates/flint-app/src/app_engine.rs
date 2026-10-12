@@ -54,6 +54,7 @@ impl FlintApp {
         let mut child_changes = Vec::new();
         let mut finished = false;
         let mut finish_reason = None;
+        let mut task_assessed = false;
         // Only events that change what the session needs from the user move
         // it up the sidebar; streaming deltas would reorder rows constantly.
         let mut notable = false;
@@ -77,13 +78,44 @@ impl FlintApp {
                 }
                 _ => {}
             }
+            if let AgentEvent::Error(message) = &event
+                && let Some(panel) = &mut self.task_panel
+                && panel.target.parent == uid
+                && (panel.pending_review.is_some()
+                    || panel.pending_scope.is_some()
+                    || self.sessions[ix].task_update_pending
+                        == Some(crate::session::TaskWrite::Engine))
+            {
+                panel.pending_review = None;
+                panel.pending_scope = None;
+                panel.saving = false;
+                panel.error = Some(message.clone());
+            }
             notable |= matches!(
                 event,
                 AgentEvent::TurnStarted { .. }
                     | AgentEvent::TurnFinished { .. }
                     | AgentEvent::ApprovalRequested { .. }
                     | AgentEvent::Error(_)
+                    | AgentEvent::TaskAssessed { .. }
             );
+            task_assessed |= matches!(&event,
+                AgentEvent::TaskAssessed { turn_id, .. } | AgentEvent::TaskUpdated { turn_id, .. }
+                    if *turn_id == self.sessions[ix].view.turn_id
+            );
+            if !self.sessions[ix].view.running
+                && self.sessions[ix].task_update_pending == Some(crate::session::TaskWrite::Engine)
+                && match &event {
+                    AgentEvent::TaskAssessed { turn_id, .. }
+                    | AgentEvent::TaskUpdated { turn_id, .. } => {
+                        *turn_id == self.sessions[ix].view.turn_id
+                    }
+                    AgentEvent::Error(_) => true,
+                    _ => false,
+                }
+            {
+                self.sessions[ix].task_update_pending = None;
+            }
             // A command an agent runs gets a read-only tab in the terminal
             // dock; the event itself carries nothing the transcript shows.
             match &event {
@@ -104,7 +136,7 @@ impl FlintApp {
             let session = &mut self.sessions[ix];
             if let AgentEvent::SessionStopped { history_saved } = &event {
                 session.engine_shutdown_verified = *history_saved;
-                session.history_save_failed |= !history_saved;
+                session.history_save_failed = !history_saved;
             }
             if matches!(&event, AgentEvent::Error(message)
                 if message.starts_with("Couldn't save engine history.")
@@ -160,11 +192,18 @@ impl FlintApp {
             );
         }
         let session = &mut self.sessions[ix];
-        session.apply(Change {
+        let change = Change {
             appended: original_rows..session.view.items.len(),
             updated: changed_rows,
             children: child_changes,
-        });
+        };
+        self.chat_content.borrow_mut().sync_change(
+            &crate::subagent_ui::Conversation::parent(uid),
+            &session.view,
+            &change,
+            cx,
+        );
+        session.apply(change);
         if ix == active
             && let Some(id) = &session.selected_subagent
             && let Some(child) = session.view.subagent_mut(id)
@@ -187,7 +226,10 @@ impl FlintApp {
         }
         if let Some(reason) = &finish_reason {
             self.queue_turn_finished(uid, reason, cx);
+        } else if task_assessed {
+            self.queue_task_reviewed(ix, cx);
         }
+        self.task_panel_updated(cx);
         self.watch_persistence(uid, cx);
         if finished && crate::automation::dump_state(self) && self.options.exit_after_turn {
             // Leave time for the harness to take its final screenshot.
@@ -368,7 +410,7 @@ impl FlintApp {
             self.clear_submitted_draft(window, cx);
             self.dispatch_next_prompt(self.sessions[ix].uid, cx);
         } else {
-            self.dispatch_prompt(ix, prompt.shown, prompt.message, prompt.images, cx);
+            self.dispatch_prompt(ix, prompt, cx);
             self.clear_submitted_draft(window, cx);
         }
     }
@@ -453,18 +495,26 @@ impl FlintApp {
                 cx,
             );
         } else {
-            self.dispatch_prompt(ix, text, message, images, cx);
+            self.dispatch_prompt(
+                ix,
+                crate::prompt_queue::Prompt::new(text, message, images),
+                cx,
+            );
         }
     }
 
     pub(crate) fn dispatch_prompt(
         &mut self,
         ix: usize,
-        text: String,
-        message: String,
-        images: Vec<ImageAttachment>,
+        prompt: crate::prompt_queue::Prompt,
         cx: &mut Context<Self>,
     ) -> bool {
+        if self.sessions[ix].task_update_pending.is_some() {
+            self.store_error =
+                Some("Wait for the task review or scope revision to finish saving.".into());
+            cx.notify();
+            return false;
+        }
         if self.sessions[ix].stopping {
             self.store_error = Some(
                 "The engine is stopping. Wait for it to finish saving before continuing.".into(),
@@ -475,19 +525,21 @@ impl FlintApp {
         if !self.storage_ready(ix, cx) {
             return false;
         }
-        let prompt = crate::prompt_queue::Prompt {
-            id: 0,
-            text: text.clone(),
-            shown: text,
-            message,
-            images,
-        };
         if !self.record_prompt(ix, &prompt, PromptRecord::Immediate, cx) {
             return false;
         }
         let accepted = match self.ensure_engine(ix, cx) {
             Ok(()) => self.sessions[ix].ops.as_ref().is_some_and(|ops| {
-                let op = if prompt.images.is_empty() {
+                let op = if self.sessions[ix].agent == flint_agent::AgentKind::Flint
+                    && prompt.text != prompt.message
+                {
+                    Op::UserMessageWithContext {
+                        request: prompt.text,
+                        text: prompt.message,
+                        images: prompt.images,
+                        steering_id: None,
+                    }
+                } else if prompt.images.is_empty() {
                     Op::UserMessage(prompt.message)
                 } else {
                     Op::UserMessageWithImages {
@@ -529,7 +581,7 @@ impl FlintApp {
             session.first_token = None;
             session.first_text = None;
         }
-        session.last_message = Some((text.clone(), prompt.message.clone(), prompt.images.clone()));
+        session.last_message = Some(crate::session::RetryRequest::Prompt(prompt.clone()));
         if !self.options.ephemeral() && session.dir.is_none() {
             session.dir = Some(store::sessions_dir(&self.home).join(store::new_id()));
         }
@@ -572,10 +624,10 @@ impl FlintApp {
     /// Re-sends the last message of the active session (error card "Retry").
     pub fn retry(&mut self, cx: &mut Context<Self>) {
         let ix = self.active;
-        if self.sessions[ix].stopping {
+        if self.sessions[ix].stopping || self.prompt_busy(ix) {
             return;
         }
-        let Some((text, message, images)) = self.sessions[ix].last_message.clone() else {
+        let Some(request) = self.sessions[ix].last_message.clone() else {
             return;
         };
         if self.sessions[ix].view.running {
@@ -590,7 +642,79 @@ impl FlintApp {
             self.sessions[ix].ops = None;
             self.sessions[ix].agent_failed = false;
         }
-        self.send_message_with_images(ix, text, message, images, cx);
+        match request {
+            crate::session::RetryRequest::Prompt(prompt) => {
+                self.send_message_with_images(ix, prompt.text, prompt.message, prompt.images, cx);
+            }
+            crate::session::RetryRequest::Continue { task_id, revision } => {
+                self.dispatch_task_continuation(ix, task_id, revision, cx);
+            }
+        }
+    }
+
+    pub(crate) fn dispatch_task_continuation(
+        &mut self,
+        ix: usize,
+        task_id: u64,
+        revision: u64,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if self.prompt_busy(ix)
+            || self.sessions[ix].stopping
+            || self.sessions[ix].history_save_failed
+        {
+            return false;
+        }
+        if self.sessions[ix].agent != flint_agent::AgentKind::Flint
+            || self.sessions[ix].view.task.as_ref().is_none_or(|task| {
+                task.source != flint_agent::TaskSource::Native
+                    || task.contract.id != task_id
+                    || task.contract.revision != revision
+            })
+        {
+            self.apply_event(
+                ix,
+                AgentEvent::Error("The task changed. Reopen its details before continuing.".into()),
+                cx,
+            );
+            return false;
+        }
+        // Setup can fail before a prompt is recorded. Retry must still retain
+        // the requested continuation, rather than resurrect the original scope.
+        self.sessions[ix].last_message =
+            Some(crate::session::RetryRequest::Continue { task_id, revision });
+        if let Err(error) = self.ensure_engine(ix, cx) {
+            self.apply_event(ix, AgentEvent::Error(format!("{error:#}")), cx);
+            return false;
+        }
+        let prompt = crate::prompt_queue::Prompt::new(
+            "Continue the current task".into(),
+            "Continue the protected task.".into(),
+            Vec::new(),
+        );
+        let recorded = self.record_prompt(ix, &prompt, PromptRecord::Immediate, cx);
+        self.sessions[ix].last_message =
+            Some(crate::session::RetryRequest::Continue { task_id, revision });
+        if !recorded {
+            return false;
+        }
+        let sent = self.sessions[ix].ops.as_ref().is_some_and(|ops| {
+            ops.try_send(Op::ContinueTask {
+                task_id,
+                expected_revision: revision,
+            })
+            .is_ok()
+        });
+        self.sessions[ix].prompt_pending = sent;
+        if !sent {
+            self.apply_event(
+                ix,
+                AgentEvent::Error("Couldn't continue this task.".into()),
+                cx,
+            );
+        }
+        cx.notify();
+        sent
     }
 
     /// Starts the engine for a session on its first message.
@@ -599,6 +723,14 @@ impl FlintApp {
         ix: usize,
         cx: &mut Context<Self>,
     ) -> anyhow::Result<()> {
+        if self.sessions[ix].native_history_conflict {
+            anyhow::bail!(
+                "Saved native history does not match this conversation. Restore matching history or start a new session before continuing."
+            );
+        }
+        if self.sessions[ix].task_update_pending.is_some() {
+            anyhow::bail!("Wait for the task review or scope revision to finish saving.");
+        }
         if self.sessions[ix].ops.is_some() {
             return Ok(());
         }

@@ -10,6 +10,7 @@ use std::time::Duration;
 use flint_agent::AgentEvent;
 use flint_agent::ApprovalDecision;
 use flint_agent::FileDiff;
+use flint_agent::JevQuestion;
 use flint_agent::NudgeReason;
 use flint_agent::ToolKind;
 use flint_agent::TurnEndReason;
@@ -37,6 +38,12 @@ pub enum Item {
         reason: NudgeReason,
         message: String,
         expanded: bool,
+    },
+    /// The optional JEV judge's verdict on a harness suspicion.
+    Jev {
+        question: JevQuestion,
+        probability: f64,
+        confirmed: bool,
     },
     /// The engine trimmed old history to fit the context budget.
     Compacted {
@@ -97,6 +104,7 @@ pub struct SubagentLink {
 pub struct SubagentView {
     pub session_id: String,
     pub model: String,
+    pub workspace: Option<std::path::PathBuf>,
     pub label: String,
     pub queued: bool,
     pub unread: bool,
@@ -144,6 +152,15 @@ pub struct Change {
     pub children: Vec<(String, Change)>,
 }
 
+/// App-local row identity and trusted text mutation revisions. These are derived
+/// during ordered folding, not persisted protocol identities or list indices.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RowIdentity {
+    pub id: u64,
+    pub revision: u64,
+    pub replacement: u64,
+}
+
 impl Change {
     pub(crate) fn updated(ix: usize) -> Self {
         Self {
@@ -158,6 +175,8 @@ impl Change {
 pub struct SessionView {
     pub title: Option<String>,
     pub items: Vec<Item>,
+    pub(crate) row_identities: Vec<RowIdentity>,
+    pub(crate) next_row_id: u64,
     pub running: bool,
     pub turn_id: u64,
     pub step: u32,
@@ -176,11 +195,16 @@ pub struct SessionView {
     pub pending_approvals: usize,
     /// Every turn so far; see `turns.rs`.
     pub turns: Vec<TurnInfo>,
+    /// Maintained during event folding so homepage redraws never scan history.
+    pub(crate) finished_turns: usize,
     /// The turn each item belongs to, parallel to `items`.
     pub turn_of: Vec<Option<usize>>,
     pub current_turn: Option<usize>,
     /// How the last turn ended; `None` before the first one finishes.
     pub last_reason: Option<TurnEndReason>,
+    /// Latest task and evidence. Missing in old streams until an unverified
+    /// fallback is created; never inferred as accepted from Completed.
+    pub task: Option<flint_agent::TaskRecord>,
     /// An error reported while no turn ran (e.g. the engine failed to
     /// start); cleared when a turn starts. Errors inside a turn that still
     /// completes are notices, not failures.
@@ -191,6 +215,43 @@ pub struct SessionView {
 }
 
 impl SessionView {
+    pub fn row_identity(&self, ix: usize) -> Option<RowIdentity> {
+        self.row_identities.get(ix).copied()
+    }
+
+    pub fn row_index(&self, id: u64) -> Option<usize> {
+        self.row_identities
+            .binary_search_by_key(&id, |row| row.id)
+            .ok()
+    }
+
+    /// Explicit replacement is not an append, even if the new text shares a
+    /// prefix. Keep the row's identity while invalidating its append baseline.
+    pub fn replace_assistant_text(&mut self, ix: usize, replacement: String) -> Change {
+        self.ensure_row_identities();
+        let Some(Item::Assistant { text, .. }) = self.items.get_mut(ix) else {
+            return Change::default();
+        };
+        *text = replacement;
+        let identity = &mut self.row_identities[ix];
+        identity.revision += 1;
+        identity.replacement += 1;
+        Change::updated(ix)
+    }
+
+    fn ensure_row_identities(&mut self) {
+        // Legacy/test projections may contain manually seeded non-text rows.
+        // Assign identities once, without examining text or rebuilding history.
+        while self.row_identities.len() < self.items.len() {
+            self.next_row_id += 1;
+            self.row_identities.push(RowIdentity {
+                id: self.next_row_id,
+                revision: 0,
+                replacement: 0,
+            });
+        }
+    }
+
     pub fn approval_preview(
         &self,
         call_id: &str,
@@ -198,16 +259,18 @@ impl SessionView {
         native: bool,
     ) -> ApprovalPreview {
         let mut agent = None;
-        let call = self.items.iter().find_map(|item| match item {
+        let mut tool_workspace = workspace;
+        let call = self.items.iter().rev().find_map(|item| match item {
             Item::Tool(call) if call.call_id == call_id => Some(call.as_ref()),
             Item::Tool(call) => call.subagent.as_ref().and_then(|link| {
                 let child = self.subagent(&link.session_id)?;
-                let found = child.view.items.iter().find_map(|item| match item {
+                let found = child.view.items.iter().rev().find_map(|item| match item {
                     Item::Tool(tool) if tool.call_id == call_id => Some(tool.as_ref()),
                     _ => None,
                 });
                 if found.is_some() {
                     agent = Some(child.session_id.clone());
+                    tool_workspace = child.workspace.as_deref().unwrap_or(workspace);
                 }
                 found
             }),
@@ -229,7 +292,7 @@ impl SessionView {
                 if let Some(cwd) = cwd {
                     fields.push(("Working directory", cwd.to_string()));
                 } else if native && call.name == "run_command" {
-                    fields.push(("Working directory", workspace.display().to_string()));
+                    fields.push(("Working directory", tool_workspace.display().to_string()));
                 }
             } else if call.kind == ToolKind::Edit {
                 for (key, label) in [
@@ -263,6 +326,7 @@ impl SessionView {
     }
 
     pub fn fold(&mut self, event: AgentEvent, now: Duration) -> Change {
+        self.ensure_row_identities();
         match event {
             AgentEvent::SteeringAccepted { .. } => Change::default(),
             AgentEvent::TurnStarted { turn_id } => {
@@ -273,9 +337,12 @@ impl SessionView {
                 self.usage = Usage::default();
                 self.streamed_chars = 0;
                 self.idle_error = None;
+                self.task = None;
                 self.begin_turn();
                 Change::default()
             }
+            AgentEvent::TaskUpdated { turn_id, task }
+            | AgentEvent::TaskAssessed { turn_id, task } => self.fold_task(turn_id, *task),
             AgentEvent::StepStarted { step, .. } => {
                 self.step = step;
                 self.close_streams(now)
@@ -381,6 +448,7 @@ impl SessionView {
                     self.subagents.push(SubagentView {
                         session_id: session_id.clone(),
                         model,
+                        workspace: None,
                         label,
                         queued: false,
                         unread: false,
@@ -397,13 +465,39 @@ impl SessionView {
                 change.children.push((session_id, child_change));
                 change
             }
+            AgentEvent::SubagentWorkspace {
+                session_id,
+                workspace,
+            } => {
+                if let Some(child) = self
+                    .subagents
+                    .iter_mut()
+                    .find(|child| child.session_id == session_id)
+                {
+                    child.workspace = Some(workspace);
+                }
+                Change::default()
+            }
             AgentEvent::SubagentEvent { call_id, event } => {
                 let Some(ix) = self.tool_index(&call_id) else {
                     return Change::default();
                 };
-                if let AgentEvent::ToolCallFinished {
-                    diff: Some(diff), ..
-                } = event.as_ref()
+                let isolated = match &self.items[ix] {
+                    Item::Tool(call) => call
+                        .subagent
+                        .as_ref()
+                        .and_then(|link| {
+                            self.subagents
+                                .iter()
+                                .find(|child| child.session_id == link.session_id)
+                        })
+                        .is_some_and(|child| child.workspace.is_some()),
+                    _ => false,
+                };
+                if !isolated
+                    && let AgentEvent::ToolCallFinished {
+                        diff: Some(diff), ..
+                    } = event.as_ref()
                 {
                     self.record_change(diff);
                     self.note_turn_file(diff);
@@ -456,12 +550,48 @@ impl SessionView {
                     .appended;
                 change
             }
+            AgentEvent::JevVerdict {
+                question,
+                probability,
+                confirmed,
+            } => {
+                let mut change = self.close_streams(now);
+                change.appended = self
+                    .push(Item::Jev {
+                        question,
+                        probability,
+                        confirmed,
+                    })
+                    .appended;
+                change
+            }
             AgentEvent::ToolRepaired { tool, detail } => self.push(Item::Repair { tool, detail }),
             AgentEvent::Usage(usage) => {
                 self.usage = usage;
                 Change::default()
             }
-            AgentEvent::TurnFinished { reason, .. } => {
+            AgentEvent::TurnFinished { turn_id, reason } => {
+                if !self.running || turn_id != self.turn_id {
+                    return Change::default();
+                }
+                if self.task.is_none() {
+                    let request = self
+                        .items
+                        .iter()
+                        .rev()
+                        .find_map(|item| match item {
+                            Item::User(text) => Some(text.clone()),
+                            _ => None,
+                        })
+                        .unwrap_or_default();
+                    let task = flint_agent::TaskRecord::unverified(
+                        turn_id,
+                        request,
+                        reason.clone(),
+                        flint_agent::TaskSource::Legacy,
+                    );
+                    self.fold_task(turn_id, task);
+                }
                 self.last_reason = Some(reason.clone());
                 let mut change = self.close_streams(now);
                 // Interrupted approvals must not remain actionable.
@@ -475,15 +605,23 @@ impl SessionView {
                 }
                 for child in &mut self.subagents {
                     if child.view.running || child.queued {
+                        let never_started = child.queued && !child.view.running;
                         child.queued = false;
                         child.unread = true;
-                        let child_change = child.view.fold(
-                            AgentEvent::TurnFinished {
-                                turn_id: child.view.turn_id,
-                                reason: TurnEndReason::Interrupted,
-                            },
-                            now,
-                        );
+                        let child_change = if never_started {
+                            // A cancelled queue entry has no execution turn to
+                            // finish. Do not invent one or leave it "Ready".
+                            child.view.last_reason = Some(TurnEndReason::Interrupted);
+                            Change::default()
+                        } else {
+                            child.view.fold(
+                                AgentEvent::TurnFinished {
+                                    turn_id: child.view.turn_id,
+                                    reason: TurnEndReason::Interrupted,
+                                },
+                                now,
+                            )
+                        };
                         change
                             .children
                             .push((child.session_id.clone(), child_change));
@@ -564,6 +702,51 @@ impl SessionView {
         }
     }
 
+    fn fold_task(&mut self, turn_id: u64, task: flint_agent::TaskRecord) -> Change {
+        if task.validate().is_err() {
+            return Change::default();
+        }
+        let Some(turn) = self
+            .turns
+            .iter_mut()
+            .rev()
+            .find(|turn| turn.turn_id == turn_id)
+        else {
+            return Change::default();
+        };
+        // Late events from an older turn cannot replace the active task.
+        if turn_id == self.turn_id {
+            self.task = Some(task.clone());
+        }
+        turn.task = Some(task);
+        turn.end.map(Change::updated).unwrap_or_default()
+    }
+
+    pub fn outcome(&self) -> flint_agent::TaskOutcome {
+        self.task
+            .as_ref()
+            .and_then(|task| task.assessment.as_ref())
+            .map_or(flint_agent::TaskOutcome::Unknown, |assessment| {
+                assessment.outcome
+            })
+    }
+
+    pub fn review_local_task(
+        &mut self,
+        review: &flint_agent::TaskReview,
+    ) -> Result<Change, String> {
+        if self.running || self.turn_id != review.turn_id {
+            return Err("Review the latest finished turn first.".into());
+        }
+        let task = self
+            .task
+            .as_mut()
+            .ok_or("No task is available to review.")?;
+        task.review(review)?;
+        let task = task.clone();
+        Ok(self.fold_task(review.turn_id, task))
+    }
+
     /// Marks an approval card answered; returns its row.
     pub fn resolve_approval(&mut self, call_id: &str, decision: ApprovalDecision) -> Change {
         self.resolve_approval_scoped(call_id, decision, true)
@@ -631,8 +814,10 @@ impl SessionView {
     }
 
     fn push(&mut self, item: Item) -> Change {
+        self.ensure_row_identities();
         let ix = self.items.len();
         self.items.push(item);
+        self.ensure_row_identities();
         self.turn_of.push(self.current_turn);
         Change {
             appended: ix..ix + 1,
@@ -651,6 +836,7 @@ impl SessionView {
             } = &mut self.items[ix]
         {
             text.push_str(delta);
+            self.row_identities[ix].revision += 1;
             return Change::updated(ix);
         }
         self.push(Item::Thinking {
@@ -670,6 +856,7 @@ impl SessionView {
             } = &mut self.items[ix]
         {
             text.push_str(delta);
+            self.row_identities[ix].revision += 1;
             return Change::updated(ix);
         }
         let mut change = self.close_streams(now);

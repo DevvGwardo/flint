@@ -275,7 +275,17 @@ impl TermView {
     fn key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
         let keystroke = &event.keystroke;
         let m = keystroke.modifiers;
-        if m.platform {
+        // Ctrl+C remains interrupt when there is no selection on Windows.
+        // Ctrl+Shift+C/V always copies/pastes; macOS keeps Command+C/V.
+        let clipboard = if cfg!(target_os = "macos") {
+            m.platform
+        } else {
+            m.control
+                && (m.shift
+                    || keystroke.key == "v"
+                    || (keystroke.key == "c" && self.terminal.selection_text().is_some()))
+        };
+        if clipboard {
             let handled = match keystroke.key.as_str() {
                 "c" => self.copy(cx),
                 "v" => {
@@ -315,7 +325,7 @@ impl TermView {
             return;
         };
         let (row, col, right) = metrics.cell_at(event.position, self.cols, self.rows);
-        if event.modifiers.platform {
+        if crate::shortcuts::primary(event.modifiers) {
             if let Some(url) = self.url_at(row, col) {
                 cx.emit(LinkClicked(url));
             }

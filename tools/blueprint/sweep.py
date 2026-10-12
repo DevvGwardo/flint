@@ -10,15 +10,17 @@ measured while the demo animates).
 from __future__ import annotations
 
 import json
+import math
 import time
+from pathlib import Path
 
 import bp
 
 # name, flags, (width, height), CPU mode, expected UI state key in the dump
 STATES = [
-    ("empty", [], (1440, 900), "idle", None),
+    ("empty", [], (1440, 900), "idle", "active_empty"),
     ("running", ["--demo", "--demo-instant", "--demo-stop", "27"], (1440, 900), "animating", "active_running"),
-    ("done", ["--demo", "--demo-instant"], (1440, 900), "background", "active_done"),
+    ("done", ["--demo", "--demo-instant"], (1440, 900), "background", "active_stopped_unverified"),
     ("expanded", ["--demo", "--demo-instant", "--demo-expand"], (1440, 900), "background", "work_expanded"),
     ("changes", ["--demo", "--demo-instant", "--select-change"], (1440, 900), "background", "changes_open"),
     ("palette", ["--palette"], (1440, 900), "idle", "palette_open"),
@@ -32,11 +34,11 @@ STATES = [
     ("settings", ["--settings"], (1440, 900), "idle", "settings_open"),
     ("mention", ["--mention"], (1440, 900), "idle", "mention_open"),
     ("slash", ["--slash"], (1440, 900), "idle", "slash_open"),
-    ("size-1100x800", ["--demo", "--demo-instant", "--size", "1100x800"], (1100, 800), "background", None),
-    ("size-1000x700", ["--size", "1000x700"], (1000, 700), "idle", None),
-    ("size-900x560", ["--size", "900x560"], (900, 560), "idle", None),
+    ("size-1100x800", ["--demo", "--demo-instant", "--size", "1100x800"], (1100, 800), "background", "active_stopped_unverified"),
+    ("size-1000x700", ["--size", "1000x700"], (1000, 700), "idle", "active_empty"),
+    ("size-900x560", ["--size", "900x560"], (900, 560), "idle", "active_empty"),
     ("settings-900x560", ["--settings", "--size", "900x560"], (900, 560), "idle", "settings_open"),
-    ("size-1920x1200", ["--demo", "--demo-instant", "--size", "1920x1200"], (1920, 1200), "background", None),
+    ("size-1920x1200", ["--demo", "--demo-instant", "--size", "1920x1200"], (1920, 1200), "background", "active_stopped_unverified"),
 ]
 
 SETTLE_S = 2.5
@@ -52,16 +54,57 @@ def ui_flag(state: dict, key: str) -> bool:
     sessions = state.get("sessions", [])
     active = next((s for s in sessions if s.get("active")), {})
     match key:
+        case "active_empty":
+            return active.get("status") == "idle" and active.get("item_kinds") == []
         case "active_running":
             return active.get("status") == "running"
-        case "active_done":
-            return active.get("status") == "done" and "summary" in active.get("item_kinds", [])
+        case "active_stopped_unverified":
+            task = active.get("task") or {}
+            turns = active.get("turns") or []
+            turn = turns[-1] if turns else {}
+            assessment = task.get("assessment") or {}
+            return (
+                active.get("status") == "needs_review"
+                and "summary" in active.get("item_kinds", [])
+                and turn.get("end_reason") == "Completed"
+                and turn.get("outcome") == "unknown"
+                and task.get("source") == "legacy"
+                and assessment.get("outcome") == "unknown"
+                and "acceptance" in task and task["acceptance"] is None
+            )
         case "work_expanded":
             return bool(state.get("work_expanded"))
         case "pinned_approval":
             return state.get("pinned_approval") is True
         case _:
             return state.get(key) is True
+
+
+def wait_capture_state(path: Path, timeout: float = 8.0) -> dict:
+    """Wait for the post-paint dump, not a fixed delay before screenshotting."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            state = json.loads(path.read_text())
+        except (FileNotFoundError, json.JSONDecodeError):
+            time.sleep(0.05)
+            continue
+        if not isinstance(state, dict):
+            raise ValueError("capture dump must be an object")
+        return state
+    raise TimeoutError(f"no complete capture dump within {timeout:g} s")
+
+
+def check_capture_state(state: dict, expected: str) -> None:
+    capture = state.get("capture")
+    assert isinstance(capture, dict), "missing completed root paint"
+    assert capture.get("fully_visible") is True, f"root paint missing or clipped: {capture}"
+    assert capture.get("window_active") is False, f"capture window became key: {capture}"
+    at = capture.get("painted_at_ms")
+    assert isinstance(at, (int, float)) and math.isfinite(at) and at >= SETTLE_S * 1000, (
+        f"capture preceded settling: {capture}"
+    )
+    assert ui_flag(state, expected), f"painted scene does not show {expected}"
 
 
 def main() -> None:
@@ -81,58 +124,74 @@ def main() -> None:
         app = bp.App(
             binary,
             ["--workspace", str(workspace), *flags],
-            env={"FLINT_BP_STATE": str(dump), "FLINT_BP_DUMP_AFTER_MS": str(int(SETTLE_S * 1000))},
+            env={
+                "FLINT_BP_STATE": str(dump),
+                "FLINT_BP_DUMP_AFTER_MS": str(int(SETTLE_S * 1000)),
+                "FLINT_BP_CAPTURE": "1",
+            },
             log=bp.LOGS / f"sweep-{args.tag}-{name}.log",
         )
-        opened = app.wait_window()
-        report.check(
-            f"{name}: window opens within {LAUNCH_MAX_MS} ms",
-            opened and app.window_ms < LAUNCH_MAX_MS,
-            f"{app.window_ms:.0f} ms" if opened else "no window",
-        )
-        if not opened:
-            app.stop()
-            continue
-        time.sleep(SETTLE_S)
-        app.refresh_window()
-        _, _, _, aw, ah = app.window
-        sw, sh = screen
-        if w <= sw and h <= sh:
-            # CoreGraphics reports a one-point rounding difference on some
-            # macOS displays, even when the requested content size fits.
-            report.check(f"{name}: window is {w}x{h}", abs(aw - w) <= 1 and abs(ah - h) <= 1, f"{aw}x{ah}")
-        else:
-            # macOS clamps oversized windows to the main display's usable
-            # area, not its full resolution or a secondary display.
+        try:
+            opened = app.wait_window()
             report.check(
-                f"{name}: oversized window is clamped to the {sw}x{sh} usable screen",
-                aw <= sw and ah <= sh and aw >= min(w, sw) - 1 and ah >= min(h, sh) - 1,
-                f"{aw}x{ah} (requested {w}x{h})",
+                f"{name}: window opens within {LAUNCH_MAX_MS} ms",
+                opened and app.window_ms < LAUNCH_MAX_MS,
+                f"{app.window_ms:.0f} ms" if opened else "no window",
             )
-        shot = bp.UI / f"{args.tag}-{name}.png"
-        app.screenshot(shot)
-        stddev, size = bp.image_stats(shot) if shot.exists() else (0, (0, 0))
-        # Captures use the display's backing scale: 2x on Retina, 1x on this
-        # harness's 1080p displays (screencapture cannot upsample honestly).
-        scale = size[0] / aw if aw else 0
-        report.check(
-            f"{name}: screenshot is not blank and at native scale",
-            stddev > 6 and scale in (1.0, 2.0) and size[1] == round(ah * scale),
-            f"stddev {stddev:.1f}, {size[0]}x{size[1]} px ({scale:g}x)",
-        )
-        if expect:
-            state = json.loads(dump.read_text()) if dump.exists() else {}
-            report.check(f"{name}: shows {expect.replace('_', ' ')}", ui_flag(state, expect), f"dump keys: {sorted(state)[:8]}")
-        rss = app.rss_mb()
-        report.check(f"{name}: memory settles under {RSS_MAX_MB} MB", rss < RSS_MAX_MB, f"{rss:.0f} MB")
-        cpu = app.cpu_percent(3.0)
-        limit = {"idle": IDLE_CPU_MAX, "animating": ANIM_CPU_MAX, "background": BACKGROUND_CPU_MAX}[mode]
-        label = {"idle": "idle CPU", "animating": "CPU while animating", "background": "CPU with a background session"}[mode]
-        report.check(f"{name}: {label} under {limit}% over 3 s", cpu < limit, f"{cpu:.1f}%")
-        app.stop()
+            if not opened:
+                continue
+            try:
+                state = wait_capture_state(dump)
+                check_capture_state(state, expect)
+                report.check(
+                    f"{name}: shows {expect.replace('_', ' ')} after completed inactive paint",
+                    True, state["capture"],
+                )
+            except (AssertionError, OSError, ValueError) as error:
+                report.check(
+                    f"{name}: shows {expect.replace('_', ' ')} after completed inactive paint",
+                    False, error,
+                )
+            app.refresh_window()
+            _, _, _, aw, ah = app.window
+            sw, sh = screen
+            if w <= sw and h <= sh:
+                # CoreGraphics reports a one-point rounding difference on some
+                # macOS displays, even when the requested content size fits.
+                report.check(f"{name}: window is {w}x{h}", abs(aw - w) <= 1 and abs(ah - h) <= 1, f"{aw}x{ah}")
+            else:
+                # macOS clamps oversized windows to the main display's usable
+                # area, not its full resolution or a secondary display.
+                report.check(
+                    f"{name}: oversized window is clamped to the {sw}x{sh} usable screen",
+                    aw <= sw and ah <= sh and aw >= min(w, sw) - 1 and ah >= min(h, sh) - 1,
+                    f"{aw}x{ah} (requested {w}x{h})",
+                )
+            shot = bp.UI / f"{args.tag}-{name}.png"
+            try:
+                captured = app.screenshot(shot)
+                stddev, size = bp.image_stats(shot) if captured else (0, (0, 0))
+                capture_error = ""
+            except (OSError, ValueError) as error:
+                stddev, size, capture_error = 0, (0, 0), str(error)
+            # Use the display's native backing scale, without upsampling.
+            scale = size[0] / aw if aw else 0
+            report.check(
+                f"{name}: screenshot is not blank and at native scale",
+                stddev > 6 and scale in (1.0, 2.0) and size[1] == round(ah * scale),
+                capture_error or f"stddev {stddev:.1f}, {size[0]}x{size[1]} px ({scale:g}x)",
+            )
+            rss = app.rss_mb()
+            report.check(f"{name}: memory settles under {RSS_MAX_MB} MB", rss < RSS_MAX_MB, f"{rss:.0f} MB")
+            cpu = app.cpu_percent(3.0)
+            limit = {"idle": IDLE_CPU_MAX, "animating": ANIM_CPU_MAX, "background": BACKGROUND_CPU_MAX}[mode]
+            label = {"idle": "idle CPU", "animating": "CPU while animating", "background": "CPU with a background session"}[mode]
+            report.check(f"{name}: {label} under {limit}% over 3 s", cpu < limit, f"{cpu:.1f}%")
+            perf[name] = {"window_ms": round(app.window_ms), "rss_mb": round(rss, 0), "cpu_pct": round(cpu, 1)}
+        finally:
+            app.stop()
         err = app.stderr()
         report.check(f"{name}: no panic on stderr", "panicked" not in err, f"{len(err)} bytes stderr")
-        perf[name] = {"window_ms": round(app.window_ms), "rss_mb": round(rss), "cpu_pct": round(cpu, 1)}
     report.metrics = perf
     report.finish()
 

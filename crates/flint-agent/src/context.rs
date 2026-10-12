@@ -214,7 +214,10 @@ fn one_line(text: &str) -> String {
 /// Appends `entry` to the summary after the system prompt, creating it if
 /// needed, and drops its oldest entries past `max_chars`.
 fn add_to_summary(history: &mut Vec<Message>, entry: String, max_chars: usize) {
-    let at = usize::from(matches!(history.first(), Some(Message::System(_))));
+    let at = history
+        .iter()
+        .take_while(|message| matches!(message, Message::System(_) | Message::TaskContext(_)))
+        .count();
     let existing = history
         .iter()
         .position(|m| matches!(m, Message::Summary(_)));
@@ -278,6 +281,7 @@ fn protected_start(starts: &[usize], len: usize) -> usize {
 /// Shrinks one message in place; returns whether it changed.
 fn compact_message(message: &mut Message) -> bool {
     match message {
+        Message::TaskContext(_) => false,
         Message::Tool { content, .. } if content.chars().count() > STUB_MIN_CHARS => {
             *content = stub_for(content);
             true
@@ -348,6 +352,7 @@ fn message_chars(message: &Message) -> usize {
     MESSAGE_OVERHEAD_CHARS
         + match message {
             Message::System(text)
+            | Message::TaskContext(text)
             | Message::User(text)
             | Message::Nudge(text)
             | Message::Summary(text) => text.len(),

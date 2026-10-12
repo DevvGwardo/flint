@@ -21,6 +21,18 @@ use gpui_kit::{
     ScrollDelta, TestAppContext, Window, WindowBounds, WindowOptions, point, px, size,
 };
 use serde_json::json;
+
+/// Scripted UI fixtures have no model loop; pair their transcript with a
+/// valid legacy native counter when the test expects restart or archive.
+fn write_native_counter_fixture(dir: &std::path::Path, turn_id: u64) {
+    std::fs::write(
+        dir.join("history.json"),
+        serde_json::to_vec(&json!({"version":1,"turn_id":turn_id,"messages":[]})).unwrap(),
+    )
+    .unwrap();
+}
+#[path = "blueprint_ui/chat_readability.rs"]
+mod chat_readability_ui;
 #[path = "blueprint_ui/command_preview.rs"]
 mod command_preview_ui;
 #[path = "blueprint_ui/composer_refresh.rs"]
@@ -33,6 +45,8 @@ mod failure_status_ui;
 mod file_preview_ui;
 #[path = "blueprint_ui/general.rs"]
 mod general_ui;
+#[path = "blueprint_ui/jev.rs"]
+mod jev_ui;
 mod local_provider;
 #[path = "blueprint_ui/menu_overflow.rs"]
 mod menu_overflow_ui;
@@ -42,16 +56,41 @@ mod prompt_queue_ui;
 mod selection_retention_ui;
 #[path = "blueprint_ui/sidebar.rs"]
 mod sidebar_ui;
+#[path = "blueprint_ui/streaming_markdown.rs"]
+mod streaming_markdown_ui;
 #[path = "blueprint_ui/subagents.rs"]
 mod subagent_ui;
+#[path = "blueprint_ui/task_outcomes.rs"]
+mod task_outcomes_ui;
 #[path = "blueprint_ui/terminal_snapshot.rs"]
 mod terminal_snapshot_ui;
 #[path = "blueprint_ui/tool_detail.rs"]
 mod tool_detail_ui;
 #[path = "blueprint_ui/unicode_mention.rs"]
 mod unicode_mention_ui;
+#[path = "blueprint_ui/welcome.rs"]
+mod welcome_ui;
 #[path = "blueprint_ui/worktrees.rs"]
 mod worktree_ui;
+
+/// Explicit acceptance evidence for fixtures that are intended to advance
+/// automatically. A Completed-only fixture deliberately remains unverified.
+fn accepted_task(turn_id: u64) -> AgentEvent {
+    let mut task = flint_agent::TaskRecord::new(turn_id, "Complete the fixture task.".into(), 0);
+    task.assess(TurnEndReason::Completed, true);
+    task.review(&flint_agent::TaskReview {
+        turn_id,
+        task_id: turn_id,
+        contract_revision: 1,
+        work_revision: 0,
+        decision: flint_agent::ReviewDecision::Accept,
+    })
+    .unwrap();
+    AgentEvent::TaskAssessed {
+        turn_id,
+        task: Box::new(task),
+    }
+}
 
 fn session_pane_fixture(cx: &mut TestAppContext, count: usize) -> (Ui, Vec<(u64, Engine)>) {
     let ui = open_with(cx, terminal_options());
@@ -319,6 +358,7 @@ fn session_panes_keep_drafts_and_route_messages_to_the_focused_engine(cx: &mut T
     sessions[0]
         .1
         .send(cx, AgentEvent::TurnStarted { turn_id: 1 });
+    sessions[0].1.send(cx, accepted_task(1));
     sessions[0].1.send(
         cx,
         AgentEvent::TurnFinished {
@@ -988,6 +1028,11 @@ fn open(cx: &mut TestAppContext) -> Ui {
 }
 
 fn open_with(cx: &mut TestAppContext, options: Options) -> Ui {
+    let ui = open_unsettled(cx, options);
+    cx.run_until_parked();
+    ui
+}
+fn open_unsettled(cx: &mut TestAppContext, options: Options) -> Ui {
     cx.update(flint_app::init);
     let (window, app) = cx.update(|cx| {
         let bounds = Bounds {
@@ -1006,7 +1051,6 @@ fn open_with(cx: &mut TestAppContext, options: Options) -> Ui {
         )
         .unwrap()
     });
-    cx.run_until_parked();
     Ui { window, app }
 }
 
@@ -1245,6 +1289,7 @@ fn terminal_output_returns_only_to_its_own_session_outside_tiled_mode(cx: &mut T
     sessions[0]
         .1
         .send(cx, AgentEvent::TurnStarted { turn_id: 1 });
+    sessions[0].1.send(cx, accepted_task(1));
     sessions[0].1.send(
         cx,
         AgentEvent::TurnFinished {
@@ -1257,7 +1302,7 @@ fn terminal_output_returns_only_to_its_own_session_outside_tiled_mode(cx: &mut T
         "another session received terminal contents"
     );
     assert!(matches!(sessions[0].1.sent().as_slice(),
-        [Op::UserMessage(message)] if message.contains("controlled first-session output")));
+        [Op::UserMessageWithContext { text:message, steering_id:None, .. }] if message.contains("controlled first-session output")));
 }
 
 #[gpui_kit::test]
@@ -2223,9 +2268,18 @@ fn at_opens_a_file_picker_and_picking_attaches_the_file(cx: &mut TestAppContext)
     );
     ui.press(cx, "enter");
     let sent = engine.sent();
-    let [Op::UserMessage(message)] = sent.as_slice() else {
+    let [
+        Op::UserMessageWithContext {
+            request,
+            text: message,
+            steering_id: None,
+            ..
+        },
+    ] = sent.as_slice()
+    else {
         panic!("expected one message, got {sent:?}");
     };
+    assert_eq!(request, "explain @src/main.rs");
     assert!(message.starts_with("explain @src/main.rs"));
     assert!(message.contains(
         "[Attached file src/main.rs (1 lines)]\n```\nfn main() { println!(\"hi\"); }\n```"
@@ -2326,6 +2380,25 @@ fn settings_save_to_config_and_are_read_on_startup(cx: &mut TestAppContext) {
         again.read(cx, |app, _| (app.approval, app.effort)),
         (ApprovalMode::Auto, Some(flint_agent::ReasoningEffort::High))
     );
+}
+
+#[gpui_kit::test]
+fn the_jev_judge_toggle_persists_to_config(cx: &mut TestAppContext) {
+    let options = test_options();
+    let home = options.home.clone().unwrap();
+    let ui = open_with(cx, options.clone());
+    ui.press(cx, "cmd-,");
+    assert!(ui.read(cx, |app, _| app.settings_form.is_some()));
+    assert!(ui.read(cx, |app, _| app.settings.jev_judge));
+    ui.scroll_settings(cx);
+    // The Off segment is the second one in the JEV row.
+    ui.click(cx, ("settings-jev", 1usize));
+    ui.click(cx, "settings-save");
+    assert!(ui.read(cx, |app, _| app.settings_form.is_none()));
+    let saved = std::fs::read_to_string(home.join("config.toml")).unwrap();
+    assert!(saved.contains("jev_judge = false"), "{saved}");
+    let again = open_with(cx, options);
+    assert!(!again.read(cx, |app, _| app.settings.jev_judge));
 }
 
 #[gpui_kit::test]
@@ -2593,7 +2666,8 @@ fn approval_details_and_broad_confirmation_are_keyboard_operable(cx: &mut TestAp
 #[gpui_kit::test]
 fn header_keyboard_keydown_and_keyup_toggle_only_once(cx: &mut TestAppContext) {
     let ui = open(cx);
-    for _ in 0..25 {
+    // Include the welcome cards and the now keyboard-accessible tip controls.
+    for _ in 0..40 {
         if ui.with(cx, |window, cx| {
             window.render_frame(cx);
             window.find("changes").focused() == Some(true)
@@ -2835,6 +2909,7 @@ fn sessions_are_saved_and_listed_after_a_restart(cx: &mut TestAppContext) {
     ] {
         engine.send(cx, event);
     }
+    write_native_counter_fixture(&ui.read(cx, |app, _| app.session().dir.clone().unwrap()), 1);
     let again = open_with(cx, options);
     let restored = again.read(cx, |app, _| {
         app.sessions
@@ -2842,7 +2917,10 @@ fn sessions_are_saved_and_listed_after_a_restart(cx: &mut TestAppContext) {
             .find(|s| s.title() == "persist me")
             .map(|s| (s.status(), s.view.items.len(), s.dir.is_some()))
     });
-    assert_eq!(restored, Some((flint_app::session::Status::Done, 3, true)));
+    assert_eq!(
+        restored,
+        Some((flint_app::session::Status::NeedsReview, 3, true))
+    );
 }
 
 #[gpui_kit::test]
@@ -2970,6 +3048,7 @@ fn sidebar_archive_scrollbar_keeps_restore_and_navigation_reachable(cx: &mut Tes
                 id: format!("saved-{ix:02}"),
                 title: Some(format!("Archived {ix} {}", "long-title-".repeat(20))),
                 workspace: options.workspace.clone().unwrap(),
+                subagent_workspaces: Vec::new(),
                 created_at: ix,
                 updated_at: ix,
                 agent: flint_agent::AgentKind::Flint,
@@ -3229,7 +3308,7 @@ fn sidebar_groups_by_project_status_or_agent_and_counts_hidden_sessions(cx: &mut
     sizes.sort();
     assert_eq!(
         sizes,
-        [("Claude Code".to_string(), 2), ("flint".to_string(), 2)]
+        [("Claude Code".to_string(), 2), ("Hooter".to_string(), 2)]
     );
 
     // A filter that hides part of a heading says so in the heading's count.
@@ -4202,7 +4281,7 @@ fn saving_new_model_does_not_relabel_an_active_native_engine(cx: &mut TestAppCon
     ui.click(cx, "settings-save");
     assert_eq!(
         ui.read(cx, |app, _| app.agent_label(flint_agent::AgentKind::Flint)),
-        "flint · active-model"
+        "Hooter · active-model"
     );
     assert_eq!(
         ui.read(cx, |app, _| app.settings.model.clone()),
@@ -4365,6 +4444,86 @@ fn narrow_settings_keep_validation_and_actions_visible(cx: &mut TestAppContext) 
 }
 
 #[gpui_kit::test]
+fn narrow_settings_scrolling_reaches_every_row_hint_without_moving_actions(
+    cx: &mut TestAppContext,
+) {
+    let ui = open_with(
+        cx,
+        Options {
+            window_size: Some((900., 560.)),
+            ..test_options()
+        },
+    );
+    ui.press(cx, "cmd-,");
+    ui.with(cx, |window, cx| {
+        window.render_frame(cx);
+        let viewport = window.find("settings-content").bounds();
+        let cancel = window.find("settings-cancel").bounds();
+        let save = window.find("settings-save").bounds();
+        let model_before = window.find("settings-hint-Model").bounds();
+        let mut remaining = std::collections::BTreeSet::from([
+            "Chat width",
+            "Provider",
+            "Model",
+            "Subagent model",
+            "Base URL",
+            "API key env",
+            "API key file",
+            "JEV judge",
+            "Approval",
+            "Queued work",
+        ]);
+        for step in 0..40 {
+            window.render_frame(cx);
+            assert_eq!(window.find("settings-content").bounds(), viewport);
+            assert_eq!(window.find("settings-cancel").bounds(), cancel);
+            assert_eq!(window.find("settings-save").bounds(), save);
+            assert!(viewport.bottom() < cancel.top());
+            for bounds in [cancel, save] {
+                assert!(bounds.top() >= px(0.) && bounds.bottom() <= px(560.));
+            }
+            remaining.retain(|label| {
+                let id = ElementId::Name(format!("settings-hint-{label}").into());
+                let Some(hint) = window.try_find(id) else {
+                    return true;
+                };
+                let bounds = hint.bounds();
+                !(hint.visible()
+                    && bounds.size.width > px(0.)
+                    && bounds.size.height > px(0.)
+                    && bounds.left() >= viewport.left()
+                    && bounds.right() <= viewport.right()
+                    && bounds.top() >= viewport.top()
+                    && bounds.bottom() <= viewport.bottom())
+            });
+            if step == 1 {
+                let model = window.find("settings-hint-Model").bounds();
+                assert!(
+                    model.top() < model_before.top(),
+                    "wheel did not move the hint"
+                );
+                assert!(
+                    model.top() >= viewport.top() && model.bottom() <= viewport.bottom(),
+                    "Model helper is clipped after scrolling: {model:?} in {viewport:?}"
+                );
+            }
+            if remaining.is_empty() {
+                assert!(step > 0, "fixture did not exercise overflow scrolling");
+                break;
+            }
+            window.scroll(
+                "settings-content",
+                ScrollDelta::Pixels(point(px(0.), px(-80.))),
+                cx,
+            );
+        }
+        assert!(remaining.is_empty(), "unreachable row hints: {remaining:?}");
+    });
+    ui.click(cx, "settings-cancel");
+    assert!(ui.read(cx, |app, _| app.settings_form.is_none()));
+}
+
+#[gpui_kit::test]
 fn escape_cancels_broad_approval_without_stopping_work(cx: &mut TestAppContext) {
     let ui = open(cx);
     let engine = running_turn(&ui, cx);
@@ -4447,6 +4606,38 @@ fn context_compaction_shows_a_row(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
+fn a_jev_verdict_shows_a_status_row(cx: &mut TestAppContext) {
+    let ui = open(cx);
+    let engine = running_turn(&ui, cx);
+    engine.send(
+        cx,
+        AgentEvent::JevVerdict {
+            question: flint_agent::JevQuestion::Verified,
+            probability: 0.72,
+            confirmed: true,
+        },
+    );
+    let ix = ui.read(cx, |app, _| app.session().view.items.len() - 1);
+    let last = ui.read(cx, |app, _| app.session().view.items.last().cloned());
+    assert_eq!(
+        last,
+        Some(Item::Jev {
+            question: flint_agent::JevQuestion::Verified,
+            probability: 0.72,
+            confirmed: true,
+        })
+    );
+    // The verdict is rendered as its own row, not only folded into the model.
+    assert!(
+        ui.with(cx, |window, cx| {
+            window.render_frame(cx);
+            window.try_find(("jev", ix)).is_some()
+        }),
+        "the JEV status row should render in the transcript"
+    );
+}
+
+#[gpui_kit::test]
 fn changes_show_one_combined_diff_per_file(cx: &mut TestAppContext) {
     use flint_app::session::combined;
     let ws = temp_dir("combined");
@@ -4520,6 +4711,7 @@ fn combined_changes_survive_restart_continued_edits_and_archive_recovery(cx: &mu
             id: "saved-edits".into(),
             title: Some("Saved edits".into()),
             workspace: workspace.clone(),
+            subagent_workspaces: Vec::new(),
             created_at: 1,
             updated_at: 2,
             agent: flint_agent::AgentKind::Flint,
@@ -4571,6 +4763,7 @@ fn combined_changes_survive_restart_continued_edits_and_archive_recovery(cx: &mu
         }),
     )
     .unwrap();
+    write_native_counter_fixture(&dir, 3);
     let ui = open_with(cx, options.clone());
     ui.with(cx, |window, cx| {
         ui.app
@@ -4637,6 +4830,7 @@ fn combined_changes_survive_restart_continued_edits_and_archive_recovery(cx: &mu
     );
     drop(engine);
     settle(cx);
+    write_native_counter_fixture(&dir, 4);
     ui.with(cx, |window, cx| {
         ui.app
             .update(cx, |app, cx| app.delete_session(app.active, window, cx));
@@ -6270,9 +6464,15 @@ fn a_command_card_sends_its_output_to_the_agent(cx: &mut TestAppContext) {
         },
     );
     assert!(
+        engine.sent().is_empty(),
+        "a normal stop alone cannot release output follow-ups"
+    );
+    ui.click(cx, "queue-pause");
+    ui.click(cx, "queue-resume-confirm");
+    assert!(
         matches!(
             engine.sent().as_slice(),
-            [Op::UserMessage(message)]
+            [Op::UserMessageWithContext { text:message, steering_id:None, .. }]
                 if message.contains("2 tests failed") && message.contains("npm test")
         ),
         "output not sent back"

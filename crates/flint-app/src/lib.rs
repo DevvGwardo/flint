@@ -1,4 +1,4 @@
-//! flint: a native agent/coding workstation on GPUI.
+//! Hooter: a native agent/coding workstation on GPUI.
 //!
 //! The binary (`src/main.rs`) is a thin launcher; everything lives here so the
 //! UI integration tests in `tests/` can drive the real views.
@@ -10,7 +10,11 @@ pub mod app_demo;
 pub mod app_engine;
 pub mod app_input;
 pub mod app_store;
+pub mod branches;
+pub mod brand;
 pub mod changes_panel;
+pub mod chat_code;
+pub mod chat_content;
 pub mod composer;
 pub mod connection_test;
 pub mod demo;
@@ -21,6 +25,7 @@ pub mod file_preview;
 pub mod general;
 pub mod header;
 mod image_attach;
+mod launcher;
 pub mod layout;
 pub mod mention;
 pub mod menus;
@@ -33,21 +38,25 @@ pub mod project_menu;
 pub mod prompt_queue;
 pub mod queue_actions;
 pub mod queue_view;
+pub mod reply_resources;
 pub mod session;
 pub mod session_groups;
 pub mod session_options;
 pub mod session_workspace;
 pub mod settings;
 pub mod settings_view;
+pub mod shortcuts;
 pub mod sidebar;
 pub mod slash;
 pub mod store;
 pub mod subagent_ui;
+pub mod task_ui;
 pub mod theme;
 pub mod transcript;
 pub mod turns;
 pub mod ui;
 pub mod view_model;
+pub mod welcome_dashboard;
 pub mod worktree_picker;
 pub mod worktrees;
 
@@ -61,6 +70,8 @@ use gpui_kit::component::TitleBar;
 use gpui_kit::*;
 
 use crate::app::Options;
+
+pub use launcher::run;
 
 /// Parses command-line flags (everything after the program name).
 pub fn parse_options(args: impl IntoIterator<Item = String>) -> Options {
@@ -101,7 +112,7 @@ pub fn parse_options(args: impl IntoIterator<Item = String>) -> Options {
             "--changes" => options.open_changes = true,
             "--select-change" => options.select_change = true,
             path if !path.starts_with("--") => options.workspace = Some(path.into()),
-            other => eprintln!("flint: ignoring unknown flag {other}"),
+            other => eprintln!("{}: ignoring unknown flag {other}", brand::NAME),
         }
     }
     options
@@ -111,20 +122,20 @@ pub fn parse_options(args: impl IntoIterator<Item = String>) -> Options {
 pub fn bind_keys(cx: &mut App) {
     use app::*;
     cx.bind_keys([
-        KeyBinding::new("cmd-n", NewSession, None),
-        KeyBinding::new("cmd-k", TogglePalette, None),
-        KeyBinding::new("cmd-shift-p", TogglePalette, None),
-        KeyBinding::new("cmd-j", ToggleChanges, None),
-        KeyBinding::new("cmd-b", ToggleSidebar, None),
-        KeyBinding::new("cmd-shift-g", CycleSessionGrouping, None),
-        KeyBinding::new("cmd-shift-a", ToggleApproval, None),
-        KeyBinding::new("cmd-o", OpenWorkspace, None),
-        KeyBinding::new("cmd-.", Interrupt, None),
-        KeyBinding::new("cmd-l", FocusComposer, None),
-        KeyBinding::new("cmd-q", Quit, None),
-        KeyBinding::new("cmd-,", OpenSettings, None),
-        KeyBinding::new("cmd-shift-r", RevealWorkspace, None),
-        KeyBinding::new("cmd-shift-t", OpenTerminal, None),
+        KeyBinding::new("secondary-n", NewSession, None),
+        KeyBinding::new("secondary-k", TogglePalette, None),
+        KeyBinding::new("secondary-shift-p", TogglePalette, None),
+        KeyBinding::new("secondary-j", ToggleChanges, None),
+        KeyBinding::new("secondary-b", ToggleSidebar, None),
+        KeyBinding::new("secondary-shift-g", CycleSessionGrouping, None),
+        KeyBinding::new("secondary-shift-a", ToggleApproval, None),
+        KeyBinding::new("secondary-o", OpenWorkspace, None),
+        KeyBinding::new("secondary-.", Interrupt, None),
+        KeyBinding::new("secondary-l", FocusComposer, None),
+        KeyBinding::new("secondary-q", Quit, None),
+        KeyBinding::new("secondary-,", OpenSettings, None),
+        KeyBinding::new("secondary-shift-r", RevealWorkspace, None),
+        KeyBinding::new("secondary-shift-t", OpenTerminal, None),
         KeyBinding::new("ctrl-`", ToggleTerminal, None),
         // In a terminal, Shift+Tab goes to the shell (back-tab), not to the
         // approval toggle.
@@ -153,10 +164,10 @@ pub fn window_options(cx: &App, width: f32, height: f32) -> WindowOptions {
         // Vibrancy behind the floating sidebar.
         window_background: WindowBackgroundAppearance::Blurred,
         titlebar: Some(TitlebarOptions {
-            title: None,
+            title: Some(brand::NAME.into()),
             appears_transparent: true,
             // In the fixed window strip above the dockable panels.
-            traffic_light_position: Some(point(px(20.), px(21.))),
+            traffic_light_position: cfg!(target_os = "macos").then(|| point(px(20.), px(21.))),
         }),
         ..TitleBar::window_options()
     }
@@ -164,8 +175,26 @@ pub fn window_options(cx: &App, width: f32, height: f32) -> WindowOptions {
 
 /// App-wide setup shared by the binary and the UI tests.
 pub fn init(cx: &mut App) {
+    cx.set_app_identity(brand::APP_ID, brand::NAME);
     gpui_kit::init(cx);
     theme::install(cx);
     bind_keys(cx);
     cx.on_action(|_: &app::Quit, cx| cx.quit());
+    cx.set_menus([
+        Menu::new(brand::NAME).items([
+            MenuItem::action("Settings…", app::OpenSettings),
+            MenuItem::separator(),
+            MenuItem::action("Quit Hooter", app::Quit),
+        ]),
+        Menu::new("File").items([
+            MenuItem::action("New agent", app::NewSession),
+            MenuItem::action("Open folder…", app::OpenWorkspace),
+        ]),
+        Menu::new("View").items([
+            MenuItem::action("Command palette", app::TogglePalette),
+            MenuItem::action("Sessions", app::ToggleSidebar),
+            MenuItem::action("Terminal", app::ToggleTerminal),
+            MenuItem::action("Changes", app::ToggleChanges),
+        ]),
+    ]);
 }

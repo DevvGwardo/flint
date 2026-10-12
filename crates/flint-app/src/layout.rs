@@ -2,6 +2,7 @@
 
 use flint_agent::AgentKind;
 use gpui_kit::base::FocusTrapElement as _;
+use gpui_kit::component::TitleBar;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -15,9 +16,23 @@ pub const SIDEBAR_INSET: f32 = 8.;
 pub const SIDEBAR_WIDTH: f32 = 288.;
 const TITLEBAR_HEIGHT: f32 = 36.;
 
+// Bound actions run before raw key listeners in GPUI. Contain them during a
+// task review without blocking the input's copy/paste and editing actions.
+fn task_action_guard<A: Action>(
+    app: &mut FlintApp,
+    _: &A,
+    _: &mut Window,
+    cx: &mut Context<FlintApp>,
+) {
+    if app.task_panel.is_some() {
+        cx.stop_propagation();
+    }
+}
+
 impl Render for FlintApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let frame_started = std::time::Instant::now();
+        self.chat_content.borrow_mut().begin_frame(cx);
         if let Some((old, new)) = self.session_workspace.pending_selection.take() {
             self.follow_session_selection(old, new, window, cx);
             self.save_session_layout();
@@ -29,15 +44,35 @@ impl Render for FlintApp {
             self.cancel_rename(window, cx);
         }
         let body = crate::docking::render(self, window, cx);
+        let titlebar_height = if window.is_fullscreen() {
+            8.
+        } else {
+            TITLEBAR_HEIGHT
+        };
         // Window controls stay in one safe strip regardless of panel placement.
-        let titlebar = self.drag_region(
+        let titlebar = if cfg!(target_os = "macos") {
+            self.drag_region(
+                div()
+                    .id("workspace-titlebar")
+                    .h(px(titlebar_height))
+                    .w_full()
+                    .flex_shrink_0(),
+                cx,
+            )
+            .test_support()
+            .into_any_element()
+        } else {
+            // GPUI's custom Windows chrome needs real min/max/close control
+            // areas, not the empty strip used behind AppKit traffic lights.
             div()
                 .id("workspace-titlebar")
-                .h(px(TITLEBAR_HEIGHT))
+                .h(px(titlebar_height))
                 .w_full()
-                .flex_shrink_0(),
-            cx,
-        );
+                .flex_shrink_0()
+                .child(TitleBar::new().h(px(titlebar_height)))
+                .test_support()
+                .into_any_element()
+        };
 
         let root = div()
             .id("flint")
@@ -50,8 +85,10 @@ impl Render for FlintApp {
             // Shift+Tab and Esc are claimed before the composer's own bindings.
             .capture_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 let key = event.keystroke.clone();
-                if (this.settings_form.is_some() || this.archive_confirm.is_some())
-                    && key.modifiers.platform
+                if (this.settings_form.is_some()
+                    || this.archive_confirm.is_some()
+                    || this.task_panel.is_some())
+                    && crate::shortcuts::primary(key.modifiers)
                     && (matches!(
                         key.key.as_str(),
                         "n" | "k" | "l" | "j" | "b" | "o" | "," | "."
@@ -60,11 +97,35 @@ impl Render for FlintApp {
                     cx.stop_propagation();
                     return;
                 }
+                if this.task_panel.is_some() {
+                    if key.key == "escape" {
+                        if this.task_panel.as_ref().is_some_and(|panel| {
+                            panel.draft.is_some() || panel.confirm_accept.is_some()
+                        }) {
+                            if let Some(panel) = &mut this.task_panel {
+                                panel.draft = None;
+                                panel.confirm_accept = None;
+                                panel.focus.focus(window, cx);
+                            }
+                            cx.notify();
+                        } else {
+                            this.close_task_details(window, cx);
+                        }
+                        cx.stop_propagation();
+                    } else if (crate::shortcuts::primary(key.modifiers)
+                        && key.modifiers.shift
+                        && matches!(key.key.as_str(), "a" | "r" | "t" | "g" | "p"))
+                        || (key.modifiers.control && key.key == "`")
+                    {
+                        cx.stop_propagation();
+                    }
+                    return;
+                }
                 if this.permission_choice_open {
                     if key.key == "escape" {
                         this.cancel_initial_permission(window, cx);
                         cx.stop_propagation();
-                    } else if key.modifiers.platform && key.key != "q" {
+                    } else if crate::shortcuts::primary(key.modifiers) && key.key != "q" {
                         cx.stop_propagation();
                     }
                     return;
@@ -73,7 +134,7 @@ impl Render for FlintApp {
                     if key.key == "escape" {
                         this.close_worktrees(window, cx);
                         cx.stop_propagation();
-                    } else if (key.modifiers.platform
+                    } else if (crate::shortcuts::primary(key.modifiers)
                         && (matches!(
                             key.key.as_str(),
                             "n" | "k" | "l" | "j" | "b" | "o" | "," | "."
@@ -135,6 +196,7 @@ impl Render for FlintApp {
                     let was_editing = this.queue_edit.is_some();
                     this.queue_edit = None;
                     this.queue_popover = false;
+                    this.queue_resume_confirm = None;
                     this.composer
                         .update(cx, |state, cx| state.focus(window, cx));
                     if was_editing {
@@ -170,6 +232,29 @@ impl Render for FlintApp {
                     cx.stop_propagation();
                 }
             }))
+            .capture_action(cx.listener(task_action_guard::<NewSession>))
+            .capture_action(cx.listener(task_action_guard::<NewClaudeSession>))
+            .capture_action(cx.listener(task_action_guard::<NewCodexSession>))
+            .capture_action(cx.listener(task_action_guard::<NewDroidSession>))
+            .capture_action(cx.listener(task_action_guard::<ToggleTerminal>))
+            .capture_action(cx.listener(task_action_guard::<TogglePalette>))
+            .capture_action(cx.listener(task_action_guard::<ToggleChanges>))
+            .capture_action(cx.listener(task_action_guard::<ToggleSidebar>))
+            .capture_action(cx.listener(task_action_guard::<CycleSessionGrouping>))
+            .capture_action(cx.listener(task_action_guard::<ToggleApproval>))
+            .capture_action(cx.listener(task_action_guard::<OpenWorkspace>))
+            .capture_action(cx.listener(task_action_guard::<OpenWorktrees>))
+            .capture_action(cx.listener(task_action_guard::<RevealWorkspace>))
+            .capture_action(cx.listener(task_action_guard::<OpenTerminal>))
+            .capture_action(cx.listener(task_action_guard::<OpenSettings>))
+            .capture_action(cx.listener(task_action_guard::<RenameSession>))
+            .capture_action(cx.listener(task_action_guard::<DeleteSession>))
+            .capture_action(cx.listener(task_action_guard::<Interrupt>))
+            .capture_action(cx.listener(task_action_guard::<crate::app::UndoLastTurn>))
+            .capture_action(cx.listener(task_action_guard::<ResetPanelLayout>))
+            .capture_action(cx.listener(task_action_guard::<ArrangeSessionGrid>))
+            .capture_action(cx.listener(task_action_guard::<ResetSessionPanes>))
+            .capture_action(cx.listener(task_action_guard::<FocusComposer>))
             .on_action(cx.listener(|this, _: &NewSession, window, cx| this.new_session(window, cx)))
             .on_action(
                 cx.listener(|this, _: &ToggleTerminal, window, cx| {
@@ -290,7 +375,7 @@ impl Render for FlintApp {
                     div()
                         .id("sessions-drawer-backdrop")
                         .absolute()
-                        .top(px(TITLEBAR_HEIGHT))
+                        .top(px(titlebar_height))
                         .bottom_0()
                         .left_0()
                         .right_0()
@@ -308,7 +393,7 @@ impl Render for FlintApp {
                                 .child(
                                     div()
                                         .h_full()
-                                        .child(crate::sidebar::render(self, cx))
+                                        .child(crate::sidebar::render(self, window, cx))
                                         .focus_trap("sessions-focus-trap", &self.drawer_focus),
                                 )
                                 .test_support(),
@@ -439,7 +524,11 @@ impl Render for FlintApp {
                 )
             })
             .children(crate::settings_view::render(self, window, cx))
-            .children(crate::permission_choice::render(self, cx));
+            .children(crate::task_ui::render(self, window, cx))
+            .children(crate::permission_choice::render(self, cx))
+            .when(crate::automation::capture_enabled(), |root| {
+                root.child(crate::automation::capture_probe(self))
+            });
         crate::automation::record_frame(frame_started);
         root
     }

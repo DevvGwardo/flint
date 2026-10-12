@@ -42,12 +42,18 @@ fn shell_candidate(request: &CreateTerminalRequest, cwd: &Path) -> bool {
         .chars()
         .any(|c| c.is_whitespace() || "|&;<>()$`'\"\\*?~".contains(c));
     if !syntax {
-        return false;
+        return cfg!(windows)
+            && matches!(
+                request.command.to_ascii_lowercase().as_str(),
+                "cd" | "chdir" | "cls" | "dir" | "echo" | "set" | "type" | "ver" | "exit"
+            );
     }
     // A missing literal path with spaces is not automatically a shell script.
     if Path::new(&request.command).is_absolute()
         || request.command.starts_with("./")
         || request.command.starts_with("../")
+        || (cfg!(windows)
+            && (request.command.starts_with(".\\") || request.command.starts_with("..\\")))
     {
         let first = request.command.split_whitespace().next().unwrap_or("");
         return cwd.join(first).is_file()
@@ -56,18 +62,107 @@ fn shell_candidate(request: &CreateTerminalRequest, cwd: &Path) -> bool {
     true
 }
 
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+    use std::time::Duration;
+
+    async fn run(request: CreateTerminalRequest) -> (String, Exit) {
+        let dir = tempfile::tempdir().unwrap();
+        let (events, _) = async_channel::unbounded();
+        let terminals = Terminals::new(dir.path(), events, "test");
+        let id = terminals.create(&request).unwrap();
+        let exit = tokio::time::timeout(Duration::from_secs(10), terminals.wait_for_exit(&id))
+            .await
+            .unwrap()
+            .unwrap();
+        (terminals.output(&id).unwrap().0, exit)
+    }
+
+    #[tokio::test]
+    async fn windows_terminal_runs_cmd_scripts_and_builtins() {
+        let (output, exit) = run(CreateTerminalRequest::new(
+            "test",
+            "echo first& echo second& exit /b 7",
+        ))
+        .await;
+        assert_eq!(exit.code, Some(7));
+        assert_eq!(output, "first\r\nsecond\r\n");
+        let (output, exit) = run(CreateTerminalRequest::new("test", "ver")).await;
+        assert_eq!(exit.code, Some(0));
+        assert!(output.contains("Windows"));
+    }
+
+    #[tokio::test]
+    async fn windows_terminal_preserves_literal_argv_instead_of_shell_fallback() {
+        let request = CreateTerminalRequest::new("test", "python").args(vec![
+            "-c".into(),
+            "import sys; print(sys.argv[1])".into(),
+            "literal & echo injected %PATH%".into(),
+        ]);
+        let (output, exit) = run(request).await;
+        assert_eq!(exit.code, Some(0));
+        assert_eq!(output.trim(), "literal & echo injected %PATH%");
+    }
+
+    #[tokio::test]
+    async fn windows_terminal_kill_stops_its_descendants() {
+        let dir = tempfile::tempdir().unwrap();
+        let (events, _) = async_channel::unbounded();
+        let terminals = Terminals::new(dir.path(), events, "test");
+        let request = CreateTerminalRequest::new("test", "powershell.exe").args(vec![
+            "-NoProfile".into(),
+            "-NonInteractive".into(),
+            "-Command".into(),
+            "Set-Content ready ready; Start-Sleep -Seconds 2; Set-Content escaped escaped".into(),
+        ]);
+        let id = terminals.create(&request).unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !dir.path().join("ready").exists() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        terminals.kill(&id).unwrap();
+        let exit = tokio::time::timeout(Duration::from_secs(5), terminals.wait_for_exit(&id))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(exit.code, Some(0));
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        assert!(!dir.path().join("escaped").exists());
+    }
+}
+
 fn command_for(
     program: &str,
     args: &[String],
     request: &CreateTerminalRequest,
     cwd: &Path,
 ) -> Command {
-    let mut command = Command::new(program);
-    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let home = flint_platform::home_dir();
+    let path = request
+        .env
+        .iter()
+        .rev()
+        .find(|var| {
+            if cfg!(windows) {
+                var.name.eq_ignore_ascii_case("PATH")
+            } else {
+                var.name == "PATH"
+            }
+        })
+        .map(|var| std::ffi::OsString::from(&var.value))
+        .unwrap_or_else(|| crate::launch::search_path(home.as_deref()));
+    let mut command = flint_platform::executable_command(program, &path, cwd);
+    command.args(args).env("PATH", path);
+    configure_command(command, request, cwd)
+}
+
+fn configure_command(mut command: Command, request: &CreateTerminalRequest, cwd: &Path) -> Command {
     command
-        .args(args)
         .current_dir(cwd)
-        .env("PATH", crate::launch::search_path(home.as_deref()))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -75,8 +170,6 @@ fn command_for(
     for var in &request.env {
         command.env(&var.name, &var.value);
     }
-    #[cfg(unix)]
-    command.process_group(0);
     command
 }
 
@@ -195,9 +288,13 @@ impl Terminals {
                 cwd.display()
             ));
         }
-        let mut spawned = command_for(&request.command, &request.args, request, &cwd).spawn();
+        let mut spawned = flint_platform::spawn(&mut command_for(
+            &request.command,
+            &request.args,
+            request,
+            &cwd,
+        ));
         let mut program = request.command.clone();
-        #[cfg(unix)]
         if spawned.as_ref().is_err_and(|err| {
             matches!(
                 err.kind(),
@@ -205,19 +302,28 @@ impl Terminals {
             )
         }) && shell_candidate(request, &cwd)
         {
-            program = shell(request);
-            spawned = command_for(
-                &program,
-                &["-c".to_string(), request.command.clone()],
-                request,
-                &cwd,
-            )
-            .spawn();
+            #[cfg(unix)]
+            {
+                program = shell(request);
+                spawned = flint_platform::spawn(&mut command_for(
+                    &program,
+                    &["-c".to_string(), request.command.clone()],
+                    request,
+                    &cwd,
+                ));
+            }
+            #[cfg(windows)]
+            {
+                program = "cmd.exe".into();
+                spawned = flint_platform::spawn(&mut configure_command(
+                    flint_platform::shell_command(&request.command),
+                    request,
+                    &cwd,
+                ));
+            }
         }
-        let mut child = spawned
+        let (mut child, mut group) = spawned
             .map_err(|err| format!("cannot run {program:?}: {err} (cwd: {})", cwd.display()))?;
-        let pid = child.id();
-        let mut group = crate::process::GroupGuard::new(pid);
         let id = format!("flint-term-{}", self.next.fetch_add(1, Ordering::Relaxed));
         let (exit_tx, exit_rx) = watch::channel(None);
         let (kill_tx, kill_rx) = tokio::sync::oneshot::channel();
@@ -262,14 +368,14 @@ impl Terminals {
             let (status, stopped) = tokio::select! {
                 status = child.wait() => (status.ok(), false),
                 _ = kill_rx => {
-                    stop(&mut child, pid, DRAIN_GRACE).await;
+                    stop(&mut child, &group, DRAIN_GRACE).await;
                     (child.wait().await.ok(), true)
                 }
             };
             // A leader can exit with descendants retaining its pipes. Reap it
             // independently, stop the owned group and only bound the drain.
             if !stopped {
-                stop(&mut child, pid, DRAIN_GRACE).await;
+                stop(&mut child, &group, DRAIN_GRACE).await;
             }
             group.disarm();
             if tokio::time::timeout(DRAIN_GRACE, &mut pumps).await.is_err() {

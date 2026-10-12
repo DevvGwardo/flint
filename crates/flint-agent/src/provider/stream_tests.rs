@@ -194,6 +194,83 @@ fn tolerates_missing_index_and_ids() {
     );
 }
 
+fn assert_unique_synthetic_ids(missing: usize, provider_ids: Vec<String>) {
+    let mut calls = Vec::new();
+    for index in 0..missing {
+        calls.push(json!({
+            "index": index,
+            "function": {"name": "read_file",
+                         "arguments": format!("{{\"path\":\"missing-{index}\"}}")}
+        }));
+    }
+    for (offset, id) in provider_ids.iter().enumerate() {
+        calls.push(json!({
+            "index": missing + offset, "id": id,
+            "function": {"name": "read_file",
+                         "arguments": format!("{{\"path\":\"provided-{offset}\"}}")}
+        }));
+    }
+    let expected_arguments: Vec<String> = calls
+        .iter()
+        .map(|call| call["function"]["arguments"].as_str().unwrap().into())
+        .collect();
+    let mut builder = CompletionBuilder::default();
+    builder.apply(&json!({"choices": [{"delta": {"tool_calls": calls},
+                                      "finish_reason": "tool_calls"}]}));
+    assert!(!builder.exceeded());
+    let completion = builder.finish();
+    let distinct: std::collections::HashSet<_> = completion
+        .tool_calls
+        .iter()
+        .map(|call| call.id.as_str())
+        .collect();
+    assert_eq!(distinct.len(), missing + provider_ids.len());
+    assert!(completion.tool_calls.iter().all(|call| !call.id.is_empty()));
+    assert_eq!(
+        completion
+            .tool_calls
+            .iter()
+            .skip(missing)
+            .map(|call| call.id.clone())
+            .collect::<Vec<_>>(),
+        provider_ids
+    );
+    assert_eq!(
+        completion
+            .tool_calls
+            .iter()
+            .map(|call| call.arguments.clone())
+            .collect::<Vec<_>>(),
+        expected_arguments
+    );
+    assert!(
+        completion
+            .tool_calls
+            .iter()
+            .all(|call| call.name == "read_file")
+    );
+}
+
+#[test]
+fn synthetic_tool_call_ids_do_not_collide_with_provider_ids() {
+    assert_unique_synthetic_ids(1, vec!["call_0".into()]);
+}
+
+#[test]
+fn synthetic_tool_call_ids_do_not_collide_with_each_other() {
+    assert_unique_synthetic_ids(2, vec!["call_0".into(), "call_1".into()]);
+}
+
+#[test]
+fn synthetic_tool_call_ids_are_unique_at_the_inventory_limit() {
+    assert_unique_synthetic_ids(
+        1,
+        (0..MAX_TOOL_CALLS - 1)
+            .map(|index| format!("call_{index}"))
+            .collect(),
+    );
+}
+
 #[test]
 fn deepseek_cache_hit_field_counts_as_cached() {
     let mut builder = CompletionBuilder::default();

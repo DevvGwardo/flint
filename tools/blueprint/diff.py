@@ -63,7 +63,7 @@ def main() -> None:
         for key in ("rss_mb", "cpu_pct", "interval_p95_ms", "root_render_p95_ms")
     }
     metrics["runs"] = runs
-    (bp.DATA / f"diff-{args.tag}.json").write_text(json.dumps(metrics, indent=2))
+    (bp.DATA / f"diff-{args.tag}.json").write_text(bp.strict_json(metrics))
     before_path = bp.DATA / "diff-before.json"
     before = json.loads(before_path.read_text()) if args.tag != "before" and before_path.exists() else None
     report.metrics = {"current": metrics, "before": before}

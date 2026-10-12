@@ -1,6 +1,11 @@
 [workspace]
 resolver = "3"
-members = ["crates/flint-agent", "crates/flint-acp", "crates/flint-term", "crates/flint-app"]
+members = ["crates/flint-platform", "crates/flint-agent", "crates/flint-acp", "crates/flint-term", "crates/flint-app"]
+exclude = ["crates/flint-native-gpui-base", "crates/flint-native-gpui-pre"]
+
+[patch.crates-io]
+gpui-base = { path = "crates/flint-native-gpui-base" }
+gpui-pre = { path = "crates/flint-native-gpui-pre" }
 
 [workspace.package]
 version = "0.1.0"
@@ -8,6 +13,7 @@ edition = "2024"
 license = "Apache-2.0"
 
 [workspace.dependencies]
+flint-platform = { path = "crates/flint-platform" }
 flint-agent = { path = "crates/flint-agent" }
 flint-acp = { path = "crates/flint-acp" }
 flint-term = { path = "crates/flint-term" }
@@ -22,3 +28,11 @@ lto = "thin"
 codegen-units = 1
 # panic = "abort" is not set: the engine's tokio runtime and session threads
 # rely on unwinding to contain a panicking task instead of killing the app.
+
+# Scrolling must not run the layout engine unoptimized in development builds.
+[profile.dev.package.taffy]
+opt-level = 3
+
+# Taffy's generic layout routines are also instantiated inside GPUI.
+[profile.dev.package.gpui-pre]
+opt-level = 2

@@ -1,6 +1,7 @@
 //! Finding and describing ACP adapters: which binary to run, the environment
 //! it needs, and what to tell the user when it can't start or isn't logged in.
 
+use std::ffi::{OsStr, OsString};
 use std::path::Path;
 use std::path::PathBuf;
 
@@ -76,6 +77,9 @@ impl AcpAgent {
     /// How to install the adapter.
     pub fn install_hint(&self) -> String {
         if *self == AcpAgent::Droid {
+            if cfg!(windows) {
+                return "Install a Windows-compatible Factory Droid build, add it to PATH, then retry.".to_string();
+            }
             return "Install Droid with `npm i -g droid` or `brew install --cask droid`, then retry.".to_string();
         }
         match self.adapter() {
@@ -98,7 +102,11 @@ impl AcpAgent {
 
     /// The command to spawn: the adapter on PATH or in `~/.local/bin`, else
     /// `npx -y <package>`. Droid runs its native ACP server directly.
-    pub fn command(&self, search_path: &str) -> Result<(PathBuf, Vec<String>), String> {
+    pub fn command(
+        &self,
+        search_path: impl AsRef<OsStr>,
+    ) -> Result<(PathBuf, Vec<String>), String> {
+        let search_path = search_path.as_ref();
         match self {
             AcpAgent::Droid => find("droid", search_path)
                 .map(|program| {
@@ -152,6 +160,13 @@ impl AcpAgent {
     ///   access instead of using the plan. Set `FLINT_CLAUDE_USE_API_KEY=1`
     ///   to keep them.
     pub fn drops_env(&self, name: &str, keep_api_key: bool) -> bool {
+        let normalized;
+        let name = if cfg!(windows) {
+            normalized = name.to_ascii_uppercase();
+            normalized.as_str()
+        } else {
+            name
+        };
         let session_marker = name == "CLAUDECODE"
             || name.starts_with("CLAUDE_CODE_")
             || matches!(name, "CLAUDE_PID" | "CLAUDE_EFFORT");
@@ -163,45 +178,14 @@ impl AcpAgent {
     }
 }
 
-/// PATH for the adapter. A GUI app launched from Finder gets a minimal PATH,
-/// so the usual install locations are added; adapters spawn `claude` /
-/// `codex` / `node` themselves; Droid also commonly lives in `~/.local/bin`.
-pub fn search_path(home: Option<&Path>) -> String {
-    let mut dirs: Vec<String> = std::env::var("PATH")
-        .unwrap_or_default()
-        .split(':')
-        .filter(|d| !d.is_empty())
-        .map(str::to_string)
-        .collect();
-    let mut extra = vec![
-        "/opt/homebrew/bin".to_string(),
-        "/usr/local/bin".to_string(),
-        "/usr/bin".to_string(),
-        "/bin".to_string(),
-    ];
-    if let Some(home) = home {
-        extra.insert(0, home.join(".local/bin").display().to_string());
-        extra.push(home.join(".npm-global/bin").display().to_string());
-        extra.push(home.join(".bun/bin").display().to_string());
-    }
-    for dir in extra {
-        if !dirs.contains(&dir) {
-            dirs.push(dir);
-        }
-    }
-    dirs.join(":")
+/// PATH for GUI-launched adapters, preserving the platform's path separator.
+pub fn search_path(home: Option<&Path>) -> OsString {
+    flint_platform::search_path(home)
 }
 
 /// `name` itself if it is a path, else the first match on `search_path`.
-pub fn find(name: &str, search_path: &str) -> Option<PathBuf> {
-    if name.contains('/') {
-        let path = PathBuf::from(name);
-        return path.is_file().then_some(path);
-    }
-    search_path
-        .split(':')
-        .map(|dir| Path::new(dir).join(name))
-        .find(|candidate| candidate.is_file())
+pub fn find(name: &str, search_path: impl AsRef<OsStr>) -> Option<PathBuf> {
+    flint_platform::find_executable(name, search_path.as_ref())
 }
 
 /// A user-facing explanation with the fix, from an agent error and the
@@ -253,6 +237,17 @@ pub fn looks_like_auth_error(code: Option<i64>, message: &str) -> bool {
 mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_environment_filtering_is_case_insensitive() {
+        assert!(AcpAgent::ClaudeCode.drops_env("anthropic_api_key", false));
+        assert!(!AcpAgent::ClaudeCode.drops_env("anthropic_api_key", true));
+        for agent in [AcpAgent::ClaudeCode, AcpAgent::Codex, AcpAgent::Droid] {
+            assert!(agent.drops_env("claudecode", false));
+            assert!(agent.drops_env("claude_code_session_id", false));
+        }
+    }
 
     #[test]
     fn finds_adapters_and_falls_back_to_npx() {
@@ -345,5 +340,33 @@ mod tests {
         ));
         assert!(looks_like_auth_error(None, "Please run /login"));
         assert!(!looks_like_auth_error(Some(-32603), "internal error"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_adapters_find_npm_cmd_shims_and_native_executables() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("folder with spaces");
+        std::fs::create_dir(&bin).unwrap();
+        let path = std::env::join_paths([&bin]).unwrap();
+        std::fs::write(bin.join("npx.cmd"), "").unwrap();
+        assert_eq!(
+            AcpAgent::ClaudeCode.command(&path).unwrap().0,
+            bin.join("npx.cmd")
+        );
+        std::fs::write(bin.join("codex-acp.cmd"), "").unwrap();
+        assert_eq!(
+            AcpAgent::Codex.command(&path).unwrap().0,
+            bin.join("codex-acp.cmd")
+        );
+        std::fs::write(bin.join("droid.exe"), "").unwrap();
+        assert_eq!(
+            AcpAgent::Droid.command(&path).unwrap().0,
+            bin.join("droid.exe")
+        );
+        assert_eq!(
+            find(bin.join("droid.exe").to_str().unwrap(), &path),
+            Some(bin.join("droid.exe"))
+        );
     }
 }

@@ -209,6 +209,89 @@ fn edit(guard: &mut TurnGuard) {
     );
 }
 
+#[test]
+fn judge_history_keeps_latest_check_after_twenty_inspections() {
+    let mut guard = TurnGuard::new("Fix a.rs");
+    edit(&mut guard);
+    for i in 0..20 {
+        command(&mut guard, &format!("ls folder{i}"), "listed", 0);
+    }
+    command(&mut guard, "cargo test", "passed", 0);
+    let state = guard.verify_state("Checked.");
+    let commands = state["commands_after_last_edit"].as_array().unwrap();
+    assert_eq!(commands.len(), JEV_MAX_COMMANDS);
+    assert_eq!(commands.last().unwrap()["command"], "cargo test");
+    assert_eq!(commands.last().unwrap()["exit_code"], 0);
+    assert_eq!(
+        guard.finish_check(),
+        None,
+        "facts need no additional JEV veto"
+    );
+    assert_eq!(guard.before_finish(), None);
+}
+
+#[test]
+fn shell_effects_require_verification_not_a_false_zero_edit_watchdog() {
+    let mut guard = TurnGuard::new("Create output.txt");
+    command(&mut guard, "printf done > output.txt", "", 0);
+    assert_eq!(guard.finish_check(), Some(FinishCheck::Verify));
+    assert_eq!(
+        guard.before_finish(),
+        Some((NudgeReason::Verify, VERIFY_NUDGE.into()))
+    );
+    command(&mut guard, "test -s output.txt", "", 0);
+    assert_eq!(guard.before_finish(), None);
+    assert_eq!(
+        guard.watchdog_state("Created.")["untracked_command_effects"],
+        true
+    );
+    assert!(
+        guard.edited_paths.is_empty(),
+        "do not invent shell-edit paths"
+    );
+}
+
+#[test]
+fn another_edit_after_a_verify_nudge_needs_a_fresh_check() {
+    let mut guard = TurnGuard::new("Fix a.rs");
+    edit(&mut guard);
+    assert!(guard.before_finish().is_some());
+    command(&mut guard, "cargo test", "passed", 0);
+    edit(&mut guard);
+    assert_eq!(
+        guard.before_finish(),
+        Some((NudgeReason::Verify, VERIFY_NUDGE.into()))
+    );
+}
+
+#[test]
+fn host_revision_evidence_overrides_legacy_guard_success() {
+    let mut guard = TurnGuard::new("Fix a.rs");
+    edit(&mut guard);
+    command(&mut guard, "cargo test", "passed", 0);
+    let mut task = crate::task::TaskRecord::new(1, "Fix a.rs".into(), 2);
+    task.observed_edits = 1;
+    task.checks.push(crate::task::CommandEvidence {
+        id: 1,
+        call_id: "check".into(),
+        command: "cargo test".into(),
+        contract_revision: 1,
+        work_revision: 1,
+        started_revision: 1,
+        success: true,
+        exit_code: Some(0),
+        detail: "passed".into(),
+        verification: true,
+    });
+    guard.set_task_record(&task);
+    assert_eq!(guard.finish_check(), Some(FinishCheck::Verify));
+    assert_eq!(
+        guard.verify_state("Done.")["current_verification_passed"],
+        false
+    );
+    assert!(guard.before_finish().is_some());
+}
+
 fn command(guard: &mut TurnGuard, cmd: &str, output: &str, exit_code: i32) {
     let args = json!({"command": cmd});
     guard.record_tool_call("run_command", ToolKind::Command, &args, None);
@@ -248,11 +331,11 @@ fn a_failed_check_after_the_edits_gets_one_nudge() {
     );
     assert_eq!(guard.before_finish(), None);
 
-    // A later passing check clears it.
+    // The same check passing clears it; different scopes are not equivalent.
     let mut guard = TurnGuard::new("fix the bug in a.rs");
     edit(&mut guard);
     command(&mut guard, "cargo test", "1 failed", 101);
-    command(&mut guard, "cd crates && cargo test -p x", "ok", 0);
+    command(&mut guard, "cargo test", "ok", 0);
     assert_eq!(guard.before_finish(), None);
 }
 
@@ -262,6 +345,8 @@ fn inspection_programs_and_real_checks() {
         "ls -la",
         "cat a | grep x",
         "git status",
+        "git -C sub diff",
+        "git --no-pager log",
         "FOO=1 head a",
         "cd x; pwd",
         "ls 2>&1",
@@ -273,6 +358,9 @@ fn inspection_programs_and_real_checks() {
         "cd x && npm test",
         "cat a | python -m json.tool",
         "git commit -m x",
+        "git -C status reset --hard",
+        "git --git-dir log checkout .",
+        "git -c core.pager=x log",
         "env FOO=1 cargo test",
         "test -f a.txt",
         "diff out expected",
@@ -369,4 +457,42 @@ fn bug_reports_count_as_change_requests() {
     assert!(task_asks_for_changes("the login button is broken"));
     assert!(task_asks_for_changes("tests are failing on main"));
     assert!(!task_asks_for_changes("why is the login button broken?"));
+}
+
+#[test]
+fn unrelated_success_does_not_erase_a_failed_required_check() {
+    let mut guard = TurnGuard::new("fix the bug in a.rs");
+    edit(&mut guard);
+    command(&mut guard, "cargo test", "one test failed", 101);
+    command(&mut guard, "cargo --version", "cargo 1.95.0", 0);
+    assert_eq!(
+        guard.before_finish(),
+        Some((
+            NudgeReason::Verify,
+            failed_check_nudge("cargo test", Some(101))
+        ))
+    );
+}
+
+#[test]
+fn attempted_check_is_not_a_completed_check() {
+    let mut guard = TurnGuard::new("fix the bug in a.rs");
+    edit(&mut guard);
+    guard.record_tool_call(
+        "run_command",
+        ToolKind::Command,
+        &json!({"command":"cargo test"}),
+        None,
+    );
+    assert_eq!(
+        guard.before_finish(),
+        Some((NudgeReason::Verify, VERIFY_NUDGE.to_string()))
+    );
+}
+
+#[test]
+fn research_only_negation_does_not_request_implementation() {
+    let mut guard = TurnGuard::new("Research the parser bug. Do not change or implement anything.");
+    guard.record_tool_call("read_file", ToolKind::Read, &json!({"path":"a.rs"}), None);
+    assert_eq!(guard.before_finish(), None);
 }

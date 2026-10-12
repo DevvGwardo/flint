@@ -1,4 +1,53 @@
 use super::*;
+
+#[tokio::test]
+async fn execution_options_disable_advertised_and_attempted_delegation() {
+    let (_guard, ws) = temp_workspace();
+    let (url, requests) = mock_server(vec![
+        sse_tool_call(
+            "delegate",
+            "spawn_agent",
+            spawn_args("Inspect the project."),
+        ),
+        sse_text("Delegation is unavailable."),
+    ])
+    .await;
+    let handle = crate::spawn_session_with_options(
+        test_config(url, ws),
+        crate::ExecutionOptions {
+            allow_subagents: false,
+        },
+    );
+    handle
+        .ops
+        .send(Op::UserMessage("Explain what tools are available.".into()))
+        .await
+        .expect("send");
+    let mut events = Vec::new();
+    collect_turn(&handle, &mut events).await;
+    handle.ops.send(Op::Shutdown).await.expect("shutdown");
+    while let Ok(Ok(event)) =
+        tokio::time::timeout(Duration::from_secs(5), handle.events.recv()).await
+    {
+        events.push(event);
+    }
+    assert!(!events.iter().any(|event| matches!(
+        event,
+        AgentEvent::SubagentStarted { .. } | AgentEvent::SubagentEvent { .. }
+    )));
+    let (output, success) = result(&events, "delegate");
+    assert!(!success);
+    assert!(output.to_string().contains("unavailable"));
+    for request in requests.lock().expect("requests").iter() {
+        assert!(
+            !request["tools"]
+                .as_array()
+                .expect("tools")
+                .iter()
+                .any(|tool| tool["function"]["name"] == "spawn_agent")
+        );
+    }
+}
 use pretty_assertions::assert_eq;
 
 fn spawn_args(message: &str) -> Value {
@@ -24,15 +73,23 @@ fn result(events: &[AgentEvent], id: &str) -> (Value, bool) {
 }
 
 fn multi_spawn(count: usize) -> String {
-    let calls: Vec<Value> = (0..count).map(|i| json!({
-        "index": i, "id": format!("delegate-{i}"), "type": "function",
-        "function": {"name": "spawn_agent", "arguments": spawn_args("Research the project.").to_string()}
-    })).collect();
+    multi_spawn_task(count, "Research the project.")
+}
+
+fn multi_spawn_task(count: usize, message: &str) -> String {
+    let calls: Vec<Value> = (0..count)
+        .map(|i| {
+            json!({
+                "index": i, "id": format!("delegate-{i}"), "type": "function",
+                "function": {"name": "spawn_agent", "arguments": spawn_args(message).to_string()}
+            })
+        })
+        .collect();
     sse(&[json!({"choices": [{"delta": {"tool_calls": calls}, "finish_reason": "tool_calls"}]})])
 }
 
 #[tokio::test]
-async fn corrupt_subagent_history_reports_its_restore_error_in_the_child_card() {
+async fn corrupt_subagent_history_is_preserved_and_resume_fails_closed() {
     let (_guard, ws) = temp_workspace();
     let sessions = tempfile::tempdir().expect("tempdir");
     let child_dir = sessions.path().join("subagents/agent-1");
@@ -51,20 +108,18 @@ async fn corrupt_subagent_history_reports_its_restore_error_in_the_child_card() 
                 "label": "Follow-up", "message": "Report.", "session_id": "agent-1"
             }),
         ),
-        sse_text("Child."),
         sse_text("Parent."),
     ])
     .await;
     let mut config = test_config(url, ws);
     config.session_dir = Some(sessions.path().to_path_buf());
     let events = run_turns(config, &["Research."]).await;
-    assert!(result(&events, "resume").1);
-    assert!(child_dir.join("history.json.corrupt").exists());
-    assert!(events.iter().any(|event| matches!(event,
-        AgentEvent::SubagentEvent { event, .. } if matches!(event.as_ref(),
-            AgentEvent::Error(error) if error.starts_with("Couldn't restore the saved conversation")
-        )
-    )));
+    assert!(!result(&events, "resume").1);
+    assert_eq!(
+        std::fs::read_to_string(child_dir.join("history.json")).unwrap(),
+        "damaged history"
+    );
+    assert!(!child_dir.join("history.json.corrupt").exists());
 }
 
 #[tokio::test]
@@ -190,11 +245,13 @@ async fn subagent_session_limit_still_allows_existing_children_to_resume() {
     for _ in 0..32 {
         let (child, _) = children
             .prepare(&args, None, approvals.clone(), None)
+            .await
             .expect("child");
         children.put(child);
     }
     let error = children
         .prepare(&args, None, approvals.clone(), None)
+        .await
         .err()
         .expect("limit");
     assert!(error.contains("limit"));
@@ -206,10 +263,12 @@ async fn subagent_session_limit_still_allows_existing_children_to_resume() {
             approvals.clone(),
             None,
         )
+        .await
         .expect("resume");
     assert_eq!(child.id, "agent-1");
     let error = children
         .prepare(resume.as_object().expect("args"), None, approvals, None)
+        .await
         .err()
         .expect("duplicate resume");
     assert!(error.contains("already running"));
@@ -240,12 +299,14 @@ async fn invalid_subagent_inputs_do_not_allocate_sessions() {
                     approvals.clone(),
                     None
                 )
+                .await
                 .is_err()
         );
     }
     let args = spawn_args("Report.");
     let (child, _) = children
         .prepare(args.as_object().expect("args"), None, approvals, None)
+        .await
         .expect("child");
     assert_eq!(child.id, "agent-1");
 }
@@ -280,13 +341,13 @@ async fn subagent_is_isolated_and_resumes_after_restart_with_its_model_and_effor
     config.subagent_model = Some("child-model".into());
     config.reasoning_effort = Some(ReasoningEffort::High);
     let first = run_turns(config.clone(), &["Parent-only conversation."]).await;
-    assert_eq!(
-        result(&first, "delegate"),
-        (
-            json!({"session_id": "agent-1", "output": "Child summary."}),
-            true,
-        )
-    );
+    let (report, success) = result(&first, "delegate");
+    assert!(success);
+    assert_eq!(report["session_id"], "agent-1");
+    assert_eq!(report["output"], "Child summary.");
+    assert_eq!(report["execution_success"], true);
+    assert_eq!(report["accepted"], false);
+    assert_eq!(report["assessment"]["outcome"], "needs_review");
     let usage = first
         .iter()
         .rev()
@@ -301,13 +362,12 @@ async fn subagent_is_isolated_and_resumes_after_restart_with_its_model_and_effor
     config.subagent_model = Some("override-model".into());
     config.reasoning_effort = Some(ReasoningEffort::Low);
     let second = run_turns(config, &["Ask the child again."]).await;
-    assert_eq!(
-        result(&second, "resume"),
-        (
-            json!({"session_id": "agent-1", "output": "Follow-up summary."}),
-            true,
-        )
-    );
+    let (report, success) = result(&second, "resume");
+    assert!(success);
+    assert_eq!(report["session_id"], "agent-1");
+    assert_eq!(report["output"], "Follow-up summary.");
+    assert_eq!(report["accepted"], false);
+    assert_eq!(report["assessment"]["outcome"], "answered");
     let requests = requests.lock().expect("lock");
     assert_eq!(requests.len(), 7);
     assert_eq!(requests[1]["model"], "child-model");
@@ -329,8 +389,8 @@ async fn subagent_is_isolated_and_resumes_after_restart_with_its_model_and_effor
     assert!(!parent_history.contains("private child tool output"));
     assert!(!parent_history.contains("plan read"));
     // Provider tool ids are untouched; only UI/approval ids are namespaced.
-    assert_eq!(requests[2]["messages"][2]["tool_calls"][0]["id"], "read");
-    assert_eq!(requests[2]["messages"][3]["tool_call_id"], "read");
+    assert_eq!(requests[2]["messages"][3]["tool_calls"][0]["id"], "read");
+    assert_eq!(requests[2]["messages"][4]["tool_call_id"], "read");
 }
 
 #[tokio::test]
@@ -392,12 +452,18 @@ async fn subagents_inherit_the_parent_model_when_no_default_is_set() {
 async fn independent_subagents_actually_run_in_parallel() {
     let (_guard, ws) = temp_workspace();
     let command = |own: &str, other: &str| {
-        format!(
-            "printf ready > {own}; for i in 1 2 3 4 5 6 7 8 9 10; do test -f {other} && break; sleep 0.05; done; test -f {other}"
-        )
+        if cfg!(windows) {
+            format!(
+                "powershell.exe -NoProfile -NonInteractive -Command \"Set-Content {own} ready; for ($i=0; $i -lt 40; $i++) {{ if (Test-Path {other}) {{ exit 0 }}; Start-Sleep -Milliseconds 50 }}; exit 1\""
+            )
+        } else {
+            format!(
+                "printf ready > {own}; for i in 1 2 3 4 5 6 7 8 9 10; do test -f {other} && break; sleep 0.05; done; test -f {other}"
+            )
+        }
     };
     let (url, _) = mock_server(vec![
-        multi_spawn(2),
+        multi_spawn_task(2, "Check the parallel command barrier."),
         sse_tool_call(
             "same-id",
             "run_command",
@@ -413,7 +479,7 @@ async fn independent_subagents_actually_run_in_parallel() {
         sse_text("Both finished."),
     ])
     .await;
-    let events = run_one_turn(url, ws, "Research in parallel.").await;
+    let events = run_one_turn(url, ws, "Coordinate the parallel command barrier.").await;
     let results: Vec<_> = events
         .iter()
         .filter_map(|event| match event {
@@ -479,11 +545,7 @@ async fn subagent_edits_and_verification_count_as_parent_work() {
             "write_file",
             json!({"path": "a.txt", "content": "hi\n"}),
         ),
-        sse_tool_call(
-            "verify",
-            "run_command",
-            json!({"command": "test \"$(cat a.txt)\" = hi"}),
-        ),
+        sse_tool_call("verify", "run_command", json!({"command": "test -s a.txt"})),
         sse_text("Created and verified."),
         sse_text("Completed."),
     ])
@@ -520,7 +582,7 @@ async fn subagent_approval_denial_prevents_writes() {
     let handle = crate::spawn_session(config);
     handle
         .ops
-        .send(Op::UserMessage("Research.".into()))
+        .send(Op::UserMessage("Coordinate child writes.".into()))
         .await
         .expect("send");
     let mut events = Vec::new();
@@ -572,7 +634,7 @@ async fn interrupt_cancels_child_approval_and_preserves_a_valid_resumable_histor
     let handle = crate::spawn_session(config);
     handle
         .ops
-        .send(Op::UserMessage("Research.".into()))
+        .send(Op::UserMessage("Coordinate child writes.".into()))
         .await
         .expect("send");
     let mut events = Vec::new();
@@ -599,15 +661,13 @@ async fn interrupt_cancels_child_approval_and_preserves_a_valid_resumable_histor
             reason: TurnEndReason::Interrupted
         })
     );
-    assert_eq!(
-        result(&events, "delegate"),
-        (
-            json!({
-                "session_id": "agent-1", "error": "Subagent interrupted."
-            }),
-            false
-        )
-    );
+    let (report, success) = result(&events, "delegate");
+    assert!(!success);
+    assert_eq!(report["session_id"], "agent-1");
+    assert_eq!(report["error"], "Subagent interrupted.");
+    assert_eq!(report["execution_success"], false);
+    assert_eq!(report["accepted"], false);
+    assert_eq!(report["assessment"]["reason"], "Interrupted");
     let _ = handle.ops.send(Op::Shutdown).await;
     while let Ok(Ok(_)) = tokio::time::timeout(Duration::from_secs(5), handle.events.recv()).await {
     }

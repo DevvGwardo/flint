@@ -18,6 +18,9 @@ pub struct Meta {
     pub id: String,
     pub title: Option<String>,
     pub workspace: PathBuf,
+    /// Keep archived child checkouts protected without replaying every archive.
+    #[serde(default)]
+    pub subagent_workspaces: Vec<PathBuf>,
     /// Unix seconds.
     pub created_at: i64,
     pub updated_at: i64,
@@ -34,6 +37,8 @@ pub struct Meta {
 pub enum Logged {
     User(String),
     Event(AgentEvent),
+    /// User review of an external/legacy result, not a native engine claim.
+    TaskReviewed(flint_agent::TaskReview),
 }
 
 pub fn sessions_dir(home: &Path) -> PathBuf {
@@ -67,22 +72,52 @@ pub fn append(dir: &Path, record: &Logged) -> std::io::Result<()> {
     append_batch(dir, std::slice::from_ref(record))
 }
 
+const EVENT_WRITE_BUFFER_BYTES: usize = 64 * 1024;
+
+fn write_records(writer: &mut impl std::io::Write, records: &[Logged]) -> std::io::Result<()> {
+    // Records are already retained for retry. Avoid a second whole-batch copy.
+    let mut buffered = std::io::BufWriter::with_capacity(EVENT_WRITE_BUFFER_BYTES, writer);
+    for record in records {
+        serde_json::to_writer(&mut buffered, record)?;
+        buffered.write_all(b"\n")?;
+    }
+    buffered.flush()
+}
+
 fn append_batch(dir: &Path, records: &[Logged]) -> std::io::Result<()> {
+    append_batch_with(dir, records, write_records)
+}
+
+fn append_batch_with(
+    dir: &Path,
+    records: &[Logged],
+    write: impl FnOnce(&mut std::fs::File, &[Logged]) -> std::io::Result<()>,
+) -> std::io::Result<()> {
     if records.is_empty() {
         return Ok(());
     }
-    let mut lines = Vec::new();
-    for record in records {
-        serde_json::to_writer(&mut lines, record)?;
-        lines.push(b'\n');
-    }
     std::fs::create_dir_all(dir)?;
+    use std::io::{Read as _, Seek as _};
     let mut file = std::fs::OpenOptions::new()
         .create(true)
+        .read(true)
         .append(true)
         .open(dir.join("events.jsonl"))?;
     let length = file.metadata()?.len();
-    if let Err(err) = file.write_all(&lines) {
+    let result = (|| {
+        if length > 0 {
+            file.seek(std::io::SeekFrom::End(-1))?;
+            let mut last = [0];
+            file.read_exact(&mut last)?;
+            if last[0] != b'\n' {
+                // Keep a crash-interrupted suffix intact, but do not join
+                // new records to it. A valid newline-free record stays valid.
+                file.write_all(b"\n")?;
+            }
+        }
+        write(&mut file, records)
+    })();
+    if let Err(err) = result {
         // A retry must not append behind a partial JSON line.
         file.set_len(length)?;
         return Err(err);
@@ -107,6 +142,13 @@ pub struct EventWriter {
 
 impl EventWriter {
     pub fn new(dir: PathBuf) -> std::io::Result<Self> {
+        Self::with_append(dir, append_batch)
+    }
+
+    fn with_append(
+        dir: PathBuf,
+        mut append: impl FnMut(&Path, &[Logged]) -> std::io::Result<()> + Send + 'static,
+    ) -> std::io::Result<Self> {
         let (commands, receiver) = std::sync::mpsc::channel();
         let (failure_tx, failures) = async_channel::unbounded();
         let error = std::sync::Arc::new(std::sync::Mutex::new(None));
@@ -141,7 +183,7 @@ impl EventWriter {
                             worker_error.lock().unwrap().clone().unwrap_or_default(),
                         ))
                     } else {
-                        append_batch(&dir, &pending)
+                        append(&dir, &pending)
                     };
                     match &result {
                         Ok(()) => {
@@ -302,10 +344,11 @@ fn load_meta(dir: &Path) -> Option<Meta> {
 
 pub(crate) fn load(dir: &Path) -> Option<(Meta, Vec<Logged>)> {
     let meta = load_meta(dir)?;
-    let events = std::fs::read_to_string(dir.join("events.jsonl"))
-        .unwrap_or_default()
-        .lines()
-        .filter_map(|line| serde_json::from_str(line).ok())
+    let bytes = std::fs::read(dir.join("events.jsonl")).unwrap_or_default();
+    // A partial Unicode character damages one record, not the whole replay.
+    let events = bytes
+        .split(|byte| *byte == b'\n')
+        .filter_map(|line| serde_json::from_slice(line).ok())
         .collect();
     Some((meta, events))
 }
@@ -378,3 +421,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "store_pressure_tests.rs"]
+mod pressure_tests;

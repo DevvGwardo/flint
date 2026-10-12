@@ -10,8 +10,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
-import shutil
+import re
 import statistics
 import subprocess
 import sys
@@ -34,6 +35,39 @@ def args_parser(description: str) -> argparse.ArgumentParser:
     return parser
 
 
+def metric_evidence(value, path: str = "$") -> tuple[object, list[dict]]:
+    """Copy metrics without inventing samples; retain missing paths/reasons."""
+    if value is None or isinstance(value, float) and not math.isfinite(value):
+        reason = "measurement unavailable" if value is None else f"non-finite measurement: {value}"
+        return None, [{"path": path, "reason": reason}]
+    if isinstance(value, (dict, list, tuple)):
+        items = value.items() if isinstance(value, dict) else enumerate(value)
+        clean = {} if isinstance(value, dict) else []
+        missing = []
+        for key, item in items:
+            child = f"{path}.{key}" if isinstance(value, dict) else f"{path}[{key}]"
+            normalized, unavailable = metric_evidence(item, child)
+            if isinstance(value, dict):
+                clean[key] = normalized
+            else:
+                clean.append(normalized)
+            missing.extend(unavailable)
+        return clean, missing
+    return value, []
+
+
+def strict_json(values: dict, *, metrics_key: str | None = None) -> str:
+    """Serialize raw metrics or a report as standard JSON, with missing evidence."""
+    if metrics_key is None:
+        clean, missing = metric_evidence(values)
+    else:
+        clean = dict(values)
+        clean[metrics_key], missing = metric_evidence(values[metrics_key], f"$.{metrics_key}")
+    if missing:
+        clean["missing_metrics"] = missing
+    return json.dumps(clean, indent=2, allow_nan=False)
+
+
 class Report:
     def __init__(self, script: str, tag: str):
         self.script = script
@@ -51,23 +85,39 @@ class Report:
         print(f"  [{mark}] {name} — {detail}", flush=True)
         return ok
 
+    def skip(self, name: str, detail="") -> None:
+        self.checks.append({"name": name, "ok": None, "skipped": True, "detail": str(detail)})
+        print(f"  [SKIP] {name} — {detail}", flush=True)
+
     def finish(self) -> None:
-        failed = [c for c in self.checks if not c["ok"]]
+        # Historical before values are context, not required current evidence.
+        required = self.metrics.get("current", self.metrics)
+        prefix = "$.metrics.current" if "current" in self.metrics else "$.metrics"
+        _, missing = metric_evidence(required, prefix)
+        if missing:
+            self.check(
+                "required measurements are available", False,
+                "; ".join(f"{item['path']}: {item['reason']}" for item in missing),
+            )
+        skipped = [c for c in self.checks if c.get("skipped")]
+        failed = [c for c in self.checks if not c["ok"] and not c.get("skipped")]
         body = {
             "script": self.script,
             "tag": self.tag,
-            "passed": len(self.checks) - len(failed),
+            "passed": len(self.checks) - len(failed) - len(skipped),
             "failed": len(failed),
+            "skipped": len(skipped),
             "total": len(self.checks),
             "seconds": round(time.time() - self.started, 1),
             "metrics": self.metrics,
             "checks": self.checks,
         }
         path = DATA / f"report-{self.script}.json"
-        path.write_text(json.dumps(body, indent=2))
+        text = strict_json(body, metrics_key="metrics")
+        path.write_text(text)
         # Keep a per-tag copy so before/after can be compared.
-        (DATA / f"report-{self.script}-{self.tag}.json").write_text(json.dumps(body, indent=2))
-        print(f"{self.script}: {body['passed']}/{body['total']} passed -> {path}")
+        (DATA / f"report-{self.script}-{self.tag}.json").write_text(text)
+        print(f"{self.script}: {body['passed']}/{body['total']} passed, {body['skipped']} skipped -> {path}")
         sys.exit(1 if failed else 0)
 
 
@@ -146,26 +196,36 @@ class App:
         return path.exists()
 
     def rss_mb(self) -> float:
-        out = subprocess.run(["ps", "-o", "rss=", "-p", str(self.proc.pid)], capture_output=True, text=True).stdout
-        return int(out.strip() or 0) / 1024
+        probe = subprocess.run(["ps", "-o", "rss=", "-p", str(self.proc.pid)], capture_output=True, text=True)
+        try:
+            rss = int(probe.stdout.strip()) if probe.returncode == 0 else 0
+        except ValueError:
+            rss = 0
+        return rss / 1024 if rss > 0 else float("nan")
 
     def cpu_seconds(self) -> float:
-        out = subprocess.run(["ps", "-o", "time=", "-p", str(self.proc.pid)], capture_output=True, text=True).stdout
-        return parse_cpu_time(out.strip())
+        probe = subprocess.run(["ps", "-o", "time=", "-p", str(self.proc.pid)], capture_output=True, text=True)
+        return parse_cpu_time(probe.stdout.strip()) if probe.returncode == 0 else float("nan")
 
     def cpu_percent(self, seconds: float) -> float:
         start = self.cpu_seconds()
         time.sleep(seconds)
-        return (self.cpu_seconds() - start) / seconds * 100
+        end = self.cpu_seconds()
+        if not math.isfinite(start) or not math.isfinite(end) or end < start:
+            return float("nan")
+        return (end - start) / seconds * 100
 
     def stop(self) -> int:
-        if self.proc.poll() is None:
-            self.proc.terminate()
-            try:
-                self.proc.wait(5)
-            except subprocess.TimeoutExpired:
-                self.proc.kill()
-        self.log.close()
+        try:
+            if self.proc.poll() is None:
+                self.proc.terminate()
+                try:
+                    self.proc.wait(5)
+                except subprocess.TimeoutExpired:
+                    self.proc.kill()
+                    self.proc.wait()
+        finally:
+            self.log.close()
         return self.proc.returncode
 
     def wait_exit(self, timeout: float) -> int | None:
@@ -188,17 +248,13 @@ def main_screen() -> tuple[int, int]:
 
 def parse_cpu_time(text: str) -> float:
     """`ps -o time=` is `[[dd-]hh:]mm:ss.cc`."""
-    if not text:
-        return 0.0
-    days = 0
-    if "-" in text:
-        d, text = text.split("-", 1)
-        days = int(d)
-    parts = [float(p) for p in text.split(":")]
-    seconds = 0.0
-    for p in parts:
-        seconds = seconds * 60 + p
-    return days * 86400 + seconds
+    match = re.fullmatch(r"(?:(\d+)-)?(?:(\d+):)?(\d+):([0-5]\d(?:\.\d+)?)", text)
+    if not match:
+        return float("nan")
+    days, hours, minutes, seconds = match.groups()
+    if (days is not None and hours is None) or (hours is not None and int(minutes) >= 60):
+        return float("nan")
+    return int(days or 0) * 86400 + int(hours or 0) * 3600 + int(minutes) * 60 + float(seconds)
 
 
 def image_stats(path: Path) -> tuple[float, tuple[int, int]]:
@@ -223,7 +279,6 @@ def median(values: list[float]) -> float:
 
 
 def fresh_dir(path: Path) -> Path:
-    if path.exists():
-        shutil.rmtree(path)
+    """Create a fresh directory; never delete an earlier run or user files."""
     path.mkdir(parents=True)
     return path

@@ -62,7 +62,10 @@ pub fn render(app: &FlintApp, cx: &mut Context<FlintApp>) -> Option<impl IntoEle
         .child(div().w(px(540.)).p(px(24.)).rounded(px(14.)).bg(p.surface)
             .border_1().border_color(p.border_strong).flex().flex_col().gap(px(14.))
             .child(ui::label("How should new native engines act?", size::MD, p.text))
-            .child(ui::label("Ask before changes is recommended. Flint asks before commands and file edits. Reading files does not need approval.", size::BASE, p.text_muted))
+            .child(ui::label("Ask before changes is recommended. Hooter asks before commands and file edits. Reading files does not need approval.", size::BASE, p.text_muted))
+            .children(cfg!(windows).then(|| ui::label(
+                "Windows commands are not sandboxed. They run with your account's file and network permissions.",
+                size::SM, p.warning)))
             .child(Button::new("first-run-ask").primary().label("Ask before changes (recommended)")
                 .on_click(cx.listener(|this, _, window, cx| this.choose_initial_permission(ApprovalMode::AskForChanges, window, cx))))
             .child(ui::label("Auto-run lets new native engines execute commands and edit files in the workspace without asking, including later turns and subagent work. Commands can have effects beyond files. ACP agents use their own permission rules.", size::BASE, p.text_muted))

@@ -4,6 +4,9 @@ use super::{LinkTarget, MAX_BYTES, link_target, read_file};
 
 #[test]
 fn local_links_resolve_against_the_document_or_session_directory() {
+    #[cfg(windows)]
+    let base = Path::new(r"C:\tmp\work\docs");
+    #[cfg(not(windows))]
     let base = Path::new("/tmp/work/docs");
     for (link, path) in [
         ("README.md", "/tmp/work/docs/README.md"),
@@ -15,11 +18,50 @@ fn local_links_resolve_against_the_document_or_session_directory() {
         ("file:///tmp/guide%20one.md#intro", "/tmp/guide one.md"),
         ("file://localhost/tmp/guide.md", "/tmp/guide.md"),
     ] {
+        #[cfg(windows)]
+        let (link, path) = (
+            link.replace("file:///tmp/", "file:///C:/tmp/")
+                .replace("file://localhost/tmp/", "file://localhost/C:/tmp/"),
+            format!("C:{path}"),
+        );
+        #[cfg(windows)]
+        let link = link.as_str();
         assert_eq!(
             link_target(link, base),
             LinkTarget::File(path.into()),
             "{link}"
         );
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn native_windows_file_links_preserve_drive_paths_and_reject_remote_shares() {
+    let base = Path::new(r"C:\work\docs");
+    for link in [
+        r"C:\work\main.rs",
+        r"C:\work\main.rs:12:4",
+        "C:/work/main.rs:12",
+    ] {
+        assert_eq!(
+            link_target(link, base),
+            LinkTarget::File(r"C:\work\main.rs".into())
+        );
+    }
+    assert_eq!(
+        link_target(r"..\main.rs:12", base),
+        LinkTarget::File(r"C:\work\main.rs".into())
+    );
+    for link in [
+        r"\\remote\share\secret.txt",
+        r"\\?\UNC\remote\share\secret.txt",
+        r"\\.\pipe\remote",
+        r"\\?\GLOBALROOT\Device\HarddiskVolumeShadowCopy1\secret.txt",
+        r"C:\work\main.rs:private",
+        "file:///C:/work/main.rs:private",
+        "file://remote/share/secret.txt",
+    ] {
+        assert_eq!(link_target(link, base), LinkTarget::Ignore);
     }
 }
 
@@ -40,6 +82,11 @@ fn only_web_links_are_sent_to_the_system_handler() {
         "vscode://file/tmp/a",
         "file://remote/tmp/a",
         "//remote/tmp/a",
+        "https://name:password@example.com/docs",
+        "https://name@example.com/docs",
+        "https://example.com/docs?access_token=sentinel",
+        "https://example.com/docs?api%5Fkey=sentinel",
+        "file://name:password@localhost/tmp/a",
     ] {
         assert_eq!(link_target(link, base), LinkTarget::Ignore, "{link}");
     }

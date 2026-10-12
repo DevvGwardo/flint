@@ -53,6 +53,15 @@ async fn main() -> anyhow::Result<()> {
             }
             AgentEvent::ReasoningDelta(_) | AgentEvent::ToolOutputDelta { .. } => continue,
             AgentEvent::TurnStarted { turn_id } => format!("── turn {turn_id}"),
+            AgentEvent::TaskUpdated { task, .. } => {
+                format!("task scope revision {}", task.contract.revision)
+            }
+            AgentEvent::TaskAssessed { task, .. } => format!(
+                "task outcome: {}",
+                task.assessment
+                    .as_ref()
+                    .map_or("Unverified", |assessment| assessment.outcome.label()),
+            ),
             AgentEvent::SteeringAccepted { id } => format!("steering accepted: {id}"),
             AgentEvent::StepStarted { step, .. } => format!("── step {step}"),
             AgentEvent::ToolCallStarted { name, summary, .. } => format!("▶ {name}: {summary}"),
@@ -74,6 +83,15 @@ async fn main() -> anyhow::Result<()> {
             }
             AgentEvent::ApprovalRequested { summary, .. } => format!("? approval: {summary}"),
             AgentEvent::HarnessNudge { reason, .. } => format!("⚑ harness nudge: {reason:?}"),
+            AgentEvent::JevVerdict {
+                question,
+                probability,
+                confirmed,
+            } => format!(
+                "◇ jev {question:?}: {:.0}% {}",
+                probability * 100.0,
+                if *confirmed { "confirmed" } else { "cleared" }
+            ),
             AgentEvent::ToolRepaired { tool, detail } => format!("⚒ repaired {tool}: {detail}"),
             AgentEvent::Usage(u) => format!(
                 "  usage in={} cached={} out={} reasoning={}",
@@ -103,6 +121,10 @@ async fn main() -> anyhow::Result<()> {
             } => {
                 format!("subagent: {session_id} ({model})")
             }
+            AgentEvent::SubagentWorkspace {
+                session_id,
+                workspace,
+            } => format!("subagent workspace: {session_id} ({})", workspace.display()),
             AgentEvent::SubagentEvent { .. } => continue,
             AgentEvent::TerminalStarted { label, .. } => format!("terminal: {label}"),
             AgentEvent::TerminalOutput { .. } | AgentEvent::TerminalExited { .. } => continue,

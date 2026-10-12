@@ -24,8 +24,10 @@ use crate::view_model::Role;
 pub use approval::pinned as pinned_approval;
 pub use turn::file_icon;
 
-/// Readable line length for the transcript.
-pub const COLUMN_WIDTH: f32 = 760.;
+/// Shared pane-local gutter for the transcript and ordinary composer.
+pub const COLUMN_GUTTER: f32 = 20.;
+/// The welcome workbench uses the room a fullscreen window gives it.
+pub const WELCOME_WIDTH: f32 = 960.;
 
 pub fn render_main(
     app: &FlintApp,
@@ -67,11 +69,7 @@ pub fn render_main(
                 .flex_shrink_0()
                 .flex()
                 .justify_center()
-                .px(px(if window.viewport_size().width < px(600.) {
-                    16.
-                } else {
-                    32.
-                }))
+                .px(px(COLUMN_GUTTER))
                 .pb(px(22.))
                 .pt(px(8.))
                 .child(crate::composer::render(app, window, cx)),
@@ -133,7 +131,9 @@ pub fn render_session_pane(
             pane.child(
                 div()
                     .flex_shrink_0()
-                    .px(px(12.))
+                    .flex()
+                    .justify_center()
+                    .px(px(COLUMN_GUTTER))
                     .pt(px(6.))
                     .pb(px(12.))
                     .child(crate::composer::render(app, window, cx)),
@@ -240,9 +240,6 @@ impl FlintApp {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let Some(session_ix) = self.session_index(target.parent) else {
-            return div().into_any_element();
-        };
         let Some(view) = self.conversation_view(target) else {
             return div().into_any_element();
         };
@@ -254,9 +251,18 @@ impl FlintApp {
             return div().into_any_element();
         }
         let now = self.now();
-        let workspace = &self.sessions[session_ix].workspace;
+        let markdown = if matches!(item, Item::Assistant { .. })
+            && (role != Role::WorkHeader || view.turn_at(ix).is_some_and(|turn| turn.expanded))
+        {
+            Some(crate::chat_content::render(self, target, ix, cx))
+        } else {
+            None
+        };
         let (top, body): (f32, AnyElement) = match role {
-            Role::Answer => (22., turn::answer(ix, item, workspace, cx)),
+            Role::Answer => (
+                22.,
+                turn::answer(ix, markdown.unwrap_or_else(|| div().into_any_element())),
+            ),
             Role::Summary => match view.turn_at(ix) {
                 Some(info) => {
                     let copied = self.copied_conversation.as_ref() == Some(target)
@@ -279,7 +285,7 @@ impl FlintApp {
                             item,
                             now,
                             &self.settings.base_url,
-                            workspace,
+                            markdown,
                             cx,
                         )))
                     })
@@ -288,15 +294,7 @@ impl FlintApp {
             }
             Role::Plain | Role::Live | Role::Work => (
                 row_spacing(item),
-                rows::render(
-                    target,
-                    ix,
-                    item,
-                    now,
-                    &self.settings.base_url,
-                    workspace,
-                    cx,
-                ),
+                rows::render(target, ix, item, now, &self.settings.base_url, markdown, cx),
             ),
             Role::Hidden => unreachable!("handled above"),
         };
@@ -305,11 +303,39 @@ impl FlintApp {
             .w_full()
             .flex()
             .justify_center()
-            .px(px(20.))
+            .min_w_0()
+            .px(px(COLUMN_GUTTER))
             .pt(px(if ix == 0 { 32. } else { top }))
             .when(last, |row| row.pb(px(32.)))
-            .child(div().w_full().max_w(px(COLUMN_WIDTH)).child(body))
+            .child(
+                div()
+                    .id(SharedString::from(format!(
+                        "chat-column-{}-{}-{ix}",
+                        target.parent,
+                        target.child.as_deref().unwrap_or("root")
+                    )))
+                    .w_full()
+                    .min_w_0()
+                    .when_some(self.settings.transcript_width.maximum(), |col, max| {
+                        col.max_w(px(max))
+                    })
+                    .child(body)
+                    .test_support(),
+            )
             .into_any_element()
+    }
+}
+
+impl FlintApp {
+    /// Reflow existing lists without reset, follow-mode changes or input focus.
+    pub(crate) fn remeasure_chat_layout(&self, cx: &mut Context<Self>) {
+        for session in &self.sessions {
+            session.list.remeasure_items(0..session.list.item_count());
+            for list in session.subagent_lists.values() {
+                list.remeasure_items(0..list.item_count());
+            }
+        }
+        cx.notify();
     }
 }
 
@@ -321,7 +347,9 @@ fn row_spacing(item: &Item) -> f32 {
         Item::Assistant { .. } => 20.,
         Item::Thinking { .. } => 18.,
         Item::Tool(_) | Item::Repair { .. } => 10.,
-        Item::Nudge { .. } | Item::Compacted { .. } | Item::Reverted { .. } => 12.,
+        Item::Nudge { .. } | Item::Jev { .. } | Item::Compacted { .. } | Item::Reverted { .. } => {
+            12.
+        }
         Item::Approval { .. } | Item::Error(_) => 18.,
         Item::TurnSummary { .. } => 24.,
     }

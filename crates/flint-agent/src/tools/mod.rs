@@ -37,9 +37,10 @@ pub const SPAWN_AGENT: &str = "spawn_agent";
 pub const LIST_MODELS: &str = "list_models";
 pub const UPDATE_PLAN: &str = "update_plan";
 pub const FETCH_URL: &str = "fetch_url";
+pub const REPORT_TASK: &str = "report_task";
 
 /// Names of every tool, in the order they are offered.
-pub const TOOL_NAMES: [&str; 10] = [
+pub const TOOL_NAMES: [&str; 11] = [
     RUN_COMMAND,
     READ_FILE,
     WRITE_FILE,
@@ -50,6 +51,7 @@ pub const TOOL_NAMES: [&str; 10] = [
     UPDATE_PLAN,
     SPAWN_AGENT,
     LIST_MODELS,
+    REPORT_TASK,
 ];
 
 /// What a finished tool call produced.
@@ -133,6 +135,7 @@ pub fn summary(name: &str, args: &Map<String, Value>) -> String {
             }
             Err(_) => "Plan".to_string(),
         },
+        REPORT_TASK => "Task progress and blockers".into(),
         WRITE_FILE | EDIT_FILE | LIST_DIR => path.to_string(),
         _ => serde_json::to_string(args).unwrap_or_default(),
     };
@@ -163,9 +166,14 @@ pub fn tool_specs() -> Vec<Value> {
     vec![
         spec(
             RUN_COMMAND,
-            "Run a shell command (sh -c) in the workspace. Use it to build, test, run scripts, and use git. \
-             Output is the head and tail of stdout+stderr plus the exit code. Keep output bounded \
-             (head, tail, grep -m).",
+            &format!(
+                "Run a shell command ({}) in the workspace. Use it to build, test, run scripts, and use git. \
+             Output is already bounded to the head and tail of stdout+stderr plus the exit code. \
+             For verification, run the checker directly (including bun test or bun run typecheck). \
+             Do not pipe checks through head/tail or append `; echo`/`|| true`: these mask failures \
+             and cannot count as verification.",
+                flint_platform::SHELL_DESCRIPTION
+            ),
             json!({
                 "command": {"type": "string", "description": "The shell command to run."},
                 "timeout_secs": {"type": "integer", "description": "Timeout in seconds (default 120, max 600)."}
@@ -257,20 +265,56 @@ pub fn tool_specs() -> Vec<Value> {
             &["plan"],
         ),
         spec(
+            REPORT_TASK,
+            "Report the task's actual deliverables and unresolved blockers before concluding substantial work. \
+             This records your report, not acceptance. Do not omit a blocker to imply it is resolved. \
+             After fixing a reported blocker and passing a current check, explicitly resolve its \
+             exact previous text with resolved_blockers. User-review blockers cannot be cleared. \
+             In a read-only review, return findings in chat. Optional changes or executable \
+             tests belong in proposed_actions, not blockers. Report a blocker only when \
+             something necessary for the current request cannot be done. \
+             User requirements cannot be removed by a plan or this tool; checks and file contents are \
+             assessed separately by the host and the user.",
+            json!({
+                "summary": {"type":"string", "description":"What was delivered and what remains, at most 4,000 characters."},
+                "deliverables": {"type":"array", "items":{"type":"string"}, "description":"Workspace-relative output paths actually produced."},
+                "blockers": {"type":"array", "items":{"type":"string"}, "description":"Unresolved obstacles; empty only when none."},
+                "proposed_actions": {"type":"array", "items":{"type":"string"}, "description":"Optional next steps to offer the user. These have not been performed or approved and do not block the current review."},
+                "resolved_blockers": {"type":"array", "items":{"type":"string"}, "description":"Optional exact texts of previously agent-reported blockers now fixed and checked. Does not clear user-review blockers."}
+            }),
+            &["summary", "deliverables", "blockers"],
+        ),
+        spec(
             SPAWN_AGENT,
             "Delegate a self-contained task to an isolated subagent in the same workspace. \
              It does not see your conversation: include all needed context in message. \
-             Returns only its final answer and a session_id for follow-ups. Consecutive independent \
+             Returns its final answer, session_id, execution status and structured task assessment. \
+             A returned answer is not acceptance; blocked or unverified work is not successful fulfillment. Consecutive independent \
              calls in one response run in parallel (up to four); use disjoint write sets for edits. \
              Do not delegate a single file read or duplicate delegated work. Omit model to use \
              the configured subagent model, otherwise the parent model. For an explicit override, \
              call list_models first and pass an exact model id. Never silently substitute models. \
-             A resumed session retains its model: do not combine model and session_id.",
+             For isolated code changes, set worktree.branch to create or reuse a real Git \
+             checkout; the child runs its shell and file tools there, not in the source tree. \
+             In general-agent mode, set worktree.repository to an absolute repository path. \
+             Worktree access requires approval and never switches the parent's workspace. \
+             A resumed session retains its model and worktree: do not combine model or worktree with session_id.",
             json!({
                 "label": {"type": "string", "description": "Short task label for the UI."},
                 "message": {"type": "string", "description": "Full task and context, or a short follow-up."},
                 "session_id": {"type": "string", "description": "Existing child session to resume. Omit for a new session."},
-                "model": {"type": "string", "description": "Optional exact model id from list_models, on the configured endpoint."}
+                "model": {"type": "string", "description": "Optional exact model id from list_models, on the configured endpoint."},
+                "worktree": {
+                    "type": "object",
+                    "description": "Optional real Git checkout for this task. Omit for same-workspace delegation.",
+                    "properties": {
+                        "branch": {"type": "string", "description": "Explicit local branch name. Creates it if missing; never resets existing branches."},
+                        "base": {"type": "string", "description": "Commit or branch for a new branch (default HEAD). Uncommitted edits are not copied."},
+                        "repository": {"type": "string", "description": "Absolute repository path, required in general-agent mode; otherwise defaults to the parent workspace."}
+                    },
+                    "required": ["branch"],
+                    "additionalProperties": false
+                }
             }),
             &["label", "message"],
         ),
@@ -288,13 +332,14 @@ pub fn tool_specs() -> Vec<Value> {
 }
 
 /// One step of an [`UPDATE_PLAN`] plan.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PlanStep {
     pub step: String,
     pub status: StepStatus,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum StepStatus {
     Pending,
     InProgress,
@@ -393,6 +438,7 @@ pub struct ToolContext {
     pub seen: FileTracker,
     /// The `sandbox-exec` policy for commands; `None` runs them unconfined.
     pub sandbox: Option<String>,
+    pub(crate) work_clock: std::sync::Arc<crate::task::WorkClock>,
 }
 
 impl ToolContext {
@@ -405,6 +451,7 @@ impl ToolContext {
             workspace,
             seen,
             sandbox,
+            work_clock: Default::default(),
         }
     }
 
@@ -415,6 +462,7 @@ impl ToolContext {
             workspace: self.workspace.clone(),
             seen: self.seen.child(),
             sandbox: self.sandbox.clone(),
+            work_clock: self.work_clock.clone(),
         }
     }
 }
@@ -466,7 +514,7 @@ fn bool_arg(args: &Map<String, Value>, key: &str) -> bool {
 }
 
 /// Resolves `path` against the workspace, refusing paths that leave it.
-fn resolve(workspace: &Path, path: &str) -> Result<PathBuf, String> {
+pub(crate) fn resolve(workspace: &Path, path: &str) -> Result<PathBuf, String> {
     let path = path.trim();
     let joined = if Path::new(path).is_absolute() {
         PathBuf::from(path)

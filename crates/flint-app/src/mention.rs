@@ -27,7 +27,12 @@ pub fn index_files(workspace: &Path) -> Vec<String> {
         if entry.file_type().is_some_and(|t| t.is_file())
             && let Ok(rel) = entry.path().strip_prefix(workspace)
         {
-            files.push(rel.to_string_lossy().to_string());
+            // Mentions are portable workspace-relative paths, not native
+            // separators that change search ranking or transcript syntax.
+            files.push(
+                rel.to_string_lossy()
+                    .replace(std::path::MAIN_SEPARATOR, "/"),
+            );
             if files.len() >= MAX_INDEXED_FILES {
                 break;
             }

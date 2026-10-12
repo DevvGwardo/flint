@@ -186,16 +186,16 @@ pub fn render_virtual(
 /// Renders up to `max_lines` lines of a unified diff; returns the element and
 /// how many lines were left out. Long lines are clipped (see [`render_wide`]).
 pub fn render(unified: &str, max_lines: usize) -> (Div, usize) {
-    render_lines(unified, max_lines, false)
+    render_lines(unified, max_lines, false, false)
 }
 
 /// The whole diff with long lines kept intact, for a horizontally scrolling
-/// container.
+/// container. Line numbers stay visible so a clipped row can still be placed.
 pub fn render_wide(unified: &str) -> Div {
-    render_lines(unified, usize::MAX, true).0
+    render_lines(unified, usize::MAX, true, true).0
 }
 
-fn render_lines(unified: &str, max_lines: usize, wide: bool) -> (Div, usize) {
+fn render_lines(unified: &str, max_lines: usize, wide: bool, numbered: bool) -> (Div, usize) {
     let parsed = ParsedDiff::new(unified);
     let hidden = parsed.lines.len().saturating_sub(max_lines);
     let rows = parsed
@@ -203,7 +203,7 @@ fn render_lines(unified: &str, max_lines: usize, wide: bool) -> (Div, usize) {
         .iter()
         .take(max_lines)
         .enumerate()
-        .map(|(ix, line)| render_row(line, ix, wide, false, None));
+        .map(|(ix, line)| render_row(line, ix, wide, numbered, None));
     let element = div()
         .when(!wide, |col| col.w_full())
         .when(wide, |col| col.min_w_full())

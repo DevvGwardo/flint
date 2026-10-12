@@ -102,21 +102,30 @@ fn reveal_row(
     });
 }
 
-pub fn render(app: &FlintApp, cx: &mut Context<FlintApp>) -> impl IntoElement {
+pub fn render(app: &FlintApp, window: &Window, cx: &mut Context<FlintApp>) -> impl IntoElement {
     let p = palette();
+    let compact =
+        window.viewport_size().height < px(720.) || (app.session_drawer && !app.sidebar_visible);
 
     // The dedicated grip moves the panel; the rest of the row moves the window.
     let top = app.drag_region(
         div()
             .id("sidebar-top")
-            .h(px(34.))
+            .h(px(if compact { 44. } else { 72. }))
             .flex_shrink_0()
             .flex()
             .items_center()
-            .gap(px(4.))
-            .px(px(8.))
+            .gap(px(10.))
+            .px(px(16.))
             .child(crate::docking::handle(crate::docking::Panel::Sidebar, cx))
-            .child(ui::label("Sessions", size::SM, p.text_subtle))
+            .child(crate::brand::mark(30.))
+            .child(
+                ui::label(crate::brand::NAME, 21., p.text)
+                    .id("hooter-brand")
+                    .font_family(crate::theme::DISPLAY_FONT)
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .test_support(),
+            )
             .child(div().flex_1())
             .child(
                 div()
@@ -145,16 +154,25 @@ pub fn render(app: &FlintApp, cx: &mut Context<FlintApp>) -> impl IntoElement {
         cx,
     );
 
-    let new_agent = nav_row("new-agent", IconName::SquarePen, "New agent", Some("⌘N")).on_click(
-        cx.listener(|_, _, window, cx| {
-            window.dispatch_action(Box::new(NewSession), cx);
-        }),
-    );
+    let new_agent = nav_row(
+        "new-agent",
+        IconName::SquarePen,
+        "New agent",
+        Some(&crate::shortcuts::label("⌘N")),
+    )
+    .h(px(if compact { 38. } else { 44. }))
+    .mb(px(if compact { 2. } else { 6. }))
+    .bg(p.accent_soft)
+    .border_1()
+    .border_color(p.accent.opacity(0.18))
+    .on_click(cx.listener(|_, _, window, cx| {
+        window.dispatch_action(Box::new(NewSession), cx);
+    }));
     let open_folder = nav_row(
         "open-folder",
         IconName::FolderPlus,
         "Open folder",
-        Some("⌘O"),
+        Some(&crate::shortcuts::label("⌘O")),
     )
     .on_click(cx.listener(|_, _, window, cx| {
         window.dispatch_action(Box::new(OpenWorkspace), cx);
@@ -170,8 +188,8 @@ pub fn render(app: &FlintApp, cx: &mut Context<FlintApp>) -> impl IntoElement {
     let search = div()
         .flex_shrink_0()
         .mx(px(10.))
-        .mt(px(12.))
-        .mb(px(4.))
+        .mt(px(if compact { 12. } else { 18. }))
+        .mb(px(if compact { 4. } else { 10. }))
         .child(
             Input::new(&app.search)
                 .id("session-search")
@@ -359,8 +377,9 @@ pub fn render(app: &FlintApp, cx: &mut Context<FlintApp>) -> impl IntoElement {
         .focus_visible(|style| style.border_1().border_color(p.accent))
         .tooltip(move |window, cx| {
             Tooltip::new(format!(
-                "Grouped by {}  ⇧⌘G\nClick to group by {}",
+                "Grouped by {}  {}\nClick to group by {}",
                 grouping.label(),
+                crate::shortcuts::label("⇧⌘G"),
                 grouping.next().label()
             ))
             .build(window, cx)
@@ -390,7 +409,7 @@ pub fn render(app: &FlintApp, cx: &mut Context<FlintApp>) -> impl IntoElement {
         .id("session-filters")
         .flex_shrink_0()
         .mx(px(10.))
-        .mb(px(2.))
+        .mb(px(if compact { 2. } else { 8. }))
         .flex()
         .flex_col()
         .gap(px(4.))
@@ -407,11 +426,16 @@ pub fn render(app: &FlintApp, cx: &mut Context<FlintApp>) -> impl IntoElement {
                 .items_center()
                 .pr(px(8.))
                 .child(
-                    nav_row("settings", IconName::Settings, "Settings", Some("⌘,"))
-                        .flex_1()
-                        .min_w_0()
-                        .on_click(cx.listener(|this, _, window, cx| this.open_settings(window, cx)))
-                        .test_support(),
+                    nav_row(
+                        "settings",
+                        IconName::Settings,
+                        "Settings",
+                        Some(&crate::shortcuts::label("⌘,")),
+                    )
+                    .flex_1()
+                    .min_w_0()
+                    .on_click(cx.listener(|this, _, window, cx| this.open_settings(window, cx)))
+                    .test_support(),
                 )
                 .child(group_toggle),
         );
@@ -422,14 +446,14 @@ pub fn render(app: &FlintApp, cx: &mut Context<FlintApp>) -> impl IntoElement {
         .h_full()
         .flex()
         .flex_col()
-        .rounded(px(14.))
+        .rounded(px(18.))
         .bg(if app.session_drawer && !app.sidebar_visible {
             p.chrome
         } else {
             p.sidebar_fill
         })
         .border_1()
-        .border_color(white(0.06))
+        .border_color(p.border)
         .overflow_hidden()
         .child(top)
         .child(new_agent)
@@ -656,14 +680,14 @@ fn filter_chip(
         .focus_visible(|style| style.border_1().border_color(p.accent))
         .flex_1()
         .min_w_0()
-        .h(px(24.))
+        .h(px(28.))
         .px(px(8.))
         .rounded(px(6.))
         .flex()
         .items_center()
         .gap(px(5.))
         .cursor_pointer()
-        .bg(white(if selected { 0.09 } else { 0. }))
+        .bg(if selected { p.raised } else { white(0.) })
         .hover(|style| style.bg(white(0.06)))
         .child(div().flex_1().min_w_0().truncate().child(ui::label(
             label,
@@ -709,8 +733,22 @@ fn nav_row(
         .items_center()
         .gap(px(11.))
         .cursor_pointer()
-        .hover(|style| style.bg(white(0.05)))
-        .child(ui::icon(icon, 16., p.text_muted))
+        .hover(move |style| {
+            style.bg(if id == "new-agent" {
+                p.accent.opacity(0.18)
+            } else {
+                white(0.05)
+            })
+        })
+        .child(ui::icon(
+            icon,
+            16.,
+            if id == "new-agent" {
+                p.accent
+            } else {
+                p.text_muted
+            },
+        ))
         .child(
             div()
                 .flex_1()
@@ -742,6 +780,8 @@ fn session_row(app: &FlintApp, ix: usize, cx: &mut Context<FlintApp>) -> AnyElem
         Status::Running => ui::spinner(now, 13., p.accent).into_any_element(),
         Status::Starting => ui::spinner(now, 13., p.text_subtle).into_any_element(),
         Status::NeedsApproval => ui::icon(IconName::ShieldAlert, 13., p.warning).into_any_element(),
+        Status::NeedsReview => ui::icon(IconName::CircleAlert, 13., p.warning).into_any_element(),
+        Status::Blocked => ui::icon(IconName::CircleStop, 13., p.warning).into_any_element(),
         Status::Failed { seen } => ui::icon(
             IconName::CircleX,
             13.,
@@ -786,7 +826,11 @@ fn session_row(app: &FlintApp, ix: usize, cx: &mut Context<FlintApp>) -> AnyElem
     let emphasized = active
         || matches!(
             status,
-            Status::Unread | Status::NeedsApproval | Status::Failed { seen: false }
+            Status::Unread
+                | Status::NeedsApproval
+                | Status::NeedsReview
+                | Status::Blocked
+                | Status::Failed { seen: false }
         );
     // A running session shows how long its turn has taken; others, when
     // they were last active.
@@ -834,10 +878,7 @@ fn session_row(app: &FlintApp, ix: usize, cx: &mut Context<FlintApp>) -> AnyElem
             .min_w_0()
             .truncate()
             .text_size(px(size::BASE))
-            .text_color(ui::tinted(
-                if emphasized { p.text } else { p.text_muted },
-                session.color_seed(),
-            ))
+            .text_color(if emphasized { p.text } else { p.text_muted })
             .when(
                 matches!(status, Status::Unread | Status::Failed { seen: false }),
                 |t| t.font_weight(FontWeight::MEDIUM),
@@ -855,12 +896,16 @@ fn session_row(app: &FlintApp, ix: usize, cx: &mut Context<FlintApp>) -> AnyElem
         .focus_visible(|style| style.border_2().border_color(p.accent))
         .mx(px(8.))
         .px(px(12.))
-        .py(px(9.))
-        .rounded(px(9.))
+        .py(px(12.))
+        .rounded(px(11.))
         .flex()
         .gap(px(11.))
         .cursor_pointer()
-        .when(active, |row| row.bg(white(0.075)))
+        .when(active, |row| {
+            row.bg(p.accent_soft)
+                .border_1()
+                .border_color(p.accent.opacity(0.16))
+        })
         .when(!active, |row| row.hover(|style| style.bg(white(0.04))))
         .on_click(cx.listener(move |this, _, window, cx| {
             if !is_renaming {

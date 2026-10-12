@@ -110,11 +110,12 @@ pub fn duration(d: Duration) -> String {
     }
 }
 
-/// `now`, `5m`, `2h`, `3d` since `elapsed`.
+/// `5m`, `2h`, `3d` since `elapsed`; empty when just now, so a list of
+/// fresh sessions does not repeat a noisy per-row timestamp.
 pub fn ago(elapsed: Duration) -> String {
     let secs = elapsed.as_secs();
     match secs {
-        0..=59 => "now".to_string(),
+        0..=59 => String::new(),
         60..=3_599 => format!("{}m", secs / 60),
         3_600..=86_399 => format!("{}h", secs / 3_600),
         _ => format!("{}d", secs / 86_400),

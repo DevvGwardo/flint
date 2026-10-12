@@ -21,7 +21,6 @@ use crate::app::FlintApp;
 use crate::theme::MONO_FONT;
 use crate::theme::palette;
 use crate::theme::size;
-use crate::transcript::COLUMN_WIDTH;
 use crate::turns::Activity;
 use crate::ui;
 
@@ -34,6 +33,7 @@ pub fn render(app: &FlintApp, window: &Window, cx: &mut Context<FlintApp>) -> An
     let panel_height = app.popover_room.area_height().unwrap_or(height);
     let card_height = (panel_height * 0.55).max(140.);
     let view = &app.session().view;
+    let welcome = view.items.is_empty();
     let running = view.running;
     let busy = app.prompt_busy(app.active);
     let queued = !app.session().prompt_queue.items.is_empty();
@@ -41,13 +41,7 @@ pub fn render(app: &FlintApp, window: &Window, cx: &mut Context<FlintApp>) -> An
     let has_prompt = crate::app_input::composer_has_text(app.composer.read(cx))
         || !app.image_attachments.is_empty();
     let compact = panel_height < 600.;
-    let panel_width = app
-        .popover_room
-        .area
-        .get()
-        .map_or(f32::from(window.viewport_size().width), |area| {
-            f32::from(area.size.width)
-        });
+    let panel_width = app.chat_width(f32::from(window.viewport_size().width));
     let narrow = panel_width < 480.;
     let now = app.now();
     let (task_count, tasks) = view.running_command_projection();
@@ -252,7 +246,7 @@ pub fn render(app: &FlintApp, window: &Window, cx: &mut Context<FlintApp>) -> An
     let mode_text = if session.native_allow_all {
         "native · approving similar calls"
     } else if session.agent != AgentKind::Flint {
-        "Flint default for new native sessions"
+        "Hooter default for new native sessions"
     } else {
         mode_text
     };
@@ -268,7 +262,7 @@ pub fn render(app: &FlintApp, window: &Window, cx: &mut Context<FlintApp>) -> An
     };
     let send: AnyElement = Button::new("send")
         .primary()
-        .h(px(36.))
+        .h(px(if welcome && !compact { 40. } else { 36. }))
         .rounded(px(10.))
         .label(send_label)
         .accessibility_label(if queueing {
@@ -295,8 +289,8 @@ pub fn render(app: &FlintApp, window: &Window, cx: &mut Context<FlintApp>) -> An
         .id("composer-toolbar")
         .min_h(px(52.))
         .flex_shrink_0()
-        .pl(px(10.))
-        .pr(px(10.))
+        .pl(px(if welcome && !compact { 16. } else { 10. }))
+        .pr(px(if welcome && !compact { 16. } else { 10. }))
         .py(px(8.))
         .flex()
         .items_center()
@@ -427,10 +421,55 @@ pub fn render(app: &FlintApp, window: &Window, cx: &mut Context<FlintApp>) -> An
                         .on_click(cx.listener(|this, _, _, cx| this.cycle_effort(cx)))
                         .child(ui::icon(IconName::Brain, 14., p.text_subtle))
                         .child(ui::label(effort_label, size::BASE - 1., p.text_subtle))
+                        .child(ui::icon(IconName::ChevronDown, 12., p.text_subtle))
                         .test_support(),
                 )
             },
         )
+        .when(app.session().agent == AgentKind::Flint, |bar| {
+            let enabled = app.settings.jev_judge;
+            let key_set = crate::settings::jev_key_set(&app.key_sources);
+            let color = if enabled && key_set {
+                p.accent
+            } else {
+                p.text_subtle
+            };
+            let status = if !enabled {
+                "Off: the harness uses its own heuristics."
+            } else if key_set {
+                "On: a TypeSafe credential is available."
+            } else {
+                "On, waiting for TYPESAFE_API_KEY or $FLINT_HOME/keys/typesafe.key."
+            };
+            bar.child(
+                chip("jev-toggle")
+                    .role(Role::Switch)
+                    .aria_label(format!("JEV judge. Applies on the next native turn. {status}"))
+                    .aria_toggled(if enabled {
+                        Toggled::True
+                    } else {
+                        Toggled::False
+                    })
+                    .on_click(cx.listener(|this, _, _, cx| this.toggle_jev_judge(cx)))
+                    .tooltip(move |window, cx| {
+                        gpui_kit::component::tooltip::Tooltip::new(format!(
+                            "{status} Changes apply on the next turn in native sessions, including existing engines. Edit permissions and completion checks stay active; external agents use their own guardrails."
+                        ))
+                        .build(window, cx)
+                    })
+                    .child(ui::icon(IconName::CircleCheck, 14., color))
+                    .child(ui::label(
+                        if enabled {
+                            "JEV: On"
+                        } else {
+                            "JEV: Off"
+                        },
+                        size::SM,
+                        color,
+                    ))
+                    .test_support(),
+            )
+        })
         // When the agent has its own modes, its mode chip replaces auto-run.
         .when(app.session().agent == AgentKind::Flint, |bar| {
             bar.child(
@@ -457,7 +496,7 @@ pub fn render(app: &FlintApp, window: &Window, cx: &mut Context<FlintApp>) -> An
         .max_h(px(card_height))
         .flex()
         .flex_col()
-        .rounded(px(16.))
+        .rounded(px(if welcome { 20. } else { 16. }))
         .border_1()
         .border_color(if app.composer.focus_handle(cx).is_focused(window) {
             p.accent.opacity(0.55)
@@ -465,13 +504,13 @@ pub fn render(app: &FlintApp, window: &Window, cx: &mut Context<FlintApp>) -> An
             p.border_strong
         })
         .bg(p.surface)
-        .shadow_sm()
+        .shadow_md()
         .overflow_hidden()
         .child(
             div()
                 .id("composer-body")
                 .test_support()
-                .min_h(px(44.))
+                .min_h(px(if welcome && !compact { 64. } else { 44. }))
                 .overflow_y_scroll()
                 .children(tray)
                 .children(chips)
@@ -485,10 +524,10 @@ pub fn render(app: &FlintApp, window: &Window, cx: &mut Context<FlintApp>) -> An
                 }))
                 .child(
                     div()
-                        .px(px(14.))
-                        .pt(px(12.))
+                        .px(px(if welcome && !compact { 20. } else { 14. }))
+                        .pt(px(if welcome && !compact { 18. } else { 12. }))
                         .min_h(px(44.))
-                        .when(!compact, |body| {
+                        .when(!compact && !welcome, |body| {
                             body.child(
                                 div()
                                     .id("composer-heading")
@@ -514,7 +553,7 @@ pub fn render(app: &FlintApp, window: &Window, cx: &mut Context<FlintApp>) -> An
                             Textarea::new(&app.composer)
                                 .appearance(false)
                                 .bordered(false)
-                                .text_size(px(size::MD)),
+                                .text_size(px(if welcome && !compact { 18. } else { size::MD })),
                         ),
                 ),
         )
@@ -527,7 +566,6 @@ pub fn render(app: &FlintApp, window: &Window, cx: &mut Context<FlintApp>) -> An
     // suggestions), elsewhere above it. Either way they take the side and
     // height the chat panel has room for (see `popover::place`): they are
     // deferred, so nothing clips them if they are taller than that.
-    let welcome = app.session().view.items.is_empty();
     let placement = app.popover_room.placement(welcome, height);
     let below = placement.below;
     let popover_height = placement.max_height;
@@ -582,11 +620,22 @@ pub fn render(app: &FlintApp, window: &Window, cx: &mut Context<FlintApp>) -> An
         });
 
     div()
+        .id("chat-composer-column")
         .w_full()
-        .max_w(px(COLUMN_WIDTH + 40.))
+        .min_w_0()
+        .when(welcome, |col| {
+            col.max_w(px(crate::transcript::WELCOME_WIDTH))
+        })
+        .when_some(
+            (!welcome)
+                .then(|| app.settings.transcript_width.maximum())
+                .flatten(),
+            |col, max| col.max_w(px(max)),
+        )
         .flex()
         .flex_col()
         .gap(px(10.))
+        .test_support()
         .when(app.session().agent_starting(), |col| {
             col.child(starting_line(app))
         })

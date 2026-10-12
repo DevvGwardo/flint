@@ -1,3 +1,24 @@
+#[test]
+fn host_task_contract_survives_compaction_with_its_requirements_intact() {
+    let contract = crate::task::TaskRecord::new(
+        1, "Decompile Gemini.\nRequired file: method-bodies.c\nAcceptance: Actual method bodies, not metadata.".into(), 0,
+    ).context();
+    let mut history = vec![
+        crate::provider::Message::System("system".into()),
+        crate::provider::Message::TaskContext(contract.clone()),
+    ];
+    for n in 0..6 {
+        history.push(crate::provider::Message::User(format!("request {n}")));
+        history.push(crate::provider::Message::Assistant {
+            content: "large answer".repeat(1_000),
+            reasoning: String::new(),
+            tool_calls: Vec::new(),
+        });
+    }
+    let tracker = crate::context::ContextTracker::new(3_000, 0);
+    assert!(tracker.maybe_compact(&mut history).is_some());
+    assert!(history.contains(&crate::provider::Message::TaskContext(contract)));
+}
 use pretty_assertions::assert_eq;
 
 use super::*;

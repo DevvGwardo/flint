@@ -1,0 +1,25 @@
+(version 3)
+(deny default)
+(allow process-exec (literal (param "HELPER")))
+(allow file-read* file-test-existence (literal (param "HELPER")) (literal "/usr/lib/dyld")
+  (subpath "/usr/lib")
+  (subpath "/System/Library/dyld")
+  (subpath "/System/Volumes/Preboot/Cryptexes/OS/System/Library/dyld")
+  (subpath "/System/Volumes/Preboot/Cryptexes/OS/usr/lib")
+  (subpath "/System/Cryptexes/OS/System/Library/dyld")
+  (subpath "/System/Cryptexes/OS/usr/lib"))
+(allow file-map-executable (literal (param "HELPER")) (literal "/usr/lib/dyld")
+  (subpath "/usr/lib")
+  (subpath "/System/Library/dyld")
+  (subpath "/System/Volumes/Preboot/Cryptexes/OS/System/Library/dyld")
+  (subpath "/System/Volumes/Preboot/Cryptexes/OS/usr/lib")
+  (subpath "/System/Cryptexes/OS/System/Library/dyld")
+  (subpath "/System/Cryptexes/OS/usr/lib"))
+(allow file-read* file-write* file-test-existence (subpath (param "SCRATCH")))
+@@ANCESTOR_METADATA@@
+(allow syscall-unix
+  (syscall-number SYS_open SYS_openat SYS_fstatat SYS_fstatat64 SYS_dup
+    SYS_getfsstat SYS_getfsstat64 SYS___mac_syscall SYS_map_with_linking_np))
+(allow system-fcntl (fcntl-command F_GETPATH F_ADDFILESIGS_RETURN F_CHECK_LV))
+(allow system-mac-syscall
+  (require-all (mac-policy-name "Sandbox") (mac-syscall-number 2)))

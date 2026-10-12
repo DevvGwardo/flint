@@ -4,8 +4,8 @@ use std::io::Read as _;
 use std::path::{Path, PathBuf};
 
 use gpui_kit::assets::IconName;
+use gpui_kit::base::TextView;
 use gpui_kit::component::button::*;
-use gpui_kit::component::text::TextView;
 use gpui_kit::*;
 
 use crate::app::FlintApp;
@@ -38,13 +38,41 @@ fn link_target(link: &str, base: &Path) -> LinkTarget {
     if link.is_empty() || link.starts_with('#') || link.starts_with("//") {
         return LinkTarget::Ignore;
     }
+    #[cfg(windows)]
+    if link.starts_with(r"\\") {
+        // Refuse remote shares and device/extended namespaces, including
+        // extended UNC paths that could silently trigger SMB authentication.
+        return LinkTarget::Ignore;
+    }
+    #[cfg(windows)]
+    if Path::new(link).is_absolute() {
+        let mut path = link;
+        for _ in 0..2 {
+            if let Some((prefix, suffix)) = path.rsplit_once(':')
+                && !suffix.is_empty()
+                && suffix.bytes().all(|byte| byte.is_ascii_digit())
+            {
+                path = prefix;
+            }
+        }
+        return local_file_target(path.into());
+    }
     if let Ok(url) = reqwest::Url::parse(link) {
+        if crate::reply_resources::has_embedded_credentials(&url) {
+            return LinkTarget::Ignore;
+        }
         match url.scheme() {
             "http" | "https" | "mailto" => return LinkTarget::Web(link.to_string()),
             "file" => {
+                if url
+                    .host_str()
+                    .is_some_and(|host| !host.eq_ignore_ascii_case("localhost"))
+                {
+                    return LinkTarget::Ignore;
+                }
                 return url
                     .to_file_path()
-                    .map(LinkTarget::File)
+                    .map(local_file_target)
                     .unwrap_or(LinkTarget::Ignore);
             }
             _ if !link.contains("://")
@@ -70,12 +98,31 @@ fn link_target(link: &str, base: &Path) -> LinkTarget {
     } else {
         std::env::current_dir().unwrap_or_default().join(base)
     };
+    #[cfg(windows)]
+    let normalized = path.replace('\\', "/");
+    #[cfg(windows)]
+    let path = normalized.as_str();
     reqwest::Url::from_directory_path(base)
         .ok()
         .and_then(|url| url.join(path).ok())
         .and_then(|url| url.to_file_path().ok())
-        .map(LinkTarget::File)
+        .map(local_file_target)
         .unwrap_or(LinkTarget::Ignore)
+}
+
+fn local_file_target(path: PathBuf) -> LinkTarget {
+    #[cfg(windows)]
+    {
+        use std::path::{Component, Prefix};
+        if path.components().any(|component| match component {
+            Component::Prefix(prefix) => !matches!(prefix.kind(), Prefix::Disk(_)),
+            Component::Normal(name) => name.to_string_lossy().contains(':'),
+            _ => false,
+        }) {
+            return LinkTarget::Ignore;
+        }
+    }
+    LinkTarget::File(path)
 }
 
 /// The base belongs to the rendered session (or document), not the active pane.
@@ -86,7 +133,8 @@ pub fn markdown(
     cx: &mut Context<FlintApp>,
 ) -> TextView {
     let app = cx.weak_entity();
-    TextView::markdown(id, text)
+    crate::reply_resources::chat_policy()
+        .apply(TextView::markdown(id, text))
         .selectable(true)
         .on_link_click(move |link, _, _, cx| {
             app.update(cx, |app, cx| app.open_link(link, &base, cx))

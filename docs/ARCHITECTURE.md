@@ -24,6 +24,11 @@ names, using GPUI's existing native click handlers.
 See [the current gap-closure ledger](GAP-CLOSURE-20261003.md) for exact caps,
 validation, filesystem race limits and native accessibility limitations.
 
+The [overnight analysis and blueprint oversight](OVERNIGHT-ANALYSIS.md) tracks
+current performance/orchestration leads separately from completed improvements.
+Its [frozen validation contract](OVERNIGHT-CONTRACT.md) requires isolated
+experiments, retained evidence and human review before promotion.
+
 ---
 
 ## 1. System Overview
@@ -592,7 +597,7 @@ flowchart TD
 
 Turn-by-turn verification provides granular code inspection before changes hit git:
 - **Turn Diff Cards:** Embedded cards in chat transcript displaying modified files with net additions (+) and deletions (-).
-- **Changes Panel:** Full-window side-by-side or unified diff viewing toggled with <kbd>⌘</kbd> <kbd>J</kbd>.
+- **Changes Panel:** Virtualized unified diff viewing toggled with <kbd>⌘</kbd> <kbd>J</kbd>, with file switching, line numbering and document-wide selection.
 - **Git State Mirroring:** Detects untracked vs modified workspace files in real time.
 
 <p align="center">
@@ -632,8 +637,8 @@ flowchart LR
     Capture --> Card["Turn Card: Files Changed (+ / -)"]
     Card --> Inspector["Changes Panel Inspector (cmd-j)"]
     Inspector --> Review{"Developer Review"}
-    Review -->|Accept| Commit["Stage in Workspace Git"]
-    Review -->|Revert / Deny| Undo["Revert File Changes"]
+    Review -->|Inspect| Commit["No Automatic Git Staging or Commit"]
+    Review -->|Request Native Undo| Undo["Restore Eligible Tool Edits"]
 
     class Edit,Capture,Review ember;
     class Card,Inspector cyan;
@@ -646,7 +651,7 @@ flowchart LR
 ## 9. Session Persistence & Context Window Budgeting
 
 Flint balances long-running multi-turn memory against model context constraints:
-- **Disk Persistence:** Every session is saved as an atomic JSON document in `~/.flint/sessions/<session_id>.json`.
+- **Disk Persistence:** Saved sessions use `~/.flint/sessions/<session_id>/`: atomic `meta.json`, an ordered append-only `events.jsonl` transcript, and the native engine's atomic `history.json` snapshot. ACP engine history remains owned by the external agent. Successful write barriers are not a demonstrated power-loss durability guarantee.
 - **Token Budgeting:** Dynamically reserves space for system prompt + tool schemas + response headroom.
 - **Compacted Trimming:** Older turns are pruned into structured summaries when context limits are approached, preventing abrupt context window errors.
 - **Sidebar Grouping:** Active sessions can be grouped by Project, Status, or Agent Type (<kbd>⌘</kbd> <kbd>⇧</kbd> <kbd>G</kbd>).

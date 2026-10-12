@@ -25,6 +25,78 @@ fn start(view: &mut SessionView, call: &str, child: &str, message: &str) {
     }
 }
 
+#[test]
+fn worktree_subagent_paths_and_diffs_do_not_use_the_parent_workspace() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut session = Session::new(1, temp.path().join("parent"));
+    session.dir = Some(temp.path().join("saved"));
+    session
+        .view
+        .fold(AgentEvent::TurnStarted { turn_id: 1 }, Duration::ZERO);
+    start(
+        &mut session.view,
+        "delegate",
+        "agent-1",
+        "Create result.txt.",
+    );
+    let workspace = temp.path().join("checkout");
+    session.view.fold(
+        AgentEvent::SubagentWorkspace {
+            session_id: "agent-1".into(),
+            workspace: workspace.clone(),
+        },
+        Duration::ZERO,
+    );
+    child(
+        &mut session.view,
+        "delegate",
+        AgentEvent::ToolCallStarted {
+            call_id: "agent-1:check".into(),
+            name: "run_command".into(),
+            kind: ToolKind::Command,
+            summary: "test -f result.txt".into(),
+            args: json!({"command":"test -f result.txt"}),
+        },
+    );
+    let preview = session
+        .view
+        .approval_preview("agent-1:check", &session.workspace, true);
+    assert!(
+        preview
+            .fields
+            .contains(&("Working directory", workspace.display().to_string()))
+    );
+    let diff = flint_agent::FileDiff {
+        path: "result.txt".into(),
+        unified: "+child output\n".into(),
+        added: 1,
+        removed: 0,
+        created: true,
+    };
+    let event = AgentEvent::SubagentEvent {
+        call_id: "delegate".into(),
+        event: Box::new(AgentEvent::ToolCallFinished {
+            call_id: "agent-1:check".into(),
+            output: "ok".into(),
+            success: true,
+            exit_code: Some(0),
+            diff: Some(diff),
+            duration_ms: 1,
+        }),
+    };
+    session.record_event_edit(&event);
+    session.view.fold(event, Duration::ZERO);
+    assert!(session.view.changes.is_empty());
+    assert!(session.changes_snapshot().is_none());
+    assert_eq!(
+        session.view.subagent("agent-1").unwrap().view.changes.len(),
+        1
+    );
+    session.save_meta().unwrap();
+    let meta = crate::store::load(session.dir.as_ref().unwrap()).unwrap().0;
+    assert_eq!(meta.subagent_workspaces, vec![workspace]);
+}
+
 fn child(view: &mut SessionView, call: &str, event: AgentEvent) {
     view.fold(
         AgentEvent::SubagentEvent {

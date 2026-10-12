@@ -101,22 +101,7 @@ pub fn create(cwd: &Path, home: &Path, branch: &str, base: &str) -> Result<Workt
         ],
     )?;
     let commit = std::str::from_utf8(&commit)?.trim();
-    let common = git(
-        cwd,
-        ["rev-parse", "--path-format=absolute", "--git-common-dir"],
-    )?;
-    let common = path_from_bytes(common.strip_suffix(b"\n").unwrap_or(&common))?;
-    let common = common.canonicalize()?;
-    let repo = common.parent().unwrap_or(&common);
-    let name = repo.file_name().unwrap_or_else(|| OsStr::new("repository"));
-    let root = home.join("worktrees").join(format!(
-        "{}-{:016x}",
-        slug(&name.to_string_lossy()),
-        hash(common.as_os_str().as_encoded_bytes())
-    ));
-    std::fs::create_dir_all(&root)?;
-    let root = root.canonicalize()?;
-    let path = root.join(format!("{}-{:016x}", slug(branch), hash(branch.as_bytes())));
+    let path = checkout_path(cwd, home, branch)?;
     git(
         cwd,
         [
@@ -132,6 +117,25 @@ pub fn create(cwd: &Path, home: &Path, branch: &str, base: &str) -> Result<Workt
     let mut tree = Worktree::new(path, false);
     tree.branch = Some(branch.to_string());
     Ok(tree)
+}
+
+pub(super) fn checkout_path(cwd: &Path, home: &Path, branch: &str) -> Result<PathBuf> {
+    let common = git(
+        cwd,
+        ["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    )?;
+    let common = path_from_bytes(common.strip_suffix(b"\n").unwrap_or(&common))?;
+    let common = common.canonicalize()?;
+    let repo = common.parent().unwrap_or(&common);
+    let name = repo.file_name().unwrap_or_else(|| OsStr::new("repository"));
+    let root = home.join("worktrees").join(format!(
+        "{}-{:016x}",
+        slug(&name.to_string_lossy()),
+        hash(common.as_os_str().as_encoded_bytes())
+    ));
+    std::fs::create_dir_all(&root)?;
+    let root = root.canonicalize()?;
+    Ok(root.join(format!("{}-{:016x}", slug(branch), hash(branch.as_bytes()))))
 }
 
 /// Git refuses dirty and locked checkouts. Keep the branch and its commits.
@@ -232,14 +236,20 @@ fn hash(bytes: &[u8]) -> u64 {
 
 /// Run off the UI thread. File-backed pipes avoid deadlocks on large output.
 /// Bound both output and wall time, disable prompts, and preserve user config.
-fn git(cwd: &Path, args: impl IntoIterator<Item = impl AsRef<OsStr>>) -> Result<Vec<u8>> {
+pub(super) fn git(
+    cwd: &Path,
+    args: impl IntoIterator<Item = impl AsRef<OsStr>>,
+) -> Result<Vec<u8>> {
     let mut stdout = tempfile::tempfile()?;
     let mut stderr = tempfile::tempfile()?;
     let mut command = Command::new("git");
     command
         .current_dir(cwd)
+        .args(["-c", "credential.interactive=false", "-c", "core.askPass="])
         .args(args)
         .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GCM_INTERACTIVE", "Never")
+        .env("SSH_ASKPASS_REQUIRE", "never")
         .stdin(Stdio::null())
         .stdout(stdout.try_clone()?)
         .stderr(stderr.try_clone()?);
@@ -274,7 +284,7 @@ fn git(cwd: &Path, args: impl IntoIterator<Item = impl AsRef<OsStr>>) -> Result<
         bail!("Git: {}", String::from_utf8_lossy(&message).trim());
     }
     if stdout.metadata()?.len() > 2 * 1024 * 1024 {
-        bail!("Git output exceeded the worktree list limit.");
+        bail!("Git output exceeded the repository list limit.");
     }
     stdout.rewind()?;
     let mut bytes = Vec::new();
@@ -284,4 +294,4 @@ fn git(cwd: &Path, args: impl IntoIterator<Item = impl AsRef<OsStr>>) -> Result<
 
 #[cfg(test)]
 #[path = "worktrees_tests.rs"]
-mod tests;
+pub(crate) mod tests;

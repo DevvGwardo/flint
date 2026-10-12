@@ -82,7 +82,7 @@ pub enum TermEvent {
 #[derive(Debug, Clone)]
 pub struct SpawnConfig {
     pub cwd: PathBuf,
-    /// Program and arguments; `None` runs `$SHELL -l` (or `/bin/zsh -l`).
+    /// Program and arguments; `None` runs the platform's interactive shell.
     pub command: Option<(String, Vec<String>)>,
     pub env: Vec<(String, String)>,
     pub size: Size,
@@ -186,13 +186,21 @@ pub struct Terminal {
 impl Terminal {
     /// Starts a shell in a PTY.
     pub fn spawn(config: SpawnConfig) -> anyhow::Result<Self> {
-        let (program, args) = config.command.unwrap_or_else(|| {
-            let shell = std::env::var("SHELL")
-                .ok()
-                .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| "/bin/zsh".to_string());
-            (shell, vec!["-l".to_string()])
-        });
+        let (program, args) = config
+            .command
+            .unwrap_or_else(flint_platform::interactive_shell);
+        #[cfg(windows)]
+        let (program, escape_args) = {
+            // Alacritty passes the program verbatim to CreateProcessW. Quote
+            // the executable itself as well as its arguments for custom shells
+            // installed beneath Program Files.
+            let cmd = std::path::Path::new(&program)
+                .file_name()
+                .is_some_and(|name| {
+                    name.eq_ignore_ascii_case("cmd.exe") || name.eq_ignore_ascii_case("cmd")
+                });
+            (format!("\"{program}\""), !cmd)
+        };
         let mut env: std::collections::HashMap<String, String> = config.env.into_iter().collect();
         env.entry("TERM".into())
             .or_insert_with(|| "xterm-256color".into());
@@ -207,6 +215,8 @@ impl Terminal {
             working_directory: Some(config.cwd),
             drain_on_exit: true,
             env,
+            #[cfg(windows)]
+            escape_args,
             ..tty::Options::default()
         };
         let pty = tty::new(&options, config.size.window(), 0)?;

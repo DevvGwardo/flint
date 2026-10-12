@@ -40,7 +40,7 @@ impl FlintApp {
             }
         };
         if let Some((meta, records)) = store::load(&restored) {
-            self.restore_session(restored, meta, records);
+            self.restore_session(restored, meta, records, cx);
         } else {
             self.store_error = Some(
                 "Archive history was restored on disk, but its details couldn't be loaded.".into(),
@@ -58,7 +58,7 @@ impl FlintApp {
         cx.notify();
     }
     /// Lists every saved session (most recent first) with its transcript.
-    pub(crate) fn restore_sessions(&mut self, _cx: &mut Context<Self>) {
+    pub(crate) fn restore_sessions(&mut self, cx: &mut Context<Self>) {
         for (dir, meta, records) in store::load_all(&self.home) {
             if self
                 .sessions
@@ -67,7 +67,7 @@ impl FlintApp {
             {
                 continue;
             }
-            self.restore_session(dir, meta, records);
+            self.restore_session(dir, meta, records, cx);
         }
     }
 
@@ -76,6 +76,7 @@ impl FlintApp {
         dir: std::path::PathBuf,
         meta: store::Meta,
         records: Vec<Logged>,
+        cx: &mut Context<Self>,
     ) {
         let mut session = self.new_session_value(meta.workspace.clone());
         session.dir = Some(dir);
@@ -87,9 +88,12 @@ impl FlintApp {
             let change = match record {
                 Logged::User(text) => session.view.push_user(text),
                 Logged::Event(event) => {
-                    if let AgentEvent::SessionStopped {
-                        history_saved: false,
-                    } = &event
+                    if let AgentEvent::SessionStopped { history_saved } = &event {
+                        session.history_save_failed = !history_saved;
+                    }
+                    if matches!(&event, AgentEvent::Error(message)
+                        if message.starts_with("Couldn't save engine history.")
+                            || message.starts_with("Session panicked"))
                     {
                         session.history_save_failed = true;
                     }
@@ -99,6 +103,9 @@ impl FlintApp {
                     }
                     session.record_event_edit(&event);
                     session.view.fold(event, clock)
+                }
+                Logged::TaskReviewed(review) => {
+                    session.view.review_local_task(&review).unwrap_or_default()
                 }
             };
             session.apply(change);
@@ -127,7 +134,81 @@ impl FlintApp {
                 session.prompt_queue.error = Some(error);
             }
         }
+        let native = session.agent == flint_agent::AgentKind::Flint;
+        let uid = session.uid;
+        if native {
+            session.task_update_pending = Some(crate::session::TaskWrite::Restore);
+        }
         self.sessions.push(session);
+        if native {
+            self.restore_native_task(uid, cx);
+        }
+    }
+
+    fn restore_native_task(&mut self, uid: u64, cx: &mut Context<Self>) {
+        let Some(ix) = self.session_index(uid) else {
+            return;
+        };
+        let Some(dir) = self.sessions[ix].dir.clone() else {
+            return;
+        };
+        let expected_turn = self.sessions[ix].view.turn_id;
+        let read = cx
+            .background_executor()
+            .spawn(async move { flint_agent::saved_task_projection(&dir) });
+        cx.spawn(async move |this,cx| {
+            let result=read.await;
+            this.update(cx,|app,cx| {
+                let Some(ix)=app.session_index(uid) else { return; };
+                let session=&mut app.sessions[ix];
+                if session.task_update_pending!=Some(crate::session::TaskWrite::Restore) { return; }
+                session.task_update_pending=None;
+                // Never apply a delayed restore over a different live turn.
+                if session.view.turn_id!=expected_turn { cx.notify();return; }
+                let clock=session.view.last_turn_duration.unwrap_or_default();
+                match result {
+                    Ok(Some(saved)) if saved.turn_id<session.view.turn_id => {
+                        session.history_save_failed=true;
+                        session.native_history_conflict=true;
+                        let change=session.view.fold(AgentEvent::Error("Saved native history is behind the displayed turn. Existing files have been kept; restore matching native history or start a new session before continuing.".into()),clock);
+                        session.apply(change);
+                    }
+                    Ok(Some(flint_agent::SavedTaskProjection { turn_id,task:Some(task) })) => {
+                        if turn_id>session.view.turn_id {
+                            let reason=task.assessment.as_ref().map_or(TurnEndReason::Interrupted,|assessment|assessment.reason.clone());
+                            for event in [
+                                AgentEvent::TurnStarted { turn_id },
+                                AgentEvent::Error("Native task details were restored from history. Some transcript events are unavailable; no answer text has been reconstructed.".into()),
+                                AgentEvent::TaskUpdated { turn_id,task:Box::new(task) },
+                                AgentEvent::TurnFinished { turn_id,reason },
+                            ] {
+                                let change=session.view.fold(event,clock);
+                                session.apply(change);
+                            }
+                        } else {
+                            let change=session.view.fold(AgentEvent::TaskUpdated { turn_id,task:Box::new(task) },clock);
+                            session.apply(change);
+                        }
+                    }
+                    Ok(None) if session.view.turn_id>0 => {
+                        session.history_save_failed=true;
+                        session.native_history_conflict=true;
+                        let change=session.view.fold(AgentEvent::Error("Saved native history is unavailable for the displayed conversation. Existing transcript data has been kept; restore native history or start a new session before continuing.".into()),clock);
+                        session.apply(change);
+                    }
+                    Err(_) => {
+                        session.history_save_failed=true;
+                        if session.view.turn_id>0 { session.native_history_conflict=true; }
+                        let change=session.view.fold(AgentEvent::Error("Couldn't read saved native task history. Existing history has been kept; repair storage before reviewing or continuing this task.".into()),clock);
+                        session.apply(change);
+                    }
+                    _ => {}
+                }
+                app.task_panel_updated(cx);
+                // Reload never auto-resumes a persisted queue.
+                cx.notify();
+            }).ok();
+        }).detach();
     }
 
     /// Shows an inline title editor for a session.
@@ -228,6 +309,14 @@ impl FlintApp {
         if ix >= self.sessions.len() {
             return;
         }
+        if self.sessions[ix].task_update_pending.is_some() {
+            self.store_error = Some(
+                "Wait for the task review or scope revision to finish saving before archiving."
+                    .into(),
+            );
+            cx.notify();
+            return;
+        }
         let uid = self.sessions[ix].uid;
         if self.sessions[ix].view.running
             && !self.sessions[ix].stopping
@@ -306,6 +395,7 @@ impl FlintApp {
             self.focus_session_pane(next, true, window, cx);
         }
         let session = self.sessions.remove(ix);
+        self.chat_content.borrow_mut().retire_owner(session.uid);
         // Its commands' read-only terminal tabs go with it.
         self.close_agent_terminals(session.uid, cx);
         self.archived_session = Some((session, ix));

@@ -8,6 +8,124 @@ use super::key_with_typesafe_fallback;
 use flint_agent::ApprovalMode;
 
 #[test]
+fn displayed_key_status_is_cached_but_agent_credentials_stay_fresh() {
+    use std::time::{Duration, Instant};
+    let temp = tempfile::tempdir().unwrap();
+    let key = temp.path().join("credential");
+    std::fs::write(&key, "fixture-key").unwrap();
+    let settings = Settings::default();
+    let sources = KeySources::none();
+    let mut cache = super::KeyStatusCache::default();
+    let now = Instant::now();
+    assert!(matches!(
+        cache.get(&settings, Some(&key), &sources, now),
+        KeyStatus::Found(_)
+    ));
+    std::fs::write(&key, "").unwrap();
+    assert!(matches!(
+        cache.get(
+            &settings,
+            Some(&key),
+            &sources,
+            now + Duration::from_secs(1)
+        ),
+        KeyStatus::Found(_)
+    ));
+    assert!(
+        settings.resolve_key(Some(&key), &sources).is_none(),
+        "Execution must never use cached credentials"
+    );
+    assert!(matches!(
+        cache.get(
+            &settings,
+            Some(&key),
+            &sources,
+            now + Duration::from_secs(2)
+        ),
+        KeyStatus::Missing(_)
+    ));
+    std::fs::write(&key, "new-fixture-key").unwrap();
+    let settings = Settings {
+        api_key_file: key.to_string_lossy().into(),
+        ..settings
+    };
+    assert!(matches!(
+        cache.get(&settings, None, &sources, now + Duration::from_secs(2)),
+        KeyStatus::Found(_)
+    ));
+}
+
+#[test]
+fn displayed_key_status_invalidates_when_provider_or_key_sources_change() {
+    fn fixture_env(name: &str) -> Option<String> {
+        (name == "FIXTURE_KEY").then(|| "fixture-key".into())
+    }
+    let now = std::time::Instant::now();
+    let mut cache = super::KeyStatusCache::default();
+    let settings = Settings {
+        api_key_env: "FIXTURE_KEY".into(),
+        ..Settings::default()
+    };
+    let sources = KeySources {
+        env: fixture_env,
+        legacy_key_file: None,
+    };
+    assert_eq!(
+        cache.get(&settings, None, &sources, now),
+        KeyStatus::Found("$FIXTURE_KEY".into())
+    );
+    assert_eq!(
+        cache.get(&settings, None, &KeySources::none(), now),
+        KeyStatus::Missing("$FIXTURE_KEY".into())
+    );
+    let other = Settings {
+        api_key_env: "OTHER_KEY".into(),
+        base_url: "https://example.invalid/v1".into(),
+        ..settings
+    };
+    assert_eq!(
+        cache.get(&other, None, &sources, now),
+        KeyStatus::Missing("$OTHER_KEY".into())
+    );
+}
+
+#[test]
+fn transcript_width_local_fallback_preserves_other_settings() {
+    use super::TranscriptWidth;
+    for value in ["\"unknown\"", "42", "false", "[]", "{ invalid = true }"] {
+        let settings: Settings = toml::from_str(&format!(
+            "transcript_width = {value}\nmodel = \"kept-model\"\nbase_url = \"https://kept.example/v1\"\napproval = \"auto\"\ntheme = \"kept-theme\"\nsandbox = true\n"
+        )).unwrap();
+        assert_eq!(settings.transcript_width, TranscriptWidth::Readable);
+        assert_eq!(settings.model, "kept-model");
+        assert_eq!(settings.base_url, "https://kept.example/v1");
+        assert_eq!(settings.approval, "auto");
+        assert_eq!(settings.theme, "kept-theme");
+        assert!(settings.sandbox);
+    }
+    let old: Settings = toml::from_str("model = \"old\"").unwrap();
+    assert_eq!(old.transcript_width, TranscriptWidth::Readable);
+}
+
+#[test]
+fn all_transcript_widths_survive_settings_save_load() {
+    use super::TranscriptWidth;
+    let dir = tempfile::tempdir().unwrap();
+    for width in [
+        TranscriptWidth::Readable,
+        TranscriptWidth::Wide,
+        TranscriptWidth::Fill,
+    ] {
+        let settings = Settings {
+            transcript_width: width,
+            ..Settings::default()
+        };
+        settings.save(dir.path()).unwrap();
+        assert_eq!(Settings::load(dir.path(), &KeySources::none()), settings);
+    }
+}
+
+#[test]
 fn defaults_point_at_a_public_endpoint() {
     let settings = Settings::default();
     assert_eq!(settings.base_url, "https://api.openai.com/v1");
@@ -15,6 +133,25 @@ fn defaults_point_at_a_public_endpoint() {
     assert_eq!(settings.api_key_file, "");
     assert_eq!(settings.subagent_model, "");
     assert_eq!(settings.approval_mode(), ApprovalMode::AskForChanges);
+}
+
+#[test]
+fn queued_verification_policy_is_opt_in_and_preserves_permissions() {
+    assert!(!Settings::default().queue_after_verification);
+    let old: Settings = toml::from_str("approval = \"auto\"\nsandbox = false\n").unwrap();
+    assert!(!old.queue_after_verification);
+    let dir = tempfile::tempdir().unwrap();
+    for enabled in [true, false] {
+        let settings = Settings {
+            queue_after_verification: enabled,
+            ..old.clone()
+        };
+        settings.save(dir.path()).unwrap();
+        let loaded = Settings::load(dir.path(), &KeySources::none());
+        assert_eq!(loaded, settings);
+        assert_eq!(loaded.approval_mode(), ApprovalMode::Auto);
+        assert!(!loaded.sandbox);
+    }
 }
 
 #[test]
@@ -290,6 +427,62 @@ fn typesafe_judge_uses_injected_credentials_without_changing_the_model_key() {
     .expect("config");
     assert_eq!(config.api_key, "fixture-model-key");
     assert_eq!(config.jev.expect("judge").api_key, "fixture-judge-key");
+}
+
+#[test]
+fn the_jev_judge_defaults_on_and_missing_configs_keep_it_on() {
+    assert!(Settings::default().jev_judge);
+    // A config written before the toggle existed has no `jev_judge` key and
+    // must keep the judge enabled.
+    let old: Settings = toml::from_str("model = \"old\"\n").expect("parse");
+    assert!(old.jev_judge);
+    let dir = tempfile::tempdir().expect("tempdir");
+    Settings::default().save(dir.path()).expect("save");
+    let loaded = Settings::load(dir.path(), &KeySources::none());
+    assert!(loaded.jev_judge);
+}
+
+#[test]
+fn turning_off_the_jev_judge_drops_it_from_the_engine_config() {
+    let sources = KeySources {
+        env: |name| match name {
+            "OPENAI_API_KEY" => Some("fixture-model-key".into()),
+            "TYPESAFE_API_KEY" => Some("fixture-judge-key".into()),
+            _ => None,
+        },
+        ..KeySources::none()
+    };
+    let dir = tempfile::tempdir().expect("tempdir");
+    let settings = Settings {
+        jev_judge: false,
+        ..Settings::default()
+    };
+    let config =
+        crate::engine::config_for(dir.path(), &settings, None, &sources, ApprovalMode::Auto)
+            .expect("config");
+    assert!(
+        config.jev.is_none(),
+        "a disabled judge must not reach the engine even with a credential set"
+    );
+}
+
+#[test]
+fn enabling_jev_without_a_typesafe_key_keeps_the_heuristic_harness() {
+    let sources = KeySources {
+        env: |name| (name == "OPENAI_API_KEY").then(|| "fixture-model-key".into()),
+        ..KeySources::none()
+    };
+    let dir = tempfile::tempdir().expect("tempdir");
+    let config = crate::engine::config_for(
+        dir.path(),
+        &Settings::default(),
+        None,
+        &sources,
+        ApprovalMode::Auto,
+    )
+    .expect("config");
+    assert!(config.jev.is_none());
+    assert!(!jev_key_set(&sources));
 }
 
 #[test]

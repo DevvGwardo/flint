@@ -292,10 +292,17 @@ fn title_and_bell_floods_are_bounded_and_keep_the_latest_title_and_exit() {
 fn pty_runs_a_command_and_reports_its_exit_code() {
     let term = Terminal::spawn(SpawnConfig {
         cwd: std::env::temp_dir(),
-        command: Some((
-            "/bin/sh".into(),
-            vec!["-c".into(), "printf hi; exit 3".into()],
-        )),
+        command: Some(if cfg!(windows) {
+            (
+                "cmd.exe".into(),
+                vec!["/D".into(), "/C".into(), "echo hi& exit /b 3".into()],
+            )
+        } else {
+            (
+                "/bin/sh".into(),
+                vec!["-c".into(), "printf hi; exit 3".into()],
+            )
+        }),
         env: Vec::new(),
         size: size(20, 4),
     })
@@ -312,19 +319,32 @@ fn pty_runs_a_command_and_reports_its_exit_code() {
         }
     }
     assert_eq!(exit, Some(Some(3)));
-    assert_eq!(term.snapshot().text_lines()[0], "hi");
+    assert!(
+        term.snapshot()
+            .text_lines()
+            .iter()
+            .any(|line| line.trim() == "hi")
+    );
 }
 
 #[test]
 fn pty_echoes_typed_input() {
     let term = Terminal::spawn(SpawnConfig {
         cwd: std::env::temp_dir(),
-        command: Some(("/bin/sh".into(), Vec::new())),
+        command: Some(if cfg!(windows) {
+            ("cmd.exe".into(), vec!["/D".into()])
+        } else {
+            ("/bin/sh".into(), Vec::new())
+        }),
         env: vec![("PS1".into(), "$ ".into())],
         size: size(40, 6),
     })
     .expect("spawn");
-    term.write(b"echo hi-$((1+2))\r".to_vec());
+    term.write(if cfg!(windows) {
+        b"echo hi-3\r".to_vec()
+    } else {
+        b"echo hi-$((1+2))\r".to_vec()
+    });
     let deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < deadline {
         if term.snapshot().text_lines().iter().any(|l| l == "hi-3") {

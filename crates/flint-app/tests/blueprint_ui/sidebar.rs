@@ -104,13 +104,38 @@ fn sidebar_long_branch_preserves_readable_metadata(cx: &mut TestAppContext) {
 #[gpui_kit::test]
 fn sidebar_timestamp_does_not_take_space_from_the_title(cx: &mut TestAppContext) {
     let ui = open(cx);
+    ui.app.update(cx, |app, cx| {
+        // Fresh sessions intentionally omit timestamps; test an actual label.
+        app.sessions[0].touched =
+            std::time::SystemTime::now() - std::time::Duration::from_secs(120);
+        cx.notify();
+    });
     ui.with(cx, |window, cx| {
         window.render_frame(cx);
         let title = window.find(("sidebar-title", 0usize)).bounds();
         let when = window.find(("sidebar-when", 0usize)).bounds();
         let actions = window.find(("session-actions", 0usize)).bounds();
+        assert!(when.size.width > px(0.));
         assert!(when.top() >= title.bottom(), "{title:?} / {when:?}");
         assert!(title.right() > when.left());
+        assert!(title.right() <= actions.left());
+    });
+}
+
+#[gpui_kit::test]
+fn sidebar_fresh_empty_timestamp_does_not_reserve_title_space(cx: &mut TestAppContext) {
+    let ui = open(cx);
+    ui.app.update(cx, |app, cx| {
+        app.sessions[0].touched = std::time::SystemTime::now();
+        cx.notify();
+    });
+    ui.with(cx, |window, cx| {
+        window.render_frame(cx);
+        let title = window.find(("sidebar-title", 0usize)).bounds();
+        let when = window.find(("sidebar-when", 0usize)).bounds();
+        let actions = window.find(("session-actions", 0usize)).bounds();
+        assert_eq!(when.size.width, px(0.));
+        assert!(title.right() >= when.left());
         assert!(title.right() <= actions.left());
     });
 }

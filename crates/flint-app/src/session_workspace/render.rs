@@ -519,6 +519,7 @@ fn pane(uid: u64, app: &FlintApp, window: &mut Window, cx: &mut Context<FlintApp
         .track_focus(&state.focus)
         .capture_any_mouse_down(cx.listener(move |app, event: &MouseDownEvent, window, cx| {
             if matches!(event.button, MouseButton::Left | MouseButton::Right)
+                && !app.session_drawer
                 && app.session().uid != uid
             {
                 app.focus_session_pane(uid, false, window, cx);

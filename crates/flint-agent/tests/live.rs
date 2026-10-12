@@ -69,8 +69,11 @@ fn live_creates_and_tests_add_py() {
             }
             AgentEvent::SessionOptions(_)
             | AgentEvent::SessionStopped { .. }
+            | AgentEvent::JevVerdict { .. }
             | AgentEvent::FilesReverted { .. } => {}
-            AgentEvent::SubagentStarted { .. } | AgentEvent::SubagentEvent { .. } => {}
+            AgentEvent::SubagentStarted { .. }
+            | AgentEvent::SubagentWorkspace { .. }
+            | AgentEvent::SubagentEvent { .. } => {}
             AgentEvent::TerminalStarted { .. }
             | AgentEvent::TerminalOutput { .. }
             | AgentEvent::TerminalExited { .. } => {}
@@ -80,6 +83,8 @@ fn live_creates_and_tests_add_py() {
                 break;
             }
             AgentEvent::TurnStarted { .. }
+            | AgentEvent::TaskUpdated { .. }
+            | AgentEvent::TaskAssessed { .. }
             | AgentEvent::SteeringAccepted { .. }
             | AgentEvent::StepStarted { .. }
             | AgentEvent::ReasoningDelta(_)

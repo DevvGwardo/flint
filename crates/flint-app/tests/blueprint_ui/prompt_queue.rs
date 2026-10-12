@@ -49,6 +49,7 @@ fn prompt_queue_waits_for_turns_and_keeps_fifo_before_turn_started(cx: &mut Test
         1
     );
     engine.send(cx, AgentEvent::TurnStarted { turn_id: 1 });
+    engine.send(cx, accepted_task(1));
     engine.send(
         cx,
         AgentEvent::TurnFinished {
@@ -68,6 +69,7 @@ fn prompt_queue_waits_for_turns_and_keeps_fifo_before_turn_started(cx: &mut Test
     );
     assert!(engine.sent().is_empty());
     engine.send(cx, AgentEvent::TurnStarted { turn_id: 2 });
+    engine.send(cx, accepted_task(2));
     engine.send(
         cx,
         AgentEvent::TurnFinished {
@@ -103,6 +105,7 @@ fn prompt_queue_reorder_edit_remove_and_pause_are_real_controls(cx: &mut TestApp
     ui.click(cx, row_id("remove", before[2]));
     assert_eq!(ids(&ui, cx).len(), 2);
     ui.click(cx, "queue-pause");
+    engine.send(cx, accepted_task(1));
     engine.send(
         cx,
         AgentEvent::TurnFinished {
@@ -142,6 +145,7 @@ fn prompt_queue_native_steering_waits_for_acceptance_and_keeps_other_prompts(
         ui.read(cx, |app, _| app.session().list.item_count()),
         ui.read(cx, |app, _| app.session().view.items.len())
     );
+    engine.send(cx, accepted_task(1));
     engine.send(
         cx,
         AgentEvent::TurnFinished {
@@ -194,6 +198,8 @@ fn prompt_queue_stop_and_failure_pause_without_losing_work(cx: &mut TestAppConte
     assert_eq!(ids(&ui, cx).len(), 1);
     assert!(ui.read(cx, |app, _| app.session().prompt_queue.paused));
     ui.click(cx, "queue-pause");
+    assert!(engine.sent().is_empty());
+    ui.click(cx, "queue-resume-confirm");
     assert!(matches!(engine.sent().as_slice(), [Op::UserMessage(text)] if text == "keep queued"));
 }
 
@@ -255,6 +261,7 @@ fn prompt_queue_background_sessions_dispatch_only_their_own_work(cx: &mut TestAp
     second.send(cx, AgentEvent::TurnStarted { turn_id: 1 });
     ui.input(cx, "second follow-up");
     ui.press(cx, "enter");
+    first.send(cx, accepted_task(1));
     first.send(
         cx,
         AgentEvent::TurnFinished {
@@ -330,6 +337,7 @@ fn prompt_queue_editing_defers_dispatch_until_the_saved_edit_is_ready(cx: &mut T
     let id = ids(&ui, cx)[0];
     ui.click(cx, "queue-toggle");
     ui.click(cx, row_id("edit", id));
+    engine.send(cx, accepted_task(1));
     engine.send(
         cx,
         AgentEvent::TurnFinished {
@@ -509,7 +517,7 @@ fn long_queued_preview_fits_and_editing_and_sending_keep_the_complete_request(
         });
         ui.click(cx, row_id("steer", id));
         assert!(
-            matches!(engine.sent().as_slice(), [Op::SteerMessage { id: sent, text, .. }] if *sent == id && text == &message)
+            matches!(engine.sent().as_slice(), [Op::UserMessageWithContext { steering_id:Some(sent), request, text:full_text, .. }] if *sent == id && full_text == &message && request == &text)
         );
         assert_eq!(ids(&ui, cx), [id]);
     }

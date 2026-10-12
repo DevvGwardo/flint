@@ -21,6 +21,47 @@ use crate::view_model::SessionView;
 /// Files listed in the card before "and N more".
 const CARD_FILES: usize = 4;
 
+/// A completed execution with a clean assessment has recovered its routine
+/// guard guidance. User acceptance alone cannot clear unresolved evidence.
+pub(super) fn guard_recovered(turn: &TurnInfo) -> bool {
+    turn.end.is_some()
+        && turn.task.as_ref().is_some_and(|task| {
+            task.blockers.is_empty()
+                && !task.evidence_overflow
+                && task.assessment.as_ref().is_some_and(|assessment| {
+                    matches!(assessment.reason, TurnEndReason::Completed)
+                        && assessment.issues.is_empty()
+                        && matches!(
+                            assessment.outcome,
+                            flint_agent::TaskOutcome::NeedsReview
+                                | flint_agent::TaskOutcome::Accepted
+                                | flint_agent::TaskOutcome::Answered
+                        )
+                })
+        })
+}
+
+fn completed_label(outcome: flint_agent::TaskOutcome) -> &'static str {
+    if outcome.allows_queue() {
+        "Done"
+    } else {
+        "Turn ended"
+    }
+}
+
+fn analysis_ready(task: Option<&flint_agent::TaskRecord>) -> bool {
+    task.is_some_and(|task| {
+        task.analysis_only()
+            && !task.evidence_overflow
+            && task.blockers.is_empty()
+            && task.assessment.as_ref().is_some_and(|assessment| {
+                assessment.outcome == flint_agent::TaskOutcome::NeedsReview
+                    && assessment.reason == TurnEndReason::Completed
+                    && assessment.issues.is_empty()
+            })
+    })
+}
+
 pub fn worked_line(
     target: &Conversation,
     ix: usize,
@@ -66,7 +107,11 @@ pub fn worked_line(
                     row.child(ui::label(
                         format!("· {}", extras.join(" · ")),
                         size::BASE,
-                        p.text_subtle,
+                        if guard_recovered(turn) {
+                            p.text_muted
+                        } else {
+                            p.warning
+                        },
                     ))
                 })
                 .child(ui::icon(
@@ -83,27 +128,14 @@ pub fn worked_line(
         .test_support()
 }
 
-pub fn answer(
-    ix: usize,
-    item: &Item,
-    workspace: &std::path::Path,
-    cx: &mut Context<FlintApp>,
-) -> AnyElement {
-    let Item::Assistant { text, .. } = item else {
-        return div().into_any_element();
-    };
+pub fn answer(ix: usize, markdown: AnyElement) -> AnyElement {
     div()
         .id(("answer", ix))
         .w_full()
         .text_size(px(size::PROSE))
         .line_height(px(24.))
         .text_color(palette().text)
-        .child(crate::file_preview::markdown(
-            ("md", ix),
-            text.clone(),
-            workspace.to_path_buf(),
-            cx,
-        ))
+        .child(markdown)
         .test_support()
         .into_any_element()
 }
@@ -121,16 +153,112 @@ pub fn summary(
     let Item::TurnSummary { reason, usage, .. } = item else {
         return div().into_any_element();
     };
+    let outcome = turn
+        .task
+        .as_ref()
+        .and_then(|task| task.assessment.as_ref())
+        .map_or(flint_agent::TaskOutcome::Unknown, |assessment| {
+            assessment.outcome
+        });
     let ended: Option<(IconName, String, Hsla)> = match reason {
-        TurnEndReason::Completed => None,
+        TurnEndReason::Completed => Some((
+            if outcome.allows_queue() {
+                IconName::Check
+            } else {
+                IconName::CircleStop
+            },
+            completed_label(outcome).into(),
+            if outcome.allows_queue() {
+                p.success
+            } else {
+                p.text_muted
+            },
+        )),
         TurnEndReason::Interrupted => Some((IconName::CircleStop, "Stopped".into(), p.warning)),
         TurnEndReason::StepLimit => Some((
             IconName::CircleAlert,
             "Hit the step limit".into(),
             p.warning,
         )),
+        TurnEndReason::ContinuationLimit => Some((
+            IconName::CircleAlert,
+            turn.task
+                .as_ref()
+                .and_then(|task| task.continuation_stop.as_ref())
+                .map_or("Automatic follow-ups stopped", |stop| stop.label())
+                .into(),
+            p.warning,
+        )),
         TurnEndReason::Failed(why) => Some((IconName::CircleX, format!("Failed: {why}"), p.danger)),
     };
+    let (outcome_icon, outcome_color) = crate::task_ui::outcome_style(outcome);
+    let ready = analysis_ready(turn.task.as_ref());
+    let outcome_label = if ready {
+        "Analysis ready"
+    } else {
+        outcome.label()
+    };
+    let details_target = target.clone();
+    let turn_id = turn.turn_id;
+    let outcome_strip = div()
+        .id(("task-outcome", ix))
+        .aria_label(outcome_label)
+        .w_full()
+        .px(px(14.))
+        .py(px(10.))
+        .rounded(px(10.))
+        .border_1()
+        .border_color(p.border_strong)
+        .bg(p.surface)
+        .flex()
+        .items_start()
+        .gap(px(10.))
+        .child(ui::icon(outcome_icon, 15., outcome_color).mt(px(3.)))
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .flex()
+                .flex_col()
+                .gap(px(3.))
+                .child(ui::label(outcome_label, size::SM, outcome_color))
+                .child(ui::label(
+                    turn.task
+                        .as_ref()
+                        .and_then(|task| {
+                            task.blockers
+                                .first()
+                                .map(|blocker| blocker.text.clone())
+                                .or_else(|| {
+                                    task.assessment
+                                        .as_ref()
+                                        .and_then(|assessment| assessment.issues.first().cloned())
+                                })
+                        })
+                        .unwrap_or_else(|| match outcome {
+                            flint_agent::TaskOutcome::Accepted => {
+                                "Your acceptance was recorded.".into()
+                            }
+                            flint_agent::TaskOutcome::Answered => {
+                                "An answer, not deliverable acceptance.".into()
+                            }
+                            _ if ready => "Here are the findings. No changes were made by this review. Suggested next steps need your approval.".into(),
+                            _ => "Check the goal and evidence before accepting this result.".into(),
+                        }),
+                    size::XS,
+                    p.text_muted,
+                )),
+        )
+        .child(
+            Button::new(("task-details", ix))
+                .outline()
+                .label("Details")
+                .accessibility_label("Inspect task goal, evidence and blockers")
+                .on_click(cx.listener(move |app, _, window, cx| {
+                    app.open_task_details(details_target.clone(), turn_id, window, cx)
+                })),
+        )
+        .test_support();
 
     let card = (!turn.files.is_empty()).then(|| {
         let n = turn.files.len();
@@ -191,7 +319,11 @@ pub fn summary(
                     .child(ui::mono(format!("+{}", turn.added), size::SM, p.success))
                     .child(ui::mono(format!("−{}", turn.removed), size::SM, p.danger))
                     .child(div().flex_1())
-                    .child(ui::label("⌘J", size::SM, p.text_subtle))
+                    .child(ui::label(
+                        crate::shortcuts::label("⌘J").into_owned(),
+                        size::SM,
+                        p.text_subtle,
+                    ))
                     .child(
                         div()
                             .id(("review-button", ix))
@@ -307,13 +439,17 @@ pub fn summary(
         .when_some(ended, |col, (icon, text, color)| {
             col.child(
                 div()
+                    .id(("turn-ended", ix))
+                    .aria_label(text.clone())
                     .flex()
                     .items_center()
                     .gap(px(6.))
                     .child(ui::icon(icon, 15., color))
-                    .child(ui::label(text, size::BASE, color)),
+                    .child(ui::label(text, size::BASE, color))
+                    .test_support(),
             )
         })
+        .child(outcome_strip)
         .children(card)
         .child(actions)
         .into_any_element()
@@ -328,5 +464,49 @@ pub fn file_icon(path: &str) -> IconName {
         "md" | "txt" => IconName::FileText,
         "sh" | "zsh" | "bash" => IconName::FileTerminal,
         _ => IconName::File,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{completed_label, guard_recovered};
+    use crate::turns::TurnInfo;
+    use flint_agent::{TaskMode, TaskOutcome, TaskRecord, TurnEndReason};
+
+    #[test]
+    fn completed_execution_label_does_not_claim_unaccepted_work_is_done() {
+        for outcome in [
+            TaskOutcome::Partial,
+            TaskOutcome::Blocked,
+            TaskOutcome::Unknown,
+            TaskOutcome::NeedsReview,
+        ] {
+            assert_eq!(completed_label(outcome), "Turn ended");
+        }
+        for outcome in [TaskOutcome::Accepted, TaskOutcome::Answered] {
+            assert_eq!(completed_label(outcome), "Done");
+        }
+    }
+
+    #[test]
+    fn quiet_guard_summary_requires_finished_clean_evidence_not_just_acceptance() {
+        let mut task = TaskRecord::new(1, "Explain the interface.".into(), 0);
+        task.contract.mode = TaskMode::ReadOnly;
+        task.assess(TurnEndReason::Completed, true);
+        let mut turn = TurnInfo {
+            task: Some(task),
+            ..TurnInfo::default()
+        };
+        assert!(!guard_recovered(&turn));
+        turn.end = Some(1);
+        assert!(guard_recovered(&turn));
+        let task = turn.task.as_mut().unwrap();
+        task.assessment.as_mut().unwrap().outcome = TaskOutcome::Accepted;
+        task.assessment
+            .as_mut()
+            .unwrap()
+            .issues
+            .push("Unresolved verification failure".into());
+        assert!(!guard_recovered(&turn));
     }
 }

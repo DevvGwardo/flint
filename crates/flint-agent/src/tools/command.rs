@@ -1,4 +1,4 @@
-//! `run_command`: `sh -c` in the workspace with streamed output, a timeout,
+//! `run_command`: the platform shell with streamed output, a timeout,
 //! cancellation, and head+tail truncation for the model.
 
 use std::path::Path;
@@ -54,11 +54,12 @@ pub(super) async fn run_command(
             cmd.arg("-p").arg(profile).arg("sh");
             cmd
         }
-        None => Command::new("sh"),
+        None => flint_platform::shell_command(command),
     };
-    cmd.arg("-c")
-        .arg(command)
-        .current_dir(workspace)
+    if sandbox.is_some() {
+        cmd.arg("-c").arg(command);
+    }
+    cmd.current_dir(workspace)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -66,13 +67,10 @@ pub(super) async fn run_command(
         .env("GIT_PAGER", "cat")
         .env("NO_COLOR", "1")
         .kill_on_drop(true);
-    #[cfg(unix)]
-    cmd.process_group(0);
-    let mut child = match cmd.spawn() {
+    let (mut child, mut tree) = match flint_platform::spawn(&mut cmd) {
         Ok(child) => child,
         Err(err) => return ToolOutcome::error(format!("failed to start command: {err}")),
     };
-    let pid = child.id();
     let (tx, rx) = async_channel::bounded::<Vec<u8>>(OUTPUT_QUEUE_CHUNKS);
     let mut pumps = Vec::with_capacity(2);
     if let Some(stdout) = child.stdout.take() {
@@ -135,13 +133,14 @@ pub(super) async fn run_command(
         pump.abort();
     }
     if ended.is_some() {
-        kill_group(pid);
+        tree.kill();
         let _ = child.kill().await;
     }
     let status = match status {
         Some(status) => status,
         None => child.wait().await.ok(),
     };
+    tree.disarm();
     let exit_code = match &ended {
         Some(_) => None,
         None => status.and_then(|s| s.code()),
@@ -161,6 +160,10 @@ pub(super) async fn run_command(
         (Some(note), _) => output.push_str(note),
         (None, Some(code)) => output.push_str(&format!("[exit code: {code}]")),
         (None, None) => output.push_str("[terminated by signal]"),
+    }
+    if let Some(hint) = crate::command_evidence::verification_rejection(command) {
+        output.push_str("\n[verification not credited] ");
+        output.push_str(hint);
     }
     ToolOutcome {
         output,
@@ -182,21 +185,6 @@ async fn pump(mut reader: impl AsyncRead + Unpin, tx: async_channel::Sender<Vec<
             }
         }
     }
-}
-
-/// Kills the whole process group so `sh -c` children don't outlive it.
-fn kill_group(pid: Option<u32>) {
-    #[cfg(unix)]
-    if let Some(pid) = pid {
-        let _ = std::process::Command::new("kill")
-            .arg("-KILL")
-            .arg(format!("-{pid}"))
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
-    }
-    #[cfg(not(unix))]
-    let _ = pid;
 }
 
 /// Keeps the head and the tail of long output, so trailing errors and test
@@ -295,5 +283,40 @@ mod tests {
         }
         task.await.expect("pump");
         assert_eq!(received, size);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_command_cancellation_stops_the_owned_process_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        let cancel = CancellationToken::new();
+        let trigger = cancel.clone();
+        let script = "powershell.exe -NoProfile -NonInteractive -Command \"Set-Content ready ready; Start-Sleep -Seconds 2; Set-Content escaped escaped\"";
+        let workspace = dir.path().to_path_buf();
+        let ready = workspace.join("ready");
+        let canceller = tokio::spawn(async move {
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while !ready.exists() {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .unwrap();
+            trigger.cancel();
+        });
+        let args = serde_json::json!({"command": script});
+        let outcome = run_command(
+            &workspace,
+            args.as_object().unwrap(),
+            None,
+            &|_| {},
+            &cancel,
+        )
+        .await;
+        canceller.await.unwrap();
+        assert!(!outcome.success);
+        assert!(outcome.output.contains("[interrupted; process killed]"));
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        assert!(!workspace.join("escaped").exists());
     }
 }

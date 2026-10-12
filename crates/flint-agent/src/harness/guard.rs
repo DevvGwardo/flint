@@ -28,10 +28,13 @@ use crate::protocol::ToolKind;
 
 /// Identical calls before the hard stuck trigger fires.
 pub const STUCK_REPEAT_TRIGGER: u32 = 3;
+pub type FinishProgress = (usize, u64, usize, usize);
 
-pub const VERIFY_NUDGE: &str = "You modified files during this turn but haven't run any \
-    verification commands. Run the relevant tests/build/lint (or explain why they can't be run) \
-    and continue instead of ending the turn.";
+pub const VERIFY_NUDGE: &str = "The changes or deliverables in this turn haven't been verified \
+    after the latest work. Run the relevant tests/build/lint (or explain why they can't be run) \
+    directly, without output-filtering pipes or exit-masking wrappers. The command tool already \
+    captures bounded output. Do not make further edits unless the check requires them; \
+    verify the final state and report the actual result.";
 
 pub const WATCHDOG_NUDGE: &str = "You inspected files and gathered context, but haven't modified \
     any files or completed the requested changes yet. Implement the solution and verify it \
@@ -104,6 +107,8 @@ struct CommandEntry {
 #[derive(Debug)]
 pub struct TurnGuard {
     user_message: String,
+    contract: Option<crate::task::TaskContract>,
+    task: Option<crate::task::TaskRecord>,
     call_counts: HashMap<String, u32>,
     last_failure: HashMap<String, String>,
     failure_streak: HashMap<String, u32>,
@@ -111,10 +116,12 @@ pub struct TurnGuard {
     stuck_suspect: Option<String>,
     tool_calls: u32,
     edited_files: bool,
+    /// A successful shell/MCP operation may change work outside the file tools.
+    possible_changes: bool,
     /// A real check (not just inspection) ran after the last edit.
     check_after_last_edit: bool,
     /// The latest real check, when it failed: command and exit code.
-    failed_check: Option<(String, Option<i32>)>,
+    failed_checks: BTreeMap<String, Option<i32>>,
     /// Output of the latest failed command, of any command.
     last_failed_output: Option<String>,
     /// Line ranges read per file since that file was last edited.
@@ -123,6 +130,8 @@ pub struct TurnGuard {
     rereads: HashMap<String, u32>,
     open_plan: Vec<String>,
     verify_nudged: bool,
+    /// Recovery activity survives later invalidation. It never certifies work.
+    verification_progress: u64,
     failed_check_nudged: bool,
     watchdog_nudged: bool,
     plan_nudged: bool,
@@ -135,6 +144,8 @@ impl TurnGuard {
     pub fn new(user_message: &str) -> Self {
         Self {
             user_message: user_message.to_string(),
+            contract: None,
+            task: None,
             call_counts: HashMap::new(),
             last_failure: HashMap::new(),
             failure_streak: HashMap::new(),
@@ -142,13 +153,15 @@ impl TurnGuard {
             stuck_suspect: None,
             tool_calls: 0,
             edited_files: false,
+            possible_changes: false,
             check_after_last_edit: false,
-            failed_check: None,
+            failed_checks: BTreeMap::new(),
             last_failed_output: None,
             read_ranges: HashMap::new(),
             rereads: HashMap::new(),
             open_plan: Vec::new(),
             verify_nudged: false,
+            verification_progress: 0,
             failed_check_nudged: false,
             watchdog_nudged: false,
             plan_nudged: false,
@@ -170,15 +183,13 @@ impl TurnGuard {
         match kind {
             ToolKind::Edit => {}
             ToolKind::Command => {
-                if !is_inspection(&command_of(name, kind, args)) {
-                    self.check_after_last_edit = true;
+                if self.commands_after_last_edit.len() == JEV_MAX_COMMANDS {
+                    self.commands_after_last_edit.remove(0);
                 }
-                if self.commands_after_last_edit.len() < JEV_MAX_COMMANDS {
-                    self.commands_after_last_edit.push(CommandEntry {
-                        command: truncate(&command_of(name, kind, args), JEV_MAX_ARGS_CHARS),
-                        exit_code: None,
-                    });
-                }
+                self.commands_after_last_edit.push(CommandEntry {
+                    command: truncate(&command_of(name, kind, args), JEV_MAX_ARGS_CHARS),
+                    exit_code: None,
+                });
             }
             ToolKind::Read if name == "read_file" => self.record_read(args),
             ToolKind::Read | ToolKind::Search | ToolKind::Other => {}
@@ -208,7 +219,8 @@ impl TurnGuard {
     fn record_edit(&mut self, path: Option<&str>) {
         self.edited_files = true;
         self.check_after_last_edit = false;
-        self.failed_check = None;
+        self.verify_nudged = false;
+        self.failed_check_nudged = false;
         self.commands_after_last_edit.clear();
         if let Some(path) = path {
             let key = path_key(path);
@@ -266,6 +278,74 @@ impl TurnGuard {
         self.user_message.push_str(text);
     }
 
+    pub fn set_task_contract(&mut self, contract: &crate::task::TaskContract) {
+        self.contract = Some(contract.clone());
+    }
+
+    /// Share the host's revision-aware evidence with the guard and JEV instead
+    /// of maintaining a contradictory, tool-name-only notion of completion.
+    pub fn set_task_record(&mut self, task: &crate::task::TaskRecord) {
+        self.verification_progress = self.verification_progress.max(
+            task.checks
+                .iter()
+                .filter(|check| {
+                    check.verification
+                        && check.success
+                        && check.contract_revision == task.contract.revision
+                        && check.started_revision == check.work_revision
+                })
+                .map(|check| check.id)
+                .max()
+                .unwrap_or(0),
+        );
+        if self.task.as_ref().is_some_and(|previous| {
+            previous.work_revision != task.work_revision
+                || previous.contract.revision != task.contract.revision
+        }) {
+            self.verify_nudged = false;
+            self.failed_check_nudged = false;
+        }
+        self.set_task_contract(&task.contract);
+        self.edited_files |= task.observed_edits > 0;
+        self.check_after_last_edit = task.has_current_verification();
+        self.failed_checks = task
+            .checks
+            .iter()
+            .filter(|check| task.failed_verification_is_unresolved(check))
+            .map(|check| (check.command.clone(), check.exit_code))
+            .collect();
+        // Restored/continued plans are host evidence too, even when this
+        // turn has not issued a new update_plan call.
+        self.open_plan = task
+            .plan
+            .iter()
+            .filter(|step| step.status.is_open())
+            .map(|step| step.step.clone())
+            .collect();
+        self.task = Some(task.clone());
+    }
+
+    pub fn analysis_scope_nudge(&self, final_text: &str) -> Option<String> {
+        let first = final_text.lines().next().unwrap_or(final_text);
+        let lower = first.trim_start().to_ascii_lowercase();
+        let claims_blocked = lower.starts_with("blocked:")
+            || [
+                "that's the blocker",
+                "that is the blocker",
+                "cannot complete",
+                "can't complete",
+                "cannot finish",
+                "can't finish",
+                "unable to finish",
+            ]
+            .iter()
+            .any(|phrase| lower.contains(phrase));
+        self.task
+            .as_ref()
+            .filter(|task| claims_blocked && task.optional_scope_blocker(first))
+            .map(|_| crate::task::TaskRecord::analysis_guidance().to_string())
+    }
+
     /// Records the model's latest plan: the steps still open.
     pub fn record_plan(&mut self, open: Vec<String>) {
         self.open_plan = open;
@@ -284,6 +364,20 @@ impl TurnGuard {
         if kind == ToolKind::Edit && success {
             self.record_edit(args.get("path").and_then(Value::as_str));
         }
+        if success && kind != ToolKind::Edit && crate::task::may_mutate(name, kind, args) {
+            self.possible_changes = true;
+            self.check_after_last_edit = false;
+            self.verify_nudged = false;
+            self.failed_check_nudged = false;
+            // Keep the completing command, not checks from before its effects.
+            let current = if kind == ToolKind::Command {
+                self.commands_after_last_edit.pop()
+            } else {
+                None
+            };
+            self.commands_after_last_edit.clear();
+            self.commands_after_last_edit.extend(current);
+        }
         let key = truncate(&call_key(name, args), JEV_MAX_ARGS_CHARS);
         if let Some(entry) = self
             .trace
@@ -301,8 +395,19 @@ impl TurnGuard {
             last.exit_code = Some(exit_code.unwrap_or(if success { 0 } else { 1 }));
         }
         let command = command_of(name, kind, args);
-        if kind == ToolKind::Command && !is_inspection(&command) {
-            self.failed_check = (!success).then(|| (command.clone(), exit_code));
+        let verifies = crate::task::is_verification(&command)
+            || self.contract.as_ref().is_some_and(|contract| {
+                contract.requirements.iter().any(|requirement| {
+                    matches!(&requirement.spec, crate::task::RequirementSpec::Command(required) if required.trim() == command.trim())
+                })
+            });
+        if kind == ToolKind::Command && verifies {
+            self.check_after_last_edit = true;
+            if success {
+                self.failed_checks.remove(&command);
+            } else {
+                self.failed_checks.insert(command.clone(), exit_code);
+            }
         }
         if success {
             self.last_failed_output = None;
@@ -355,10 +460,69 @@ impl TurnGuard {
 
     /// Which finish check applies, by preconditions only.
     pub fn finish_check(&self) -> Option<FinishCheck> {
-        if self.edited_files {
-            return (!self.verify_nudged).then_some(FinishCheck::Verify);
+        if self.changed_work() {
+            return (!self.check_after_last_edit
+                && self.failed_checks.is_empty()
+                && !self.verify_nudged)
+                .then_some(FinishCheck::Verify);
         }
-        (self.tool_calls > 0 && !self.watchdog_nudged).then_some(FinishCheck::Watchdog)
+        (self.tool_calls > 0
+            && !self.observed_work()
+            && !self.watchdog_nudged
+            && self.watchdog_allowed())
+        .then_some(FinishCheck::Watchdog)
+    }
+
+    pub fn verification_nudge(&self) -> String {
+        let hint = self.task.as_ref().and_then(|task| {
+            task.checks
+                .iter()
+                .filter(|check| {
+                    check.verification
+                        || crate::command_evidence::verification_rejection(&check.command).is_some()
+                })
+                .max_by_key(|check| check.id)
+                .and_then(|check| crate::command_evidence::verification_rejection(&check.command))
+        });
+        let mut message = hint.map_or_else(
+            || VERIFY_NUDGE.into(),
+            |hint| format!("{VERIFY_NUDGE}\n{hint}"),
+        );
+        if let Some(detail) = self
+            .task
+            .as_ref()
+            .and_then(|task| task.stale_verification_detail())
+        {
+            message.push('\n');
+            message.push_str(&detail);
+        }
+        message
+    }
+
+    /// Real edits, successfully executed checks, closed plan steps and usable child
+    /// reports are progress. An unknown shell command bumping a revision isn't.
+    pub fn finish_progress(&self) -> Option<FinishProgress> {
+        self.task.as_ref().map(|task| {
+            (
+                task.observed_edits,
+                self.verification_progress,
+                task.plan
+                    .iter()
+                    .filter(|step| !step.status.is_open())
+                    .count(),
+                task.children
+                    .iter()
+                    .filter(|child| {
+                        matches!(
+                            child.outcome,
+                            crate::task::TaskOutcome::Answered
+                                | crate::task::TaskOutcome::NeedsReview
+                                | crate::task::TaskOutcome::Accepted
+                        )
+                    })
+                    .count(),
+            )
+        })
     }
 
     /// Marks a finish nudge as sent (each fires at most once per turn).
@@ -371,14 +535,19 @@ impl TurnGuard {
 
     /// The heuristic finish rules: a nudge to keep going, or `None` to finish.
     pub fn before_finish(&mut self) -> Option<(NudgeReason, String)> {
-        if self.edited_files && !self.check_after_last_edit && !self.verify_nudged {
+        if self.changed_work()
+            && !self.check_after_last_edit
+            && self.failed_checks.is_empty()
+            && !self.verify_nudged
+        {
             self.verify_nudged = true;
-            return Some((NudgeReason::Verify, VERIFY_NUDGE.to_string()));
+            return Some((NudgeReason::Verify, self.verification_nudge()));
         }
-        if !self.edited_files
+        if !self.changed_work()
+            && !self.observed_work()
             && self.tool_calls > 0
             && !self.watchdog_nudged
-            && task_asks_for_changes(&self.user_message)
+            && self.watchdog_allowed()
         {
             self.watchdog_nudged = true;
             return Some((NudgeReason::Watchdog, WATCHDOG_NUDGE.to_string()));
@@ -390,8 +559,8 @@ impl TurnGuard {
     /// when the JEV judge has ruled on verify/watchdog: a failed last check,
     /// and open plan steps.
     pub fn factual_finish(&mut self) -> Option<(NudgeReason, String)> {
-        if let Some((command, exit_code)) = &self.failed_check
-            && self.edited_files
+        if let Some((command, exit_code)) = self.failed_checks.first_key_value()
+            && self.changed_work()
             && !self.failed_check_nudged
         {
             self.failed_check_nudged = true;
@@ -415,27 +584,101 @@ impl TurnGuard {
 
     /// State for the verify judge.
     pub fn verify_state(&self, final_message: &str) -> Value {
-        let commands: Vec<Value> = self
-            .commands_after_last_edit
-            .iter()
-            .map(|c| json!({"command": c.command, "exit_code": c.exit_code}))
-            .collect();
-        json!({
+        let commands: Vec<Value> = if let Some(task) = &self.task {
+            let mut checks: Vec<_> = task
+                .checks
+                .iter()
+                .filter(|check| {
+                    check.contract_revision == task.contract.revision
+                        && check.work_revision == task.work_revision
+                })
+                .collect();
+            checks.sort_by_key(|check| check.id);
+            checks
+                .into_iter()
+                .rev()
+                .take(JEV_MAX_COMMANDS)
+                .map(|check| {
+                    json!({
+                        "command": truncate(&check.command, JEV_MAX_ARGS_CHARS),
+                        "exit_code": check.exit_code,
+                        "verification": check.verification,
+                        "state": check.state(task.contract.revision, task.work_revision),
+                    })
+                })
+                .collect()
+        } else {
+            self.commands_after_last_edit
+                .iter()
+                .map(|c| json!({"command": c.command, "exit_code": c.exit_code}))
+                .collect()
+        };
+        let mut state = json!({
             "files_edited": self.edited_paths,
             "commands_after_last_edit": commands,
             "final_message": truncate(final_message, JEV_MAX_MESSAGE_CHARS),
-        })
+        });
+        if let Some(contract) = &self.contract {
+            state["task_contract"] = judge_contract(contract);
+        }
+        self.add_task_evidence(&mut state);
+        state
     }
 
     /// State for the watchdog judge.
     pub fn watchdog_state(&self, final_message: &str) -> Value {
-        json!({
+        let mut state = json!({
             "task": truncate(&self.user_message, JEV_MAX_TASK_CHARS),
             "files_edited": self.edited_paths,
             "tool_call_count": self.tool_calls,
             "recent_tool_calls": self.trace_json(),
             "final_message": truncate(final_message, JEV_MAX_MESSAGE_CHARS),
+        });
+        if let Some(contract) = &self.contract {
+            state["task_contract"] = judge_contract(contract);
+        }
+        self.add_task_evidence(&mut state);
+        state
+    }
+
+    fn changed_work(&self) -> bool {
+        self.edited_files || self.possible_changes
+    }
+
+    fn observed_work(&self) -> bool {
+        self.task.as_ref().is_some_and(|task| {
+            task.has_current_verification()
+                || task.files.iter().any(|file| {
+                    matches!(file.state, crate::task::FileState::Present { bytes, .. } if bytes > 0)
+                })
         })
+    }
+
+    fn add_task_evidence(&self, state: &mut Value) {
+        if self.possible_changes {
+            state["untracked_command_effects"] = json!(true);
+        }
+        if let Some(task) = &self.task {
+            state["current_verification_passed"] = json!(task.has_current_verification());
+            state["evidence_overflow"] = json!(task.evidence_overflow);
+            state["observed_deliverables"] = json!(
+                task.files
+                    .iter()
+                    .take(JEV_MAX_EDITED_FILES)
+                    .map(|file| json!({
+                        "path": truncate(&file.path, JEV_MAX_PATH_CHARS),
+                        "state": file.state,
+                    }))
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+
+    fn watchdog_allowed(&self) -> bool {
+        self.contract.as_ref().map_or_else(
+            || task_asks_for_changes(&self.user_message),
+            |contract| contract.mode == crate::task::TaskMode::Work,
+        )
     }
 
     fn trace_json(&self) -> Vec<Value> {
@@ -444,6 +687,25 @@ impl TurnGuard {
             .map(|e| json!({"tool": e.tool, "args": e.args, "exit_code": e.exit_code, "output": e.output}))
             .collect()
     }
+}
+
+fn judge_contract(contract: &crate::task::TaskContract) -> Value {
+    json!({
+        "revision": contract.revision,
+        "objective": truncate(&contract.objective, JEV_MAX_TASK_CHARS),
+        "mode": contract.mode,
+        "requirements": contract.requirements.iter().take(JEV_MAX_EDITED_FILES).map(|requirement| {
+            json!({
+                "id": requirement.id,
+                "kind": requirement.spec.kind_label(),
+                "text": truncate(requirement.spec.text(), JEV_MAX_ARGS_CHARS),
+            })
+        }).collect::<Vec<_>>(),
+        "requirement_count": contract.requirements.len(),
+        "requirements_truncated": contract.requirements.len() > JEV_MAX_EDITED_FILES,
+        "restrictions": contract.restrictions.iter().take(JEV_MAX_EDITED_FILES)
+            .map(|text| truncate(text, JEV_MAX_ARGS_CHARS)).collect::<Vec<_>>(),
+    })
 }
 
 /// Stable key for a call: tool name + args with sorted keys and trimmed strings.
@@ -497,6 +759,45 @@ const INSPECTION_GIT: &[&str] = &[
     "status", "diff", "log", "show", "branch", "blame", "ls-files",
 ];
 
+/// The subcommand Git will actually run for the words after `git`.
+///
+/// Global options that take a separate value (`-C <path>`) consume it, so
+/// `git -C status reset --hard` yields `reset`, not `status`. Any global
+/// option not listed here (including `-c`, `--config-env`, `--exec-path`
+/// and `-p`) yields `None` so callers fail closed.
+pub fn git_subcommand<'a>(args: &[&'a str]) -> Option<&'a str> {
+    let mut args = args.iter().copied();
+    while let Some(arg) = args.next() {
+        match arg {
+            "-C" | "--git-dir" | "--work-tree" | "--namespace" | "--attr-source" => {
+                args.next()?;
+            }
+            "-P"
+            | "--no-pager"
+            | "--bare"
+            | "--no-replace-objects"
+            | "--no-lazy-fetch"
+            | "--no-optional-locks"
+            | "--literal-pathspecs"
+            | "--glob-pathspecs"
+            | "--noglob-pathspecs"
+            | "--icase-pathspecs"
+            | "--no-advice" => {}
+            _ if [
+                "--git-dir=",
+                "--work-tree=",
+                "--namespace=",
+                "--attr-source=",
+            ]
+            .iter()
+            .any(|prefix| arg.starts_with(prefix)) => {}
+            _ if arg.starts_with('-') => return None,
+            sub => return Some(sub),
+        }
+    }
+    None
+}
+
 /// Whether every part of a shell command only inspects (ls, cat, git diff,
 /// …). `cd x && cargo test | tail` is a real check.
 pub fn is_inspection(command: &str) -> bool {
@@ -511,8 +812,7 @@ pub fn is_inspection(command: &str) -> bool {
                 .skip_while(|w| w.contains('=') && !w.starts_with('-'));
             match words.next() {
                 None => true,
-                Some("git") => words
-                    .find(|w| !w.starts_with('-'))
+                Some("git") => git_subcommand(&words.collect::<Vec<_>>())
                     .is_some_and(|sub| INSPECTION_GIT.contains(&sub)),
                 Some(program) => {
                     let program = program.rsplit('/').next().unwrap_or(program);
@@ -691,7 +991,6 @@ const QUESTION_STARTERS: &[&str] = &[
     "is there ",
     "are there ",
     "does ",
-    "do ",
     "should ",
 ];
 
@@ -702,12 +1001,13 @@ pub fn is_pure_question(text: &str) -> bool {
         return false;
     }
     let starts = QUESTION_STARTERS.iter().any(|q| lower.starts_with(q));
-    starts && (lower.ends_with('?') || !lower.contains('\n'))
+    (starts && (lower.ends_with('?') || !lower.contains('\n')))
+        || (lower.starts_with("do ") && lower.ends_with('?'))
 }
 
 /// Whether the task wording asks for code or file changes.
 pub fn task_asks_for_changes(text: &str) -> bool {
-    if is_pure_question(text) {
+    if is_pure_question(text) || crate::task::requests_read_only(text) {
         return false;
     }
     text.to_lowercase()
