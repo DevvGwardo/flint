@@ -153,11 +153,11 @@ fn verbatim_prefixes_still_match_their_workspace() {
     {
         assert_eq!(
             without_verbatim(Path::new(r"\\?\C:\ws\a.txt")),
-            PathBuf::from(r"C:\ws\a.txt")
+            std::path::PathBuf::from(r"C:\ws\a.txt")
         );
         assert_eq!(
             without_verbatim(Path::new(r"\\?\UNC\host\share\a.txt")),
-            PathBuf::from(r"\\host\share\a.txt")
+            std::path::PathBuf::from(r"\\host\share\a.txt")
         );
     }
 }
