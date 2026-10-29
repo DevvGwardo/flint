@@ -4,6 +4,10 @@ use super::*;
 use crate::task::*;
 use pretty_assertions::assert_eq;
 #[path = "adaptive_session_tests.rs"]
+// ImprovementStore::open refuses non-Unix by contract (ownership/mode/link
+// checks have no validated Windows equivalent), so these tests can only run
+// where the lane initializes.
+#[cfg(unix)]
 mod adaptive_session_tests;
 #[path = "analysis_flow_tests.rs"]
 mod analysis_flow_tests;

@@ -146,7 +146,7 @@ fn relative_paths_use_forward_slashes_on_every_platform() {
 
 #[test]
 fn verbatim_prefixes_still_match_their_workspace() {
-    use super::without_verbatim;
+    use flint_platform::without_verbatim;
     let plain = Path::new("/workspace/a.txt");
     assert_eq!(without_verbatim(plain), plain.to_path_buf());
     #[cfg(windows)]

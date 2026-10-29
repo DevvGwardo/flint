@@ -88,7 +88,11 @@ pub(crate) async fn prepare(
     }
     let listing = git(&repository, ["worktree", "list", "--porcelain", "-z"]).await?;
     if let Some(path) = checkout_for_branch(&listing, &request.branch)? {
-        let path = path.canonicalize().map_err(|error| error.to_string())?;
+        // `git` rejects verbatim paths on Windows; compare and reuse the
+        // plain form everywhere below.
+        let path = flint_platform::without_verbatim(
+            &path.canonicalize().map_err(|error| error.to_string())?,
+        );
         if workspace
             .canonicalize()
             .unwrap_or_else(|_| workspace.into())
@@ -124,10 +128,11 @@ pub(crate) async fn prepare(
     tokio::fs::create_dir_all(&root)
         .await
         .map_err(|error| format!("Cannot create worktree directory: {error}"))?;
-    let path = root
-        .canonicalize()
-        .map_err(|error| error.to_string())?
-        .join(format!("agent-{}", uuid::Uuid::new_v4()));
+    // Canonicalization yields a verbatim path on Windows, which `git`
+    // rejects: hand it the plain form instead.
+    let root =
+        flint_platform::without_verbatim(&root.canonicalize().map_err(|error| error.to_string())?);
+    let path = root.join(format!("agent-{}", uuid::Uuid::new_v4()));
     // Existing, unoccupied local branches are opened without resetting them.
     let reference = format!("refs/heads/{}", request.branch);
     let existing = git(&repository, ["show-ref", "--verify", "--quiet", &reference])

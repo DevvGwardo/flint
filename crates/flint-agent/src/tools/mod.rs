@@ -625,10 +625,12 @@ pub(crate) fn resolve(workspace: &Path, path: &str) -> Result<PathBuf, String> {
 
 /// Workspace-relative display form of an absolute path.
 fn display_path(workspace: &Path, path: &Path) -> String {
-    path.strip_prefix(workspace)
-        .unwrap_or(path)
-        .display()
-        .to_string()
+    let workspace = flint_platform::without_verbatim(workspace);
+    let path = flint_platform::without_verbatim(path);
+    match path.strip_prefix(&workspace) {
+        Ok(rel) => flint_platform::relative_display(rel),
+        Err(_) => path.display().to_string(),
+    }
 }
 
 #[cfg(test)]

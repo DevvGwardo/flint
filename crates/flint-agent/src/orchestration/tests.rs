@@ -778,6 +778,12 @@ fn lineage_disk_bytes(
             let path = entry.unwrap().path();
             if path.is_dir() {
                 collect(root, &path, files);
+            } else if path.file_name().and_then(|name| name.to_str()) == Some(".flint-writer.lock")
+            {
+                // The active writer lock is not lineage payload. Reading a
+                // byte-locked region fails on Windows; skipping it keeps the
+                // comparison about history content on every platform.
+                continue;
             } else {
                 files.insert(
                     path.strip_prefix(root).unwrap().to_owned(),

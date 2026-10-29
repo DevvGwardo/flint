@@ -104,6 +104,36 @@ pub fn find_executable(name: impl AsRef<OsStr>, search_path: &OsStr) -> Option<P
         .find_map(|dir| executable_candidate(&dir.join(name), &extensions))
 }
 
+/// Drops a Windows `\\?\` verbatim prefix so an extended-length path still
+/// matches its workspace (notably `git`, which rejects verbatim paths).
+/// Identity everywhere else.
+pub fn without_verbatim(path: &Path) -> PathBuf {
+    #[cfg(windows)]
+    {
+        // Non-UTF-8 verbatim paths fall back to the lossy form; the worst
+        // case is a failed prefix match, i.e. today's full-path display.
+        let raw = path.as_os_str().to_string_lossy();
+        if let Some(rest) = raw.strip_prefix(r"\\?\") {
+            if let Some(unc) = rest.strip_prefix(r"UNC\") {
+                return PathBuf::from(format!(r"\\{unc}"));
+            }
+            return PathBuf::from(rest);
+        }
+    }
+    path.to_path_buf()
+}
+
+/// Workspace-relative display form, always `/`-separated so transcripts,
+/// diffs and tool summaries read the same on every platform. A bare filename
+/// has no separator and is unaffected; only genuinely nested paths change on
+/// Windows (and a backslash stays literal inside Unix filenames).
+pub fn relative_display(path: &Path) -> String {
+    path.components()
+        .map(|component| component.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
 fn executable_candidate(path: &Path, extensions: &[String]) -> Option<PathBuf> {
     if path.is_file() {
         return Some(on_disk(path).unwrap_or_else(|| path.to_path_buf()));
