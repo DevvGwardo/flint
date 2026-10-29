@@ -106,7 +106,7 @@ pub fn find_executable(name: impl AsRef<OsStr>, search_path: &OsStr) -> Option<P
 
 fn executable_candidate(path: &Path, extensions: &[String]) -> Option<PathBuf> {
     if path.is_file() {
-        return Some(path.to_path_buf());
+        return Some(on_disk(path).unwrap_or_else(|| path.to_path_buf()));
     }
     if path.extension().is_some() {
         return None;
@@ -115,7 +115,24 @@ fn executable_candidate(path: &Path, extensions: &[String]) -> Option<PathBuf> {
         let mut candidate = path.as_os_str().to_os_string();
         candidate.push(extension);
         let candidate = PathBuf::from(candidate);
-        candidate.is_file().then_some(candidate)
+        candidate
+            .is_file()
+            .then(|| on_disk(&candidate).unwrap_or(candidate))
+    })
+}
+
+/// The on-disk spelling of `candidate`. `PATHEXT` entries are usually
+/// uppercase, but the file may be `npx.cmd`: a case-insensitive filesystem
+/// matches either way, so resolve the real name for a stable path.
+fn on_disk(candidate: &Path) -> Option<PathBuf> {
+    let parent = candidate.parent()?;
+    let name = candidate.file_name()?;
+    std::fs::read_dir(parent).ok()?.flatten().find_map(|entry| {
+        entry
+            .file_name()
+            .as_encoded_bytes()
+            .eq_ignore_ascii_case(name.as_encoded_bytes())
+            .then(|| entry.path())
     })
 }
 
@@ -242,6 +259,19 @@ mod tests {
             executable_candidate(&dir.path().join("npx.ps1"), &extensions),
             None
         );
+    }
+
+    #[test]
+    fn executable_lookup_returns_the_on_disk_casing() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("tool.CMD"), "").unwrap();
+        // A differently-cased query still resolves to the real file name,
+        // so PATHEXT case never leaks into spawned commands.
+        assert_eq!(
+            on_disk(&dir.path().join("tool.cmd")),
+            Some(dir.path().join("tool.CMD"))
+        );
+        assert_eq!(on_disk(&dir.path().join("missing")), None);
     }
 
     #[test]

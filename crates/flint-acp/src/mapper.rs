@@ -7,6 +7,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::path::PathBuf;
 use std::time::Instant;
 
 use agent_client_protocol::schema::v1::ContentBlock;
@@ -563,12 +564,38 @@ fn raw_output_text(raw: &Value) -> String {
     }
 }
 
-/// Workspace-relative display path.
+/// Workspace-relative display path, always `/`-separated so transcripts and
+/// diffs read the same on every platform. A bare filename has no separator
+/// and is unaffected; only genuinely nested paths change on Windows.
 pub fn relative(workspace: &Path, path: &Path) -> String {
-    path.strip_prefix(workspace)
-        .unwrap_or(path)
-        .display()
-        .to_string()
+    let workspace = without_verbatim(workspace);
+    let path = without_verbatim(path);
+    match path.strip_prefix(&workspace) {
+        Ok(rel) => rel
+            .components()
+            .map(|component| component.as_os_str().to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("/"),
+        Err(_) => path.display().to_string(),
+    }
+}
+
+/// Drops a Windows `\\?\` verbatim prefix so an extended-length path still
+/// matches its workspace. Identity everywhere else.
+fn without_verbatim(path: &Path) -> PathBuf {
+    #[cfg(windows)]
+    {
+        // Non-UTF-8 verbatim paths fall back to the lossy form; the worst
+        // case is a failed prefix match, i.e. today's full-path display.
+        let raw = path.as_os_str().to_string_lossy();
+        if let Some(rest) = raw.strip_prefix(r"\\?\") {
+            if let Some(unc) = rest.strip_prefix(r"UNC\") {
+                return PathBuf::from(format!(r"\\{unc}"));
+            }
+            return PathBuf::from(rest);
+        }
+    }
+    path.to_path_buf()
 }
 
 #[cfg(test)]

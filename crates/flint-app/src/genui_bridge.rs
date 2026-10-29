@@ -36,6 +36,7 @@ impl std::fmt::Debug for BridgeAction {
 }
 
 #[derive(Debug)]
+#[cfg_attr(not(unix), allow(dead_code))]
 pub(crate) enum BridgeEvent {
     Connected,
     Action(BridgeAction),
@@ -676,6 +677,7 @@ mod unix {
     }
 
     #[cfg(test)]
+    #[cfg(unix)]
     mod tests {
         include!("genui_bridge_tests.rs");
     }

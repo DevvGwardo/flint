@@ -114,3 +114,42 @@ fn unfinished_terminal_deltas_have_a_hard_storage_cap() {
         if output.contains("truncated"))
     );
 }
+
+#[test]
+fn relative_paths_use_forward_slashes_on_every_platform() {
+    use super::relative;
+    let workspace = Path::new("/workspace");
+    assert_eq!(relative(workspace, &workspace.join("hello.py")), "hello.py");
+    assert_eq!(
+        relative(workspace, &workspace.join("new").join("b.txt")),
+        "new/b.txt"
+    );
+    // A backslash is an ordinary filename character outside Windows.
+    assert_eq!(
+        relative(workspace, &workspace.join("weird\\name.txt")),
+        "weird\\name.txt"
+    );
+    // Outside the workspace, the display form is kept as-is.
+    assert_eq!(
+        relative(workspace, Path::new("/elsewhere/a.txt")),
+        "/elsewhere/a.txt"
+    );
+}
+
+#[test]
+fn verbatim_prefixes_still_match_their_workspace() {
+    use super::without_verbatim;
+    let plain = Path::new("/workspace/a.txt");
+    assert_eq!(without_verbatim(plain), plain.to_path_buf());
+    #[cfg(windows)]
+    {
+        assert_eq!(
+            without_verbatim(Path::new(r"\\?\C:\ws\a.txt")),
+            PathBuf::from(r"C:\ws\a.txt")
+        );
+        assert_eq!(
+            without_verbatim(Path::new(r"\\?\UNC\host\share\a.txt")),
+            PathBuf::from(r"\\host\share\a.txt")
+        );
+    }
+}

@@ -350,7 +350,11 @@ mod tests {
         let path = dir.path().display().to_string();
         std::fs::write(dir.path().join("npx"), "").expect("npx");
         let missing = AcpAgent::Droid.command(&path).expect_err("missing Droid");
-        assert!(missing.contains("npm i -g droid"));
+        if cfg!(windows) {
+            assert!(missing.contains("Windows-compatible"), "{missing}");
+        } else {
+            assert!(missing.contains("npm i -g droid"), "{missing}");
+        }
         assert!(missing.contains("isn't installed"));
         std::fs::write(dir.path().join("droid"), "").expect("Droid");
         assert_eq!(
