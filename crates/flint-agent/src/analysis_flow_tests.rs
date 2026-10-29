@@ -289,7 +289,7 @@ async fn a_required_denied_check_is_not_reported_as_executed_or_as_optional() {
 #[tokio::test]
 async fn explicit_new_work_after_review_restores_edit_tools_and_requires_checks() {
     let (_root, ws) = temp_workspace();
-    let command = exists_check("result.txt");
+    let command = exists_check(&ws, "result.txt");
     let (url, requests) = mock_server(vec![
         sse_text("I found a gap. Would you like me to fix it?"),
         sse_tool_call(

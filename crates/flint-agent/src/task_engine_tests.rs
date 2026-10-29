@@ -33,9 +33,21 @@ fn assessed(events: &[AgentEvent]) -> &TaskRecord {
         .expect("host assessment")
 }
 
-fn exists_check(path: &str) -> String {
+/// `workspace` is only needed on Windows, where the script must be materialized.
+fn exists_check(_workspace: &std::path::Path, path: &str) -> String {
     if cfg!(windows) {
-        format!(r#"python -c "import pathlib; assert pathlib.Path('{path}').is_file()""#)
+        // The classifier blesses `python test_*.py` as a non-mutating check
+        // while inline `python -c` stays conservatively mutating (it can hide
+        // arbitrary writes). Emit the script form so Windows turns observe
+        // the same clean effects as Unix `test -s`.
+        std::fs::write(
+            _workspace.join("test_check_exists.py"),
+            "import pathlib, sys\n\
+             path = pathlib.Path(sys.argv[1])\n\
+             assert path.is_file() and path.stat().st_size > 0, path\n",
+        )
+        .expect("check script");
+        format!("python test_check_exists.py {path}")
     } else {
         format!("test -s {path}")
     }
@@ -49,7 +61,7 @@ async fn finalization_recovers_after_a_setup_command_invalidates_passing_checks_
     } else {
         "printf setup > setup.txt"
     };
-    let check = exists_check("result.txt");
+    let check = exists_check(&ws, "result.txt");
     let (url, _) = mock_server(vec![
         sse_tool_call(
             "write",
@@ -349,7 +361,7 @@ async fn passing_format_check_preserves_verification_and_skips_unnecessary_jev()
         sse_tool_call(
             "check",
             "run_command",
-            json!({"command":exists_check("src/lib.rs")}),
+            json!({"command":exists_check(&ws, "src/lib.rs")}),
         ),
         sse_tool_call(
             "format",
@@ -441,7 +453,7 @@ async fn shell_deliverables_and_compound_inspection_share_current_evidence() {
         sse_tool_call(
             "check",
             "run_command",
-            json!({"command":exists_check("output.txt")}),
+            json!({"command":exists_check(&ws, "output.txt")}),
         ),
         sse_tool_call(
             "inspect",
@@ -488,7 +500,7 @@ async fn a_failed_exploratory_command_does_not_leave_verified_work_partial() {
         sse_tool_call(
             "check",
             "run_command",
-            json!({"command":exists_check("result.txt")}),
+            json!({"command":exists_check(&ws, "result.txt")}),
         ),
         sse_text("Created and checked the result."),
     ])
@@ -511,7 +523,7 @@ async fn repaired_agent_blockers_can_be_explicitly_resolved_without_user_accepta
             "summary":"Result is missing.", "blockers":["Result is missing."], "deliverables":[],
         })),
         sse_tool_call("write", "write_file", json!({"path":"result.txt","content":"result"})),
-        sse_tool_call("check", "run_command", json!({"command":exists_check("result.txt")})),
+        sse_tool_call("check", "run_command", json!({"command":exists_check(&ws, "result.txt")})),
         sse_tool_call("resolved", "report_task", json!({
             "summary":"Created and checked result.txt.", "blockers":[], "deliverables":["result.txt"],
             "resolved_blockers":["Result is missing."],
@@ -1214,7 +1226,7 @@ async fn a_write_and_its_check_in_one_step_keep_the_check_current() {
     // The file is already evidence before the step, so its change is drift the
     // step must observe rather than a newly noticed artifact.
     std::fs::write(ws.join("result.txt"), "before").unwrap();
-    let check = exists_check("result.txt");
+    let check = exists_check(&ws, "result.txt");
     let (url, _) = mock_server(vec![
         // The replace needs a prior read of the existing file.
         sse_tool_call("read", "read_file", json!({"path": "result.txt"})),

@@ -5,7 +5,7 @@ use pretty_assertions::assert_eq;
 async fn an_executed_failed_mutation_still_invalidates_checks_and_holds_the_queue() {
     let (_root, ws) = temp_workspace();
     std::fs::write(ws.join("result.txt"), "original").unwrap();
-    let check = exists_check("result.txt");
+    let check = exists_check(&ws, "result.txt");
     let mutation = if cfg!(windows) {
         r#"powershell.exe -NoProfile -NonInteractive -Command "Set-Content result.txt changed; exit 23""#
     } else {
@@ -72,7 +72,7 @@ async fn denied_mutations_do_not_make_current_required_checks_stale() {
     ] {
         let (_root, ws) = temp_workspace();
         std::fs::write(ws.join("result.txt"), "original").unwrap();
-        let check = exists_check("result.txt");
+        let check = exists_check(&ws, "result.txt");
         let (url, _) = mock_server(vec![
             sse_tool_call("required-check", "run_command", json!({"command":check})),
             sse_tool_call("denied-mutation", name, args),
@@ -252,7 +252,7 @@ async fn scope_edit_during_final_inference_result(fail_revised_request: bool) {
 async fn file_drift_during_final_inference_gets_current_verification_recovery() {
     let (_root, ws) = temp_workspace();
     let path = ws.join("result.txt");
-    let check = exists_check("result.txt");
+    let check = exists_check(&ws, "result.txt");
     let (url, _) = mock_server_with_response_hook(
         vec![
             sse_tool_call(

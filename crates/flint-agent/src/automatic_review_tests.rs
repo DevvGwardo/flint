@@ -10,7 +10,7 @@ fn ready_task(workspace: &std::path::Path) -> TaskRecord {
     task.checks.push(CommandEvidence {
         id: 1,
         call_id: "checked".into(),
-        command: exists_check("result.txt"),
+        command: exists_check(workspace, "result.txt"),
         contract_revision: 1,
         work_revision: 1,
         started_revision: 1,
@@ -202,7 +202,7 @@ fn automatic_review_fingerprints_dependencies_and_revokes_verified_on_external_d
 async fn automatic_review_native_loop_persists_a_separate_clean_verdict() {
     let (_root, ws) = temp_workspace();
     let dir = tempfile::tempdir().unwrap();
-    let check = exists_check("result.txt");
+    let check = exists_check(&ws, "result.txt");
     let (url, _) = mock_server(vec![
         sse_tool_call(
             "write",
@@ -259,7 +259,7 @@ async fn automatic_review_native_loop_persists_a_separate_clean_verdict() {
 #[tokio::test]
 async fn automatic_review_findings_survive_fixes_until_a_new_independent_review() {
     let (_root, ws) = temp_workspace();
-    let check = exists_check("result.txt");
+    let check = exists_check(&ws, "result.txt");
     let (url, _) = mock_server(vec![
         sse_tool_call(
             "write",
