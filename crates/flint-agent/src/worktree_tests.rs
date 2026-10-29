@@ -20,6 +20,10 @@ pub(crate) fn repository(root: &Path) -> PathBuf {
     std::fs::create_dir_all(&repo).unwrap();
     run(&repo, &["init", "--quiet", "--template="]);
     run(&repo, &["symbolic-ref", "HEAD", "refs/heads/main"]);
+    // Byte-identical checkouts on every platform: the runner default
+    // (autocrlf=true) would rewrite LF fixtures to CRLF on checkout and make
+    // content assertions platform-dependent.
+    run(&repo, &["config", "core.autocrlf", "false"]);
     std::fs::write(repo.join("tracked.txt"), "base\n").unwrap();
     std::fs::write(repo.join(".gitignore"), "ignored\n").unwrap();
     run(&repo, &["add", "."]);
@@ -158,7 +162,12 @@ async fn explicit_repository_can_be_reached_through_a_symlink() {
     let tree = prepare(&request, temp.path(), &temp.path().join("home"))
         .await
         .unwrap();
-    assert_eq!(tree.repository, repo.canonicalize().unwrap());
+    // prepare() hands out plain (non-verbatim) roots; canonicalize alone
+    // would keep the Windows `\\?\` prefix and never match.
+    assert_eq!(
+        tree.repository,
+        flint_platform::without_verbatim(&repo.canonicalize().unwrap())
+    );
 }
 
 #[test]

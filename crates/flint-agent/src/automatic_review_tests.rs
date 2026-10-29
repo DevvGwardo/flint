@@ -58,10 +58,15 @@ fn verdict(verdict: &str, findings: Vec<&str>) -> String {
 async fn finished(handle: &crate::SessionHandle) -> Vec<AgentEvent> {
     let mut events = Vec::new();
     loop {
-        let event = tokio::time::timeout(Duration::from_secs(15), handle.events.recv())
-            .await
-            .unwrap()
-            .unwrap();
+        let event = match tokio::time::timeout(Duration::from_secs(15), handle.events.recv()).await
+        {
+            Ok(event) => event.expect("session still running"),
+            // The events so far show exactly where the turn stalled.
+            Err(_) => panic!("review turn stalled after events: {events:#?}"),
+        };
+        // Printed only when the test fails: CI captures per-test output, so
+        // the next failure shows exactly how far the turn progressed.
+        eprintln!("auto-review event: {event:?}");
         let done = matches!(event, AgentEvent::TurnFinished { .. });
         events.push(event);
         if done {
