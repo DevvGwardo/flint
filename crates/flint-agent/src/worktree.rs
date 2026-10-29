@@ -77,6 +77,7 @@ pub(crate) async fn prepare(
         .as_deref()
         .unwrap_or(workspace)
         .canonicalize()
+        .map(|path| flint_platform::without_verbatim(&path))
         .map_err(|error| format!("Cannot open worktree repository: {error}"))?;
     let checked = git(
         &repository,
@@ -95,6 +96,7 @@ pub(crate) async fn prepare(
         );
         if workspace
             .canonicalize()
+            .map(|path| flint_platform::without_verbatim(&path))
             .unwrap_or_else(|_| workspace.into())
             .starts_with(&path)
         {

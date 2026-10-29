@@ -66,10 +66,9 @@ async fn creates_real_checkout_without_copying_or_changing_source_edits() {
     let tree = prepare(&request("feature/agent"), &repo, &temp.path().join("home"))
         .await
         .unwrap();
-    assert!(
-        tree.workspace
-            .starts_with(temp.path().join("home/worktrees").canonicalize().unwrap())
-    );
+    assert!(tree.workspace.starts_with(flint_platform::without_verbatim(
+        &temp.path().join("home/worktrees").canonicalize().unwrap()
+    )));
     assert_eq!(
         std::fs::read_to_string(tree.workspace.join("tracked.txt")).unwrap(),
         "base\n"

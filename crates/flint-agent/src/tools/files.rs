@@ -362,6 +362,7 @@ pub(super) async fn list_dir(workspace: &Path, args: &Map<String, Value>) -> Too
 }
 
 fn walk(root: &Path, dir: &Path, depth: usize, out: &mut Vec<String>, truncated: &mut bool) {
+    let root = flint_platform::without_verbatim(root);
     let Ok(read) = std::fs::read_dir(dir) else {
         return;
     };
@@ -373,18 +374,17 @@ fn walk(root: &Path, dir: &Path, depth: usize, out: &mut Vec<String>, truncated:
             return;
         }
         let path = entry.path();
-        let rel = path
-            .strip_prefix(root)
-            .unwrap_or(&path)
-            .display()
-            .to_string();
+        let rel = match flint_platform::without_verbatim(&path).strip_prefix(&root) {
+            Ok(rel) => flint_platform::relative_display(rel),
+            Err(_) => path.display().to_string(),
+        };
         let is_dir = entry.file_type().is_ok_and(|t| t.is_dir());
         if is_dir {
             out.push(format!("{rel}/"));
             let name = entry.file_name();
             let skip = SKIP_DIRS.iter().any(|s| name == *s);
             if depth > 1 && !skip {
-                walk(root, &path, depth - 1, out, truncated);
+                walk(&root, &path, depth - 1, out, truncated);
             }
         } else {
             out.push(rel);

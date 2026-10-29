@@ -100,6 +100,10 @@ async fn ripgrep(
     }
     cmd.arg("--regexp")
         .arg(pattern)
+        // Match results print `path:line:content`; keep the path part
+        // `/`-separated on every platform without touching match content.
+        .arg("--path-separator")
+        .arg("/")
         .arg("--")
         .arg(target.strip_prefix(workspace).map_or(target, |rel| {
             if rel.as_os_str().is_empty() {
