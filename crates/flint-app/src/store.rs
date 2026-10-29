@@ -118,8 +118,13 @@ fn append_batch_with(
         write(&mut file, records)
     })();
     if let Err(err) = result {
-        // A retry must not append behind a partial JSON line.
-        file.set_len(length)?;
+        // A retry must not append behind a partial JSON line. Truncate with
+        // a write-capable handle: the append handle above carries only
+        // FILE_APPEND_DATA on Windows, which SetEndOfFile rejects.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(dir.join("events.jsonl"))?
+            .set_len(length)?;
         return Err(err);
     }
     Ok(())

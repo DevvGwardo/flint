@@ -125,7 +125,9 @@ pub(super) fn checkout_path(cwd: &Path, home: &Path, branch: &str) -> Result<Pat
         ["rev-parse", "--path-format=absolute", "--git-common-dir"],
     )?;
     let common = path_from_bytes(common.strip_suffix(b"\n").unwrap_or(&common))?;
-    let common = common.canonicalize()?;
+    // Canonicalization yields a verbatim path on Windows, which `git`
+    // rejects as a worktree location: hand it the plain form everywhere.
+    let common = flint_platform::without_verbatim(&common.canonicalize()?);
     let repo = common.parent().unwrap_or(&common);
     let name = repo.file_name().unwrap_or_else(|| OsStr::new("repository"));
     let root = home.join("worktrees").join(format!(
@@ -134,7 +136,7 @@ pub(super) fn checkout_path(cwd: &Path, home: &Path, branch: &str) -> Result<Pat
         hash(common.as_os_str().as_encoded_bytes())
     ));
     std::fs::create_dir_all(&root)?;
-    let root = root.canonicalize()?;
+    let root = flint_platform::without_verbatim(&root.canonicalize()?);
     Ok(root.join(format!("{}-{:016x}", slug(branch), hash(branch.as_bytes()))))
 }
 

@@ -199,6 +199,10 @@ fn worktree_removal_refuses_primary_locked_dirty_untracked_and_ignored() {
     assert!(remove(&cwd, &tree.path).is_err());
 }
 
+// Git-for-Windows cannot create a worktree directory containing a newline
+// (msys path conversion rejects it); the parsing half is covered by
+// `worktree_porcelain_preserves_paths_and_checkout_flags` on every platform.
+#[cfg(unix)]
 #[test]
 fn worktree_lists_detached_checkouts_without_interpreting_path_newlines() {
     let tmp = tempfile::tempdir().unwrap();
