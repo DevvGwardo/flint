@@ -89,6 +89,7 @@ impl FlintApp {
         self.session_limit = SESSION_PAGE;
         self.sidebar_scroll.set_offset(Point::default());
         self.session_menu = None;
+        self.sidebar_menu = None;
         cx.notify();
     }
 
@@ -104,6 +105,55 @@ impl FlintApp {
         self.session_limit = SESSION_PAGE;
         self.sidebar_scroll.set_offset(Point::default());
         self.session_menu = None;
+        self.sidebar_menu = None;
+        cx.notify();
+    }
+
+    /// Collapse or expand one heading. The state outlives a relaunch.
+    pub fn toggle_group_collapsed(
+        &mut self,
+        key: crate::session_groups::GroupKey,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.collapsed_groups.remove(&key) {
+            self.collapsed_groups.insert(key);
+        }
+        self.save_collapsed_groups();
+        self.session_menu = None;
+        self.sidebar_menu = None;
+        cx.notify();
+    }
+
+    /// Persist the collapsed headings, pruning any that no longer exist so the
+    /// settings file does not collect stale keys.
+    fn save_collapsed_groups(&mut self) {
+        let listed = self.listed_group_keys();
+        self.collapsed_groups.retain(|key| listed.contains(key));
+        let mut keys: Vec<String> = self
+            .collapsed_groups
+            .iter()
+            .map(|key| key.setting_key())
+            .collect();
+        keys.sort();
+        if self.settings.collapsed_groups != keys {
+            self.settings.collapsed_groups = keys;
+            if !self.options.ephemeral() {
+                self.settings.save(&self.home).ok();
+            }
+        }
+    }
+
+    /// Open or close the archived-sessions disclosure. Remembered across launches.
+    pub fn toggle_archived(&mut self, cx: &mut Context<Self>) {
+        self.archived_open = !self.archived_open;
+        if self.settings.archived_open != self.archived_open {
+            self.settings.archived_open = self.archived_open;
+            if !self.options.ephemeral() {
+                self.settings.save(&self.home).ok();
+            }
+        }
+        self.session_menu = None;
+        self.sidebar_menu = None;
         cx.notify();
     }
 

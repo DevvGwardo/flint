@@ -16,6 +16,8 @@ async fn execution_options_disable_advertised_and_attempted_delegation() {
         test_config(url, ws),
         crate::ExecutionOptions {
             allow_subagents: false,
+            interactive_ui: false,
+            improvement_hints: false,
         },
     );
     handle

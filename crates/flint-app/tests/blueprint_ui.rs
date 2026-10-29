@@ -50,8 +50,14 @@ mod jev_ui;
 mod local_provider;
 #[path = "blueprint_ui/menu_overflow.rs"]
 mod menu_overflow_ui;
+#[path = "blueprint_ui/omniroute.rs"]
+mod omniroute_ui;
 #[path = "blueprint_ui/prompt_queue.rs"]
 mod prompt_queue_ui;
+#[path = "blueprint_ui/provider_profiles.rs"]
+mod provider_profiles_ui;
+#[path = "blueprint_ui/queue_restore.rs"]
+mod queue_restore_ui;
 #[path = "blueprint_ui/selection_retention.rs"]
 mod selection_retention_ui;
 #[path = "blueprint_ui/sidebar.rs"]
@@ -1093,6 +1099,38 @@ impl Ui {
         let id = id.into();
         self.with(cx, |window, cx| window.click(id, cx));
         cx.run_until_parked();
+    }
+
+    /// Settings grows as profiles are added. Find controls by their actual
+    /// position rather than relying on a fixed wheel distance.
+    fn click_settings(&self, cx: &mut TestAppContext, id: impl Into<ElementId>) {
+        let id = id.into();
+        for _ in 0..20 {
+            let visible = self.with(cx, |window, cx| {
+                window.render_frame(cx);
+                let target = window.find(id.clone());
+                let bounds = target.bounds();
+                let viewport = window.find("settings-content").bounds();
+                if target.visible()
+                    && bounds.top() >= viewport.top()
+                    && bounds.bottom() <= viewport.bottom()
+                {
+                    return true;
+                }
+                window.scroll(
+                    "settings-content",
+                    ScrollDelta::Pixels(point(px(0.), viewport.center().y - bounds.center().y)),
+                    cx,
+                );
+                false
+            });
+            cx.run_until_parked();
+            if visible {
+                self.click(cx, id);
+                return;
+            }
+        }
+        panic!("Settings control {id:?} could not be scrolled into view");
     }
 
     fn read<R>(&self, cx: &mut TestAppContext, f: impl FnOnce(&FlintApp, &App) -> R) -> R {
@@ -2360,8 +2398,8 @@ fn settings_save_to_config_and_are_read_on_startup(cx: &mut TestAppContext) {
         });
     });
     ui.scroll_settings(cx);
-    ui.click(cx, ("settings-approval", 0usize));
-    ui.click(cx, ("settings-effort", 2usize));
+    ui.click_settings(cx, ("settings-approval", 0usize));
+    ui.click_settings(cx, ("settings-effort", 2usize));
     ui.click(cx, "settings-save");
     assert!(ui.read(cx, |app, _| app.settings_form.is_none()));
     let saved = std::fs::read_to_string(home.join("config.toml")).unwrap();
@@ -3071,6 +3109,9 @@ fn sidebar_archive_scrollbar_keeps_restore_and_navigation_reachable(cx: &mut Tes
     );
     ui.click(cx, "sessions-control");
     seed_sidebar_sessions(&ui, cx, 20);
+    // Archives start collapsed (docs/PLAN-SIDEBAR-SIMPLIFY.md P4): open the
+    // disclosure before reading the list.
+    ui.click(cx, "archived-sessions");
     ui.with(cx, |window, cx| {
         window.render_frame(cx);
         let sidebar = window.find("sidebar").bounds();
@@ -3290,7 +3331,9 @@ fn sidebar_groups_by_project_status_or_agent_and_counts_hidden_sessions(cx: &mut
     assert_eq!(by_project[0].rows.len(), 4);
     assert!(matches!(by_project[0].key, GroupKey::Project(..)));
 
+    // Grouping is a menu now, not a cycler (docs/PLAN-SIDEBAR-SIMPLIFY.md P5).
     ui.click(cx, "session-grouping");
+    ui.click(cx, ("grouping-option", 1usize));
     assert_eq!(ui.read(cx, |app, _| app.grouping), SessionGrouping::Status);
     let by_status = groups(&ui, cx);
     let labels: Vec<_> = by_status.iter().map(|g| g.label.as_str()).collect();
@@ -3299,6 +3342,7 @@ fn sidebar_groups_by_project_status_or_agent_and_counts_hidden_sessions(cx: &mut
     assert_eq!(by_status[0].rows, vec![3]);
 
     ui.click(cx, "session-grouping");
+    ui.click(cx, ("grouping-option", 2usize));
     assert_eq!(ui.read(cx, |app, _| app.grouping), SessionGrouping::Agent);
     let by_agent = groups(&ui, cx);
     let mut sizes: Vec<_> = by_agent
@@ -3357,10 +3401,11 @@ fn sidebar_groups_every_worktree_of_a_repository_together(cx: &mut TestAppContex
         .collect();
     labels.sort();
     assert_eq!(labels, [("other".to_string(), 1), ("repo".to_string(), 3)]);
-    // The row for the worktree shows its own branch.
+    // The row for the worktree shows its own branch, on the row's second line
+    // (docs/PLAN-SIDEBAR-SIMPLIFY.md P3 retires the third line).
     assert!(ui.with(cx, |window, cx| {
         window.render_frame(cx);
-        window.try_find(("sidebar-details", 1usize)).is_some()
+        window.try_find(("sidebar-branch", 1usize)).is_some()
     }));
     assert_eq!(
         flint_app::project::branch(&linked).as_deref(),
@@ -3726,9 +3771,9 @@ fn sidebar_tab_navigation_scrolls_offscreen_sessions_into_view(cx: &mut TestAppC
     let ui = open(cx);
     seed_sidebar_sessions(&ui, cx, 40);
     ui.click(cx, "session-search");
-    // Only the filter strip's "All" chip precedes the list; grouping is
-    // beside Settings in the footer.
-    for _ in 0..42 {
+    // Only the filter strip's "All" chip and the group heading precede the
+    // list; grouping is beside Settings in the footer.
+    for _ in 0..43 {
         ui.press(cx, "tab");
         ui.with(cx, |window, cx| {
             window.render_frame(cx);
@@ -5711,6 +5756,75 @@ fn droid_is_selectable_and_its_options_and_session_survive_restart(cx: &mut Test
     ui.press(cx, "enter");
     assert_eq!(ui.read(cx, |app, _| app.session().agent), AgentKind::Droid);
     assert_eq!(ui.composer_text(cx), "");
+}
+
+#[gpui_kit::test]
+fn opencode_is_selectable_and_its_session_survives_restart(cx: &mut TestAppContext) {
+    use flint_agent::AgentKind;
+    let options = test_options();
+    let ui = open_with(cx, options.clone());
+    ui.click(cx, "model-chip");
+    let index = flint_app::agents::AGENTS
+        .iter()
+        .position(|kind| *kind == AgentKind::OpenCode)
+        .unwrap();
+    ui.click(cx, ("agent-item", index));
+    assert_eq!(
+        ui.read(cx, |app, _| app.session().agent),
+        AgentKind::OpenCode
+    );
+    assert_eq!(
+        ui.read(cx, |app, _| app.agent_label(app.session().agent)),
+        "OpenCode"
+    );
+    let engine = ui.engine(cx);
+    ui.input(cx, "OpenCode task");
+    ui.press(cx, "enter");
+    assert!(matches!(engine.sent().as_slice(),
+        [Op::UserMessage(text)] if text == "OpenCode task"));
+    engine.send(cx, agent_options("default"));
+    assert!(has(&ui, cx, "option-model"));
+    ui.click(cx, "option-model");
+    ui.press(cx, "down");
+    ui.press(cx, "enter");
+    assert!(matches!(engine.sent().as_slice(),
+        [Op::SetSessionOption { id, value }] if id == "model" && value == "opus"));
+    for event in [
+        AgentEvent::TurnStarted { turn_id: 1 },
+        AgentEvent::TextDelta("OpenCode answer.".into()),
+        AgentEvent::TurnFinished {
+            turn_id: 1,
+            reason: TurnEndReason::Completed,
+        },
+    ] {
+        engine.send(cx, event);
+    }
+    let again = open_with(cx, options);
+    assert!(again.read(cx, |app, _| app.sessions.iter().any(
+        |session| session.title() == "OpenCode task" && session.agent == AgentKind::OpenCode
+    )));
+    ui.input(cx, "/agent flint");
+    ui.press(cx, "enter");
+    ui.input(cx, "/agent opencode");
+    ui.press(cx, "enter");
+    assert_eq!(
+        ui.read(cx, |app, _| app.session().agent),
+        AgentKind::OpenCode
+    );
+    assert_eq!(ui.composer_text(cx), "");
+}
+
+#[gpui_kit::test]
+fn command_palette_opens_an_opencode_session(cx: &mut TestAppContext) {
+    let ui = open(cx);
+    ui.press(cx, "cmd-k");
+    ui.input(cx, "New OpenCode session");
+    ui.press(cx, "enter");
+    assert_eq!(
+        ui.read(cx, |app, _| app.session().agent),
+        flint_agent::AgentKind::OpenCode
+    );
+    assert!(ui.read(cx, |app, _| app.palette.is_none()));
 }
 
 #[gpui_kit::test]

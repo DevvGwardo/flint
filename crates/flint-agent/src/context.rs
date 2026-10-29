@@ -177,9 +177,18 @@ fn summarize_turn(turn: &[Message]) -> String {
         _ => None,
     });
     let mut edited: Vec<String> = Vec::new();
+    let mut sources: Vec<String> = Vec::new();
     for message in turn {
         if let Message::Assistant { tool_calls, .. } = message {
             for call in tool_calls {
+                if call.name == "read_file"
+                    && let Some(source) = read_source(&call.arguments)
+                    && !sources.contains(&source)
+                    && sources.iter().map(|s| s.len() + 1).sum::<usize>() + source.len()
+                        <= SUMMARY_FIELD_CHARS
+                {
+                    sources.push(source);
+                }
                 if matches!(call.name.as_str(), "write_file" | "edit_file")
                     && let Ok(args) = serde_json::from_str::<Value>(&call.arguments)
                     && let Some(path) = args.get("path").and_then(Value::as_str)
@@ -198,7 +207,29 @@ fn summarize_turn(turn: &[Message]) -> String {
     if !edited.is_empty() {
         line.push_str(&format!(" | Edited: {}", edited.join(", ")));
     }
+    if !sources.is_empty() {
+        line.push_str(&format!(
+            " | Sources (historical; re-read): {}",
+            sources.join(" ")
+        ));
+    }
     line
+}
+
+/// Source locations, not old contents or evidence that a read succeeded.
+fn read_source(arguments: &str) -> Option<String> {
+    let args: Value = serde_json::from_str(arguments).ok()?;
+    let path = args.get("path")?.as_str()?;
+    if path.is_empty() || path.len() > 160 || path.chars().any(char::is_control) {
+        return None;
+    }
+    let mut source = serde_json::json!({"path":path});
+    for key in ["offset", "limit"] {
+        if let Some(value) = args.get(key).filter(|value| value.is_u64()) {
+            source[key] = value.clone();
+        }
+    }
+    Some(source.to_string())
 }
 
 fn one_line(text: &str) -> String {

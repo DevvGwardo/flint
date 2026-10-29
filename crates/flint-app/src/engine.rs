@@ -40,7 +40,21 @@ pub fn config_for(
     let mut effective = settings.clone();
     effective.base_url =
         (sources.env)("FLINT_BASE_URL").unwrap_or_else(|| settings.base_url.clone());
+    effective.validate_provider().map_err(anyhow::Error::msg)?;
     let Some(found) = effective.resolve_key(key_file, sources) else {
+        if effective.provider == crate::settings::ProviderKind::OmniRoute {
+            bail!(
+                "{NO_KEY} for OmniRoute. Set OMNIROUTE_API_KEY or choose the router's API \
+                 key file in Settings. For a loopback router with API-key enforcement off, \
+                 explicitly enable local no-auth mode."
+            );
+        }
+        if effective.provider == crate::settings::ProviderKind::Custom {
+            bail!(
+                "{NO_KEY} for the custom provider. Choose its API key environment variable \
+                 or key file in Settings, then retry. Other providers' keys are not used."
+            );
+        }
         bail!(
             "{NO_KEY}. Set FLINT_API_KEY (or OPENAI_API_KEY) in the environment, or choose a \
              key file in Settings, then retry. An unauthenticated local server still needs \

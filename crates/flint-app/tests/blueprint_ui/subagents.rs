@@ -497,7 +497,9 @@ fn subagent_sidebar_keyboard_reveals_offscreen_children(cx: &mut TestAppContext)
         );
     }
     ui.click(cx, "session-search");
-    for _ in 0..25 {
+    // The group heading is one tab stop ahead of the rows
+    // (docs/PLAN-SIDEBAR-SIMPLIFY.md P4).
+    for _ in 0..26 {
         ui.press(cx, "tab");
         ui.with(cx, |window, cx| {
             window.render_frame(cx);

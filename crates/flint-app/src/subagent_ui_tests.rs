@@ -178,6 +178,19 @@ fn duplicate_started_event_does_not_duplicate_child_prompt() {
 }
 
 #[test]
+fn unknown_child_lookup_is_fail_closed_not_a_panic() {
+    let mut view = SessionView::default();
+    start(&mut view, "call", "agent-1", "Inspect.");
+    assert!(view.subagent("missing").is_none());
+    assert!(view.subagent_mut("missing").is_none());
+    // Marking read on a missing child must be a no-op, never unwrap.
+    if let Some(child) = view.subagent_mut("missing") {
+        child.unread = false;
+    }
+    assert!(view.subagent("agent-1").is_some());
+}
+
+#[test]
 fn interrupt_closes_running_and_queued_children_without_touching_finished_children() {
     let mut view = SessionView::default();
     view.fold(AgentEvent::TurnStarted { turn_id: 1 }, Duration::ZERO);

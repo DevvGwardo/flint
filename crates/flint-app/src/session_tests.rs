@@ -348,6 +348,18 @@ fn unsaved_event_logging_does_not_start_storage_or_consume_the_event() {
 }
 
 #[test]
+fn owned_record_logging_without_a_dir_is_a_noop_not_a_panic() {
+    use crate::store::Logged;
+    let mut session = Session::new(1, PathBuf::new());
+    assert!(session.dir.is_none());
+    session.log(Logged::User("unsaved prompt".into())).unwrap();
+    session.flush_records().unwrap();
+    assert!(session.event_writer.is_none());
+    assert!(session.pending_records.is_empty());
+    assert!(!session.storage_failed());
+}
+
+#[test]
 fn saved_event_logging_owns_records_and_keeps_order_across_flushes() {
     use crate::store::Logged;
     let root = tempfile::tempdir().unwrap();

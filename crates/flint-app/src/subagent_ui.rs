@@ -144,6 +144,7 @@ impl FlintApp {
             return;
         }
         self.select_session_with_focus(ix, false, window, cx);
+        self.invalidate_genui_actions();
         if let Some(pane) = self.session_workspace.panes.get_mut(&uid)
             && pane.mode == crate::session_workspace::PaneMode::Terminal
         {
@@ -152,7 +153,9 @@ impl FlintApp {
         let session = &mut self.sessions[ix];
         session.selected_subagent = Some(id.to_string());
         session.subagents_expanded = true;
-        session.view.subagent_mut(id).unwrap().unread = false;
+        if let Some(subagent) = session.view.subagent_mut(id) {
+            subagent.unread = false;
+        }
         self.copied = None;
         self.copied_conversation = None;
         self.mention = None;
@@ -272,7 +275,9 @@ pub(crate) fn sidebar_children(
     let uid = session.uid;
     let query = app.search_query(cx);
     let expanded = session.subagents_expanded || !query.is_empty();
-    let parent_matches = app.parent_matches_query(app.session_index(uid).unwrap(), &query);
+    let parent_matches = app
+        .session_index(uid)
+        .is_some_and(|ix| app.parent_matches_query(ix, &query));
     let children = session.view.subagents.iter().filter(|child| {
         (parent_matches || child.matches_query(&query))
             && match app.filter {

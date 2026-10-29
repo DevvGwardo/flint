@@ -10,6 +10,7 @@ pub mod app_demo;
 pub mod app_engine;
 pub mod app_input;
 pub mod app_store;
+pub mod auto_continue;
 pub mod branches;
 pub mod brand;
 pub mod changes_panel;
@@ -23,6 +24,8 @@ pub mod docking;
 pub mod engine;
 pub mod file_preview;
 pub mod general;
+pub(crate) mod genui_bridge;
+pub(crate) mod genui_ui;
 pub mod header;
 mod image_attach;
 mod launcher;
@@ -132,6 +135,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("secondary-o", OpenWorkspace, None),
         KeyBinding::new("secondary-.", Interrupt, None),
         KeyBinding::new("secondary-l", FocusComposer, None),
+        KeyBinding::new("secondary-f", FocusSearch, None),
         KeyBinding::new("secondary-q", Quit, None),
         KeyBinding::new("secondary-,", OpenSettings, None),
         KeyBinding::new("secondary-shift-r", RevealWorkspace, None),

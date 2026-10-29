@@ -320,6 +320,154 @@ fn resolving_own_blockers_requires_explicit_checked_evidence_and_preserves_user_
     );
 }
 
+#[test]
+fn informational_blocker_resolution_requires_new_current_inspection_and_exact_text() {
+    let mut task = TaskRecord::new(1, "What did I work on recently?".into(), 0);
+    let args = json!({"path":"activity.md"});
+    task.observe_inspection("read_file", ToolKind::Read, &args);
+    task.add_blocker("Activity source not yet found.", "agent report");
+    let resolution = json!({
+        "summary":"Read the activity source and found recent work.",
+        "deliverables":[], "blockers":[],
+        "resolved_blockers":["Activity source not yet found."],
+    });
+    assert!(
+        task.report(&resolution).is_err(),
+        "old inspection is not recovery evidence"
+    );
+    task.observe_inspection("read_file", ToolKind::Read, &args);
+    task.set_work_revision(1);
+    assert!(
+        task.report(&resolution).is_err(),
+        "stale inspection is not recovery evidence"
+    );
+    task.observe_inspection("read_file", ToolKind::Read, &args);
+    let contract = task.contract.clone();
+    task.report(&resolution).unwrap();
+    assert!(task.blockers.is_empty());
+    assert_eq!(task.contract, contract);
+    assert!(!task.has_current_verification() && !task.is_accepted());
+    task.validate().unwrap();
+}
+
+#[test]
+fn inspection_cannot_clear_user_blockers_or_replace_work_verification() {
+    for request in [
+        "Fix the parser.",
+        "Analyze only.\nRequired check: cargo test",
+        "Analyze only.\nRequired file: report.md",
+    ] {
+        let mut task = TaskRecord::new(1, request.into(), 0);
+        task.add_blocker("Missing input", "agent report");
+        task.observe_inspection("list_dir", ToolKind::Read, &json!({"path":"."}));
+        assert!(
+            task.report(&json!({
+                "summary":"Inspected", "deliverables":[], "blockers":[],
+                "resolved_blockers":["Missing input"],
+            }))
+            .is_err(),
+            "{request}"
+        );
+        assert_eq!(task.blockers.len(), 1);
+    }
+    let mut task = TaskRecord::new(1, "Analyze the code.".into(), 0);
+    task.add_blocker("User requested more work", "user review");
+    task.observe_inspection("read_file", ToolKind::Read, &json!({"path":"source.rs"}));
+    assert!(
+        task.report(&json!({
+            "summary":"Inspected", "deliverables":[], "blockers":[],
+            "resolved_blockers":["User requested more work"],
+        }))
+        .is_err()
+    );
+}
+
+#[test]
+fn informational_inspection_cannot_certify_observed_edits() {
+    let mut task = TaskRecord::new(1, "What changed?".into(), 0);
+    task.add_blocker("Missing input", "agent report");
+    task.observed_edits = 1;
+    task.observe_inspection("list_dir", ToolKind::Read, &json!({"path":"."}));
+    assert!(
+        task.report(&json!({
+            "summary":"Inspected", "deliverables":[], "blockers":[],
+            "resolved_blockers":["Missing input"],
+        }))
+        .is_err()
+    );
+    assert!(!task.has_current_verification());
+}
+
+#[test]
+fn only_known_inspection_calls_count_as_blocker_resolution_evidence() {
+    let mut task = TaskRecord::new(1, "What changed?".into(), 0);
+    for (name, kind, args) in [
+        ("report_task", ToolKind::Other, json!({"summary":"Done"})),
+        (
+            "run_command",
+            ToolKind::Command,
+            json!({"command":"cargo test"}),
+        ),
+        (
+            "run_command",
+            ToolKind::Command,
+            json!({"command":"echo ok > out.txt"}),
+        ),
+        (
+            "run_command",
+            ToolKind::Command,
+            json!({"command":"python3 -c 'print(1)'"}),
+        ),
+        ("mcp__server__read", ToolKind::Read, json!({})),
+    ] {
+        task.observe_inspection(name, kind, &args);
+        assert!(task.last_inspection.is_none(), "{name}: {args}");
+    }
+    task.observe_inspection(
+        "run_command",
+        ToolKind::Command,
+        &json!({"command":"git log -3"}),
+    );
+    assert_eq!(task.last_inspection.as_ref().unwrap().id, 1);
+}
+
+#[test]
+fn blocker_inspection_evidence_roundtrips_and_legacy_records_remain_valid() {
+    let mut task = TaskRecord::new(1, "What changed?".into(), 0);
+    task.observe_inspection(
+        "read_file",
+        ToolKind::Read,
+        &json!({"path":"x".repeat(2_000)}),
+    );
+    task.add_blocker("Need another source", "agent report");
+    let mut saved = serde_json::to_value(&task).unwrap();
+    let mut restored: TaskRecord = serde_json::from_value(saved.clone()).unwrap();
+    assert_eq!(restored, task);
+    restored.validate().unwrap();
+    restored.observe_inspection("list_dir", ToolKind::Read, &json!({"path":"."}));
+    assert_eq!(restored.last_inspection.as_ref().unwrap().id, 2);
+    assert_eq!(restored.blockers[0].inspection_id, 1);
+    restored.contract.revision += 1;
+    assert!(
+        restored
+            .report(&json!({
+                "summary":"Inspected", "deliverables":[], "blockers":[],
+                "resolved_blockers":["Need another source"],
+            }))
+            .is_err(),
+        "old-scope inspection cannot resolve a new-scope blocker"
+    );
+    saved.as_object_mut().unwrap().remove("last_inspection");
+    saved["blockers"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("inspection_id");
+    let legacy: TaskRecord = serde_json::from_value(saved).unwrap();
+    legacy.validate().unwrap();
+    assert!(legacy.last_inspection.is_none());
+    assert_eq!(legacy.blockers[0].inspection_id, 0);
+}
+
 fn edit(task: &TaskRecord) -> TaskEdit {
     TaskEdit {
         task_id: task.contract.id,
@@ -969,4 +1117,165 @@ fn native_history_readers_reject_a_fifo_without_blocking_or_moving_it() {
             .is_fifo()
     );
     assert!(!root.path().join("history.json.corrupt").exists());
+}
+
+/// Moves a file's timestamp into the past so the scan cache may reuse it.
+fn settle(path: &Path) -> std::time::SystemTime {
+    let settled = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_600_000_000);
+    std::fs::File::options()
+        .write(true)
+        .open(path)
+        .unwrap()
+        .set_modified(settled)
+        .unwrap();
+    settled
+}
+
+#[test]
+fn fingerprint_cache_reuses_settled_files_but_follows_metadata_moves() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("result");
+    std::fs::write(&path, "aaaa").unwrap();
+    let settled = settle(&path);
+    let mut cache = FileScanCache::default();
+    let first = file_state_cached(root.path(), "result", &mut cache);
+    let FileState::Present { .. } = first else {
+        panic!("expected a present file, got {first:?}");
+    };
+    // Reuse is keyed on metadata: a same-length rewrite that keeps the
+    // timestamp is served from the cache without re-reading the bytes.
+    std::fs::write(&path, "bbbb").unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_modified(settled)
+        .unwrap();
+    assert_eq!(file_state_cached(root.path(), "result", &mut cache), first);
+    assert_eq!(cache.entries.len(), 1);
+    // A scan without the cache reads the bytes, so the reuse above is a cache
+    // decision and never a change in what the evidence means.
+    assert_ne!(file_state(root.path(), "result"), first);
+    // Any metadata move re-reads immediately, even inside the grace window.
+    std::fs::write(&path, "cccc-and-longer").unwrap();
+    let moved = file_state_cached(root.path(), "result", &mut cache);
+    assert!(matches!(moved, FileState::Present { bytes: 15, .. }));
+    assert_ne!(moved, first);
+    // A recently written file is hashed even when its metadata matches a
+    // cached entry, because one timestamp tick can hide a same-size rewrite.
+    let recent = root.path().join("recent");
+    std::fs::write(&recent, "1234").unwrap();
+    let mut warm = FileScanCache::default();
+    let hashed = file_state_cached(root.path(), "recent", &mut warm);
+    std::fs::write(&recent, "5678").unwrap();
+    assert_ne!(file_state_cached(root.path(), "recent", &mut warm), hashed);
+}
+
+#[test]
+fn fingerprint_cache_forgets_missing_and_oversized_files() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("result");
+    std::fs::write(&path, "aaaa").unwrap();
+    settle(&path);
+    let mut cache = FileScanCache::default();
+    assert!(matches!(
+        file_state_cached(root.path(), "result", &mut cache),
+        FileState::Present { .. }
+    ));
+    assert_eq!(cache.entries.len(), 1);
+    std::fs::remove_file(&path).unwrap();
+    assert_eq!(
+        file_state_cached(root.path(), "result", &mut cache),
+        FileState::Missing
+    );
+    assert!(
+        cache.entries.is_empty(),
+        "a missing file holds no fingerprint"
+    );
+    // Oversized files are rejected from metadata alone and never cached.
+    let big = root.path().join("big");
+    std::fs::File::create(&big)
+        .unwrap()
+        .set_len(MAX_FILE_BYTES + 1)
+        .unwrap();
+    assert!(matches!(
+        file_state_cached(root.path(), "big", &mut cache),
+        FileState::Unknown(_)
+    ));
+    assert!(cache.entries.is_empty());
+}
+
+#[test]
+fn cached_refresh_matches_a_fresh_refresh_and_still_flags_drift() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("result"), "before").unwrap();
+    settle(&root.path().join("result"));
+    let mut task = TaskRecord::new(1, "Produce result.\nRequired file: result".into(), 0);
+    let mut cache = FileScanCache::default();
+    assert!(!task.refresh_files_cached(root.path(), &mut cache));
+    let mut fresh = task.clone();
+    assert!(!fresh.refresh_files(root.path()));
+    assert_eq!(fresh.files, task.files);
+    // A second cached scan of unchanged files reports no drift.
+    assert!(!task.refresh_files_cached(root.path(), &mut cache));
+    // A real change is still detected with a warm cache.
+    std::fs::write(root.path().join("result"), "after-and-longer").unwrap();
+    assert!(task.refresh_files_cached(root.path(), &mut cache));
+    fresh.refresh_files(root.path());
+    assert_eq!(fresh.files, task.files);
+    assert_eq!(task.files[0].state, fresh.files[0].state);
+}
+
+/// `Verified` is the strongest outcome the engine awards automatically, so a
+/// child holding it must not reach the parent as failed work. The predicate is
+/// shared with `run_child` and the finish-progress counter, which previously
+/// listed three of the four usable outcomes and silently dropped `Verified`.
+#[test]
+fn verified_child_reports_are_usable_work() {
+    for outcome in [
+        TaskOutcome::Answered,
+        TaskOutcome::NeedsReview,
+        TaskOutcome::Accepted,
+        TaskOutcome::Verified,
+    ] {
+        assert!(
+            outcome.is_usable_child_report(),
+            "{} should count as usable child work",
+            outcome.label()
+        );
+    }
+    for outcome in [
+        TaskOutcome::Partial,
+        TaskOutcome::Blocked,
+        TaskOutcome::Unknown,
+    ] {
+        assert!(
+            !outcome.is_usable_child_report(),
+            "{} must not count as usable child work",
+            outcome.label()
+        );
+    }
+
+    let mut task = TaskRecord::new(1, "Fix the rounding bug.".into(), 0);
+    task.note_child(
+        "child-1",
+        &TaskAssessment {
+            task_id: 2,
+            contract_revision: 0,
+            work_revision: 1,
+            outcome: TaskOutcome::Verified,
+            reason: TurnEndReason::Completed,
+            requirements: Vec::new(),
+            issues: Vec::new(),
+        },
+    );
+    let assessment = task.assess(TurnEndReason::Completed, false);
+    assert!(
+        !assessment
+            .issues
+            .iter()
+            .any(|issue| issue.starts_with("Child ")),
+        "a Verified child was reported as a failed dependency: {:?}",
+        assessment.issues
+    );
 }

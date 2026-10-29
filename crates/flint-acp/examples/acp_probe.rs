@@ -2,7 +2,7 @@
 //! prompt (no model usage): proves the adapter launches, the handshake works
 //! and the agent is logged in.
 //!
-//! cargo run -p flint-acp --example acp_probe -- [claude|codex|droid]...
+//! cargo run -p flint-acp --example acp_probe -- [claude|codex|droid|opencode]...
 
 use std::time::Duration;
 use std::time::Instant;
@@ -19,6 +19,7 @@ fn main() {
         ("claude", AcpAgent::ClaudeCode),
         ("codex", AcpAgent::Codex),
         ("droid", AcpAgent::Droid),
+        ("opencode", AcpAgent::OpenCode),
     ] {
         if !wanted.is_empty() && !wanted.iter().any(|w| w == key) {
             continue;

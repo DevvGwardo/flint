@@ -106,6 +106,10 @@ const TASKS: &[Task] = &[
 
 struct Outcome {
     passed: bool,
+    artifact_passed: Option<bool>,
+    shutdown_verified: bool,
+    assessment: Option<serde_json::Value>,
+    jev_verdicts: Vec<serde_json::Value>,
     reason: TurnEndReason,
     steps: u32,
     nudges: u32,
@@ -162,7 +166,83 @@ fn grader_rejects_failed_cli_process_after_valid_output() {
     );
 }
 
-fn run_task(task: &Task, base: &AgentConfig, jev: bool) -> Outcome {
+async fn receive_until<T>(
+    events: &async_channel::Receiver<T>,
+    deadline: Instant,
+) -> Result<T, &'static str> {
+    // A ready receive can win Tokio's timeout poll even past the deadline.
+    if Instant::now() >= deadline {
+        return Err("timed out");
+    }
+    tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), events.recv())
+        .await
+        .map_err(|_| "timed out")?
+        .map_err(|_| "event stream closed")
+}
+
+async fn await_shutdown(events: &async_channel::Receiver<AgentEvent>, deadline: Instant) -> bool {
+    while let Ok(event) = receive_until(events, deadline).await {
+        if let AgentEvent::SessionStopped { history_saved } = event {
+            return history_saved;
+        }
+    }
+    false
+}
+
+#[tokio::test]
+async fn event_deadline_expires_even_when_the_provider_is_silent() {
+    let (_sender, events) = async_channel::unbounded::<AgentEvent>();
+    let result = tokio::time::timeout(
+        Duration::from_secs(1),
+        receive_until(&events, Instant::now() + Duration::from_millis(10)),
+    )
+    .await
+    .expect("receive ignored its deadline");
+    assert!(matches!(result, Err("timed out")));
+}
+
+#[tokio::test]
+async fn expired_event_deadline_also_rejects_an_always_ready_stream() {
+    let (sender, events) = async_channel::unbounded();
+    sender
+        .send(AgentEvent::SessionStopped {
+            history_saved: true,
+        })
+        .await
+        .unwrap();
+    assert!(matches!(
+        receive_until(&events, Instant::now() - Duration::from_secs(1)).await,
+        Err("timed out")
+    ));
+}
+
+#[tokio::test]
+async fn grading_barrier_requires_a_verified_shutdown_not_just_turn_completion() {
+    for saved in [false, true] {
+        let (sender, events) = async_channel::unbounded();
+        sender
+            .send(AgentEvent::TurnFinished {
+                turn_id: 1,
+                reason: TurnEndReason::Completed,
+            })
+            .await
+            .unwrap();
+        sender
+            .send(AgentEvent::SessionStopped {
+                history_saved: saved,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            await_shutdown(&events, Instant::now() + Duration::from_secs(1)).await,
+            saved
+        );
+    }
+    let (_sender, events) = async_channel::unbounded();
+    assert!(!await_shutdown(&events, Instant::now() + Duration::from_millis(10)).await);
+}
+
+async fn run_task(task: &Task, base: &AgentConfig, jev: bool) -> Outcome {
     let dir = tempfile::tempdir().expect("tempdir");
     let workspace = dir.path().canonicalize().expect("canonical");
     for (path, content) in task.files {
@@ -178,30 +258,56 @@ fn run_task(task: &Task, base: &AgentConfig, jev: bool) -> Outcome {
     let handle = flint_agent::spawn_session(config);
     handle
         .ops
-        .send_blocking(Op::UserMessage(task.prompt.to_string()))
+        .send(Op::UserMessage(task.prompt.to_string()))
+        .await
         .expect("send");
     let deadline = Instant::now() + Duration::from_secs(600);
     let (mut steps, mut nudges, mut usage) = (0, 0, flint_agent::Usage::default());
-    let mut reason = TurnEndReason::Failed("timed out".into());
-    while Instant::now() < deadline {
-        let Ok(event) = handle.events.recv_blocking() else {
-            break;
+    let (mut assessment, mut jev_verdicts) = (None, Vec::new());
+    let reason = loop {
+        let event = match receive_until(&handle.events, deadline).await {
+            Ok(event) => event,
+            Err(message) => break TurnEndReason::Failed(message.into()),
         };
         match event {
             AgentEvent::StepStarted { step, .. } => steps = step + 1,
             AgentEvent::HarnessNudge { .. } => nudges += 1,
             AgentEvent::Usage(u) => usage = u,
+            AgentEvent::TaskAssessed { task, .. } => assessment = Some(json!(task.assessment)),
+            AgentEvent::JevVerdict {
+                question,
+                probability,
+                confirmed,
+            } => {
+                jev_verdicts.push(json!({
+                    "question": question, "probability": probability, "confirmed": confirmed,
+                }));
+            }
             AgentEvent::TurnFinished { reason: r, .. } => {
-                reason = r;
-                break;
+                break r;
             }
             _ => {}
         }
+    };
+    let _ = handle.ops.send(Op::Shutdown).await;
+    let shutdown_verified =
+        await_shutdown(&handle.events, Instant::now() + Duration::from_secs(30)).await;
+    // Do not grade files while the engine could still be writing them.
+    let artifact_passed = shutdown_verified
+        .then(|| grade_check(&workspace, task.check).is_ok_and(|out| out.status.success()));
+    let passed = matches!(reason, TurnEndReason::Completed) && artifact_passed == Some(true);
+    if !shutdown_verified {
+        eprintln!(
+            "unverified shutdown; retained workspace: {}",
+            dir.keep().display()
+        );
     }
-    let _ = handle.ops.send_blocking(Op::Shutdown);
-    let passed = grade_check(&workspace, task.check).is_ok_and(|out| out.status.success());
     Outcome {
         passed,
+        artifact_passed,
+        shutdown_verified,
+        assessment,
+        jev_verdicts,
         reason,
         steps,
         nudges,
@@ -232,6 +338,10 @@ fn eval_suite() {
     };
     let mut results = Vec::new();
     let mut summary = Vec::new();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .expect("evaluation event runtime");
     for (variant, jev) in &variants {
         let (mut passed, mut total) = (0, 0);
         for task in TASKS
@@ -239,7 +349,7 @@ fn eval_suite() {
             .filter(|t| only.as_ref().is_none_or(|o| o.iter().any(|n| n == t.name)))
         {
             for trial in 0..trials {
-                let outcome = run_task(task, &base, *jev);
+                let outcome = runtime.block_on(run_task(task, &base, *jev));
                 eprintln!(
                     "{variant:7} {:20} #{trial} {} {:?} steps={} nudges={} {:.0}s",
                     task.name,
@@ -254,6 +364,9 @@ fn eval_suite() {
                 results.push(json!({
                     "variant": variant, "task": task.name, "trial": trial,
                     "passed": outcome.passed, "reason": format!("{:?}", outcome.reason),
+                    "artifact_passed": outcome.artifact_passed,
+                    "shutdown_verified": outcome.shutdown_verified,
+                    "assessment": outcome.assessment, "jev_verdicts": outcome.jev_verdicts,
                     "steps": outcome.steps, "nudges": outcome.nudges,
                     "input_tokens": outcome.input_tokens, "output_tokens": outcome.output_tokens,
                     "seconds": outcome.seconds,

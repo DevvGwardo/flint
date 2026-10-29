@@ -145,6 +145,11 @@ pub fn render(app: &FlintApp, window: &mut Window, cx: &mut Context<FlintApp>) -
                 format!("Credential missing; set {source} or open Settings"),
                 true,
             ),
+            KeyStatus::NotRequired => (
+                "Local OmniRoute · no authentication".into(),
+                "You enabled no-auth mode for this loopback router.".into(),
+                false,
+            ),
         }
     } else {
         (

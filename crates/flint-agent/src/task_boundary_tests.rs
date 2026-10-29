@@ -610,11 +610,16 @@ async fn a_gated_fingerprint_scan_yields_while_sibling_work_invalidates_checks()
     let (started, entered) = tokio::sync::oneshot::channel();
     let (release, gate) = std::sync::mpsc::channel();
     let workspace = root.path().to_path_buf();
-    let scan = tokio::spawn(scan_task_files(task, workspace, move |task, workspace| {
-        started.send(()).unwrap();
-        gate.recv_timeout(Duration::from_secs(3)).unwrap();
-        task.refresh_files(workspace)
-    }));
+    let scan = tokio::spawn(scan_task_files(
+        task,
+        workspace,
+        crate::task::FileScanCache::default(),
+        move |task, workspace, cache| {
+            started.send(()).unwrap();
+            gate.recv_timeout(Duration::from_secs(3)).unwrap();
+            task.refresh_files_cached(workspace, cache)
+        },
+    ));
     tokio::time::timeout(Duration::from_secs(1), entered)
         .await
         .unwrap()
@@ -627,7 +632,7 @@ async fn a_gated_fingerprint_scan_yields_while_sibling_work_invalidates_checks()
         .unwrap();
     std::fs::write(root.path().join("result"), "sibling changed this").unwrap();
     release.send(()).unwrap();
-    let (mut task, changed) = scan.await.unwrap().unwrap();
+    let (mut task, changed, _scans) = scan.await.unwrap().unwrap();
     assert!(changed);
     task.set_work_revision(revision);
     assert_eq!(

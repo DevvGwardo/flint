@@ -119,6 +119,9 @@ impl FlintApp {
         cx: &mut Context<Self>,
     ) {
         // Drafts belong to sessions even when only one session is visible.
+        if old != new || self.session().selected_subagent.is_some() {
+            self.invalidate_genui_actions();
+        }
         self.swap_pane_draft(old, new, window, cx);
         if self.session_workspace.tiled() {
             if !self.session_workspace.visible(new) {
@@ -216,6 +219,9 @@ impl FlintApp {
     }
 
     pub(crate) fn focus_session_input(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.session().selected_subagent.is_some() {
+            self.invalidate_genui_actions();
+        }
         self.sessions[self.active].selected_subagent = None;
         let uid = self.session().uid;
         if self.session_workspace.tiled()

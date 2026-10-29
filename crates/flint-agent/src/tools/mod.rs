@@ -38,9 +38,10 @@ pub const LIST_MODELS: &str = "list_models";
 pub const UPDATE_PLAN: &str = "update_plan";
 pub const FETCH_URL: &str = "fetch_url";
 pub const REPORT_TASK: &str = "report_task";
+pub const RENDER_UI: &str = "render_ui";
 
 /// Names of every tool, in the order they are offered.
-pub const TOOL_NAMES: [&str; 11] = [
+pub const TOOL_NAMES: [&str; 12] = [
     RUN_COMMAND,
     READ_FILE,
     WRITE_FILE,
@@ -52,6 +53,7 @@ pub const TOOL_NAMES: [&str; 11] = [
     SPAWN_AGENT,
     LIST_MODELS,
     REPORT_TASK,
+    RENDER_UI,
 ];
 
 /// What a finished tool call produced.
@@ -88,7 +90,7 @@ impl ToolOutcome {
 pub fn tool_kind(name: &str) -> ToolKind {
     match name {
         RUN_COMMAND => ToolKind::Command,
-        READ_FILE | LIST_DIR => ToolKind::Read,
+        READ_FILE | LIST_DIR | RENDER_UI => ToolKind::Read,
         WRITE_FILE | EDIT_FILE => ToolKind::Edit,
         GREP | FETCH_URL => ToolKind::Search,
         _ => ToolKind::Other,
@@ -270,6 +272,9 @@ pub fn tool_specs() -> Vec<Value> {
              This records your report, not acceptance. Do not omit a blocker to imply it is resolved. \
              After fixing a reported blocker and passing a current check, explicitly resolve its \
              exact previous text with resolved_blockers. User-review blockers cannot be cleared. \
+             For an informational task without required files/checks or observed edits, a new \
+             relevant successful inspection after the blocker report can replace the check. \
+             Explain the evidence in summary; an empty search is not proof of global absence. \
              In a read-only review, return findings in chat. Optional changes or executable \
              tests belong in proposed_actions, not blockers. Report a blocker only when \
              something necessary for the current request cannot be done. \
@@ -283,6 +288,27 @@ pub fn tool_specs() -> Vec<Value> {
                 "resolved_blockers": {"type":"array", "items":{"type":"string"}, "description":"Optional exact texts of previously agent-reported blockers now fixed and checked. Does not clear user-review blockers."}
             }),
             &["summary", "deliverables", "blockers"],
+        ),
+        spec(
+            RENDER_UI,
+            "Prepare a native Google GenUI interactive view as DATA, never code or acceptance. \
+             Pass surface with surface_id='task', catalog_id='dev.hooter.safe.v1', data (up to 64 plain strings), \
+             and a complete tree of components including id='root'. Allowed component names: PlainText \
+             (text literal or {path:'/dataKey'}, optional style heading/body/muted/code), Column/Row \
+             (children IDs), Card (child ID), Divider, Button (child ID, action:{name:'open_task'|'stage_prompt'}). \
+             IDs are ASCII letters/digits/underscore/dash, at most 64 bytes. Every nonroot component has \
+             exactly one parent; no reused children/cycles/unknown references. Maximum 256 components, \
+             64 children per container, depth24, text16KiB, total256KiB. No functions, expressions, URLs as \
+             widgets, assets, Markdown, arbitrary themes, commands, approval or submission actions. \
+             Native task status remains separate and authoritative. This prepares a preview, not proof \
+             of delivery or verification. Prefer useful findings, evidence and next steps over decoration.",
+            json!({"surface":{"type":"object","properties":{
+                "surface_id":{"type":"string","enum":["task"]},
+                "catalog_id":{"type":"string","enum":["dev.hooter.safe.v1"]},
+                "components":{"type":"array","maxItems":256,"items":{"type":"object"}},
+                "data":{"type":"object","maxProperties":64,"additionalProperties":{"type":"string"}}
+            },"required":["surface_id","catalog_id","components","data"],"additionalProperties":false}}),
+            &["surface"],
         ),
         spec(
             SPAWN_AGENT,
@@ -486,6 +512,32 @@ pub async fn execute(
         LIST_DIR => files::list_dir(workspace, args).await,
         GREP => search::grep(workspace, args, cancel).await,
         FETCH_URL => fetch::fetch_url(args, cancel).await,
+        RENDER_UI => {
+            if cancel.is_cancelled() {
+                return ToolOutcome::error("Interactive view preparation was interrupted.");
+            }
+            if args.len() != 1 {
+                return ToolOutcome::error("Invalid interactive view arguments.");
+            }
+            let Some(value) = args.get("surface") else {
+                return ToolOutcome::error("Missing interactive surface.");
+            };
+            let surface =
+                match serde_json::from_value::<crate::genui::SurfaceSnapshot>(value.clone()) {
+                    Ok(surface) => surface,
+                    Err(_) => return ToolOutcome::error("Invalid interactive surface schema."),
+                };
+            if let Err(error) = surface.validate() {
+                return ToolOutcome::error(error);
+            }
+            let output = serde_json::to_string(&json!({"surface":surface})).unwrap_or_default();
+            if output.len() > crate::genui::MAX_FRAME_BYTES - 1024 {
+                return ToolOutcome::error(
+                    "Interactive surface exceeds the framed transport budget.",
+                );
+            }
+            ToolOutcome::ok(output)
+        }
         _ => ToolOutcome::error(format!(
             "unknown tool `{name}`. Available tools: {}",
             TOOL_NAMES.join(", ")

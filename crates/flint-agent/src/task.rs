@@ -267,6 +267,8 @@ pub enum TaskOutcome {
     Unknown,
     /// Explicit user acceptance, never model self-certification.
     Accepted,
+    /// Current checks plus a separate read-only review, not user acceptance.
+    Verified,
 }
 
 impl TaskOutcome {
@@ -278,11 +280,23 @@ impl TaskOutcome {
             Self::Blocked => "Blocked",
             Self::Unknown => "Unverified",
             Self::Accepted => "Accepted by you",
+            Self::Verified => "Verified automatically",
         }
     }
 
     pub fn allows_queue(self) -> bool {
-        matches!(self, Self::Answered | Self::Accepted)
+        matches!(self, Self::Answered | Self::Accepted | Self::Verified)
+    }
+
+    /// Whether a child reporting this outcome produced work the parent can build
+    /// on. `Accepted` and `Verified` are the strongest outcomes, `NeedsReview`
+    /// is a usable report and `Answered` is conversational. Blocked, partial and
+    /// unknown work is not task success.
+    pub fn is_usable_child_report(self) -> bool {
+        matches!(
+            self,
+            Self::Answered | Self::NeedsReview | Self::Accepted | Self::Verified
+        )
     }
 }
 
@@ -371,6 +385,18 @@ pub struct Blocker {
     pub text: String,
     /// "agent report", "child <id>", or "user review".
     pub source: String,
+    /// Successful inspection sequence when this claim was first recorded.
+    #[serde(default)]
+    pub inspection_id: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InspectionEvidence {
+    pub id: u64,
+    pub contract_revision: u64,
+    pub work_revision: u64,
+    pub tool: String,
+    pub target: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -424,6 +450,26 @@ pub struct Acceptance {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+pub enum AutomaticReviewVerdict {
+    Clean,
+    NeedsFixes,
+    Blocked,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AutomaticReview {
+    pub contract_revision: u64,
+    pub work_revision: u64,
+    pub model: String,
+    pub verdict: AutomaticReviewVerdict,
+    pub summary: String,
+    pub findings: Vec<String>,
+    pub reviewed_requirements: Vec<u64>,
+    pub inspected_files: Vec<FileEvidence>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ContinuationStopCause {
     NoProgress,
     BudgetExhausted,
@@ -469,6 +515,8 @@ pub struct TaskRecord {
     pub checks: Vec<CommandEvidence>,
     pub files: Vec<FileEvidence>,
     pub blockers: Vec<Blocker>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_inspection: Option<InspectionEvidence>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub proposed_actions: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -480,6 +528,8 @@ pub struct TaskRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub continuation_stop: Option<ContinuationStop>,
     pub acceptance: Option<Acceptance>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub automatic_review: Option<AutomaticReview>,
     pub observed_edits: usize,
     pub unknown_effects: bool,
     /// Never silently lose an acceptance condition when observation caps fill.
@@ -495,6 +545,121 @@ pub enum TaskSource {
 }
 
 impl TaskRecord {
+    pub fn can_automatically_review(&self) -> bool {
+        self.source == TaskSource::Native
+            && self.contract.mode == TaskMode::Work
+            && !self.is_accepted()
+            && self.blockers.is_empty()
+            && self.scope_denials.is_empty()
+            && !self.evidence_overflow
+            && !self.unknown_effects
+            && self.continuation_stop.is_none()
+            && !self.plan.iter().any(|step| step.status.is_open())
+            && self.has_current_verification()
+            && self.assessment.as_ref().is_some_and(|assessment| {
+                assessment.task_id == self.contract.id
+                    && assessment.contract_revision == self.contract.revision
+                    && assessment.work_revision == self.work_revision
+                    && assessment.reason == TurnEndReason::Completed
+                    && assessment
+                        .issues
+                        .iter()
+                        .all(|issue| issue.starts_with("Automatic review: "))
+            })
+            && self.automatic_review.as_ref().is_none_or(|review| {
+                review.contract_revision != self.contract.revision
+                    || review.work_revision != self.work_revision
+            })
+    }
+
+    pub fn is_automatically_verified(&self) -> bool {
+        self.source == TaskSource::Native
+            && self.contract.mode == TaskMode::Work
+            && self.blockers.is_empty()
+            && self.scope_denials.is_empty()
+            && !self.evidence_overflow
+            && !self.unknown_effects
+            && self.continuation_stop.is_none()
+            && !self.plan.iter().any(|step| step.status.is_open())
+            && self.has_current_verification()
+            && !self
+                .checks
+                .iter()
+                .any(|check| self.failed_verification_is_unresolved(check))
+            && self.children.iter().all(|child| {
+                child.issues.is_empty()
+                    && matches!(
+                        child.outcome,
+                        TaskOutcome::Answered
+                            | TaskOutcome::NeedsReview
+                            | TaskOutcome::Accepted
+                            | TaskOutcome::Verified
+                    )
+            })
+            && self.automatic_review.as_ref().is_some_and(|review| {
+                review.verdict == AutomaticReviewVerdict::Clean
+                && review.contract_revision == self.contract.revision
+                && review.work_revision == self.work_revision
+                && review.findings.is_empty()
+                && !review.inspected_files.is_empty()
+                && review.inspected_files.iter().all(|inspected| {
+                    self.files
+                        .iter()
+                        .any(|file| file.path == inspected.path && file.state == inspected.state)
+                }) && self.contract.requirements.iter().all(|requirement| {
+                review.reviewed_requirements.contains(&requirement.id) && match &requirement.spec {
+                    RequirementSpec::Review(_) => true,
+                    RequirementSpec::File(path) => self.files.iter().any(|file| {
+                        file.path == *path
+                            && matches!(file.state, FileState::Present { bytes, .. } if bytes > 0)
+                    }),
+                    RequirementSpec::Command(command) => self.checks.iter().any(|check| {
+                        check.command == command.trim()
+                            && check.state(self.contract.revision, self.work_revision)
+                                == EvidenceState::Passed
+                    }),
+                }
+            })
+            })
+    }
+
+    pub(crate) fn record_automatic_review(
+        &mut self,
+        review: AutomaticReview,
+    ) -> Result<(), String> {
+        if !self.can_automatically_review()
+            || review.contract_revision != self.contract.revision
+            || review.work_revision != self.work_revision
+        {
+            return Err("Task evidence changed or is not ready for automatic review.".into());
+        }
+        validate_automatic_review(&review, self)?;
+        let additional_files = review
+            .inspected_files
+            .iter()
+            .filter(|inspected| !self.files.iter().any(|file| file.path == inspected.path))
+            .count();
+        if self.files.len().saturating_add(additional_files) > MAX_FILES {
+            return Err("Independent review exceeded the tracked file evidence limit.".into());
+        }
+        // Keep current observations separate from immutable review receipts.
+        // Comparing every refresh with an old receipt would permanently dirty
+        // the work clock after the builder repairs a reviewed file.
+        for inspected in &review.inspected_files {
+            self.note_file(&inspected.path, false);
+            if let Some(file) = self
+                .files
+                .iter_mut()
+                .find(|file| file.path == inspected.path)
+            {
+                file.state = inspected.state.clone();
+            }
+        }
+        self.automatic_review = Some(review);
+        self.assess(TurnEndReason::Completed, true);
+        Ok(())
+    }
+
     /// Passing execution evidence, not semantic certification or user acceptance.
     pub fn has_current_verification(&self) -> bool {
         self.checks.iter().any(|check| {
@@ -573,6 +738,7 @@ impl TaskRecord {
             checks: Vec::new(),
             files: Vec::new(),
             blockers: Vec::new(),
+            last_inspection: None,
             proposed_actions: Vec::new(),
             scope_denials: Vec::new(),
             children: Vec::new(),
@@ -581,6 +747,7 @@ impl TaskRecord {
             assessment: None,
             continuation_stop: None,
             acceptance: None,
+            automatic_review: None,
             observed_edits: 0,
             unknown_effects: false,
             evidence_overflow: false,
@@ -654,6 +821,25 @@ impl TaskRecord {
         {
             return Err("The saved task scope feedback is invalid.".into());
         }
+        if self.last_inspection.as_ref().is_some_and(|inspection| {
+            inspection.id == 0
+                || inspection.contract_revision == 0
+                || inspection.contract_revision > self.contract.revision
+                || inspection.work_revision > self.work_revision
+                || !matches!(
+                    inspection.tool.as_str(),
+                    "read_file" | "list_dir" | "grep" | "run_command"
+                )
+                || inspection.target.chars().count() > 600
+        }) || self.blockers.iter().any(|blocker| {
+            blocker.inspection_id
+                > self
+                    .last_inspection
+                    .as_ref()
+                    .map_or(0, |inspection| inspection.id)
+        }) {
+            return Err("The saved task inspection evidence is inconsistent.".into());
+        }
         let mut ids = BTreeSet::new();
         if self.contract.requirements.iter().any(|requirement| {
             requirement.id == 0
@@ -667,6 +853,8 @@ impl TaskRecord {
                 || assessment.contract_revision != self.contract.revision
                 || assessment.work_revision != self.work_revision
                 || (assessment.outcome == TaskOutcome::Accepted) != self.is_accepted()
+                || (assessment.outcome == TaskOutcome::Verified
+                    && !self.is_automatically_verified())
                 || assessment.requirements.len() != self.contract.requirements.len()
                 || self.contract.requirements.iter().any(|requirement| {
                     assessment
@@ -678,6 +866,9 @@ impl TaskRecord {
                 }))
         {
             return Err("The saved task assessment is inconsistent.".into());
+        }
+        if let Some(review) = &self.automatic_review {
+            validate_automatic_review(review, self)?;
         }
         if self.acceptance.is_some() && (self.assessment.is_none() || !self.is_accepted()) {
             return Err("The saved task acceptance is inconsistent.".into());
@@ -750,6 +941,7 @@ impl TaskRecord {
         self.contract.mode = edit.mode;
         self.contract.requirements = requirements;
         self.contract.restrictions = edit.restrictions;
+        self.automatic_review = None;
         self.acceptance = None;
         self.assessment = None;
         if edit.clear_reported_blockers {
@@ -774,6 +966,7 @@ impl TaskRecord {
         }
         self.add_explicit_requirements(&text);
         self.contract.instructions.push(text);
+        self.automatic_review = None;
         self.acceptance = None;
         self.assessment = None;
     }
@@ -904,8 +1097,61 @@ impl TaskRecord {
         self.blockers.push(Blocker {
             text,
             source: source.into(),
+            inspection_id: self
+                .last_inspection
+                .as_ref()
+                .map_or(0, |inspection| inspection.id),
         });
         self.acceptance = None;
+    }
+
+    /// Inspection evidence can resolve an informational obstacle, never verify
+    /// an edit or satisfy an explicit file/check requirement.
+    pub(crate) fn informational(&self) -> bool {
+        self.source == TaskSource::Native
+            && matches!(
+                self.contract.mode,
+                TaskMode::Conversation | TaskMode::ReadOnly
+            )
+            && self.observed_edits == 0
+            && self
+                .contract
+                .requirements
+                .iter()
+                .all(|requirement| matches!(requirement.spec, RequirementSpec::Review(_)))
+    }
+
+    pub(crate) fn observe_inspection(&mut self, name: &str, kind: ToolKind, args: &Value) {
+        let inspection = matches!(name, "read_file" | "list_dir" | "grep")
+            || (kind == ToolKind::Command
+                && read_only_call_allowed(name, kind, args)
+                && !may_mutate(name, kind, args)
+                && !is_verification(args["command"].as_str().unwrap_or_default()));
+        if !inspection {
+            return;
+        }
+        let Some(id) = self
+            .last_inspection
+            .as_ref()
+            .map_or(0, |inspection| inspection.id)
+            .checked_add(1)
+        else {
+            self.evidence_overflow = true;
+            return;
+        };
+        self.last_inspection = Some(InspectionEvidence {
+            id,
+            contract_revision: self.contract.revision,
+            work_revision: self.work_revision,
+            tool: name.into(),
+            target: args["path"]
+                .as_str()
+                .or_else(|| args["command"].as_str())
+                .unwrap_or(".")
+                .chars()
+                .take(600)
+                .collect(),
+        });
     }
 
     /// Reported progress is not a new contract and cannot certify a criterion.
@@ -957,11 +1203,6 @@ impl TaskRecord {
             return Err(Self::analysis_guidance().into());
         }
         if !resolved.is_empty() {
-            if !self.has_current_verification() {
-                return Err(
-                    "Run a current passing check before resolving reported blockers.".into(),
-                );
-            }
             if resolved.iter().any(|text| {
                 blockers.contains(text)
                     || !self
@@ -971,6 +1212,24 @@ impl TaskRecord {
             }) {
                 return Err(
                     "Resolve only exact previously reported agent blockers. User-review blockers cannot be cleared by the agent.".into(),
+                );
+            }
+            let inspected = self.informational()
+                && self.last_inspection.as_ref().is_some_and(|inspection| {
+                    inspection.contract_revision == self.contract.revision
+                        && inspection.work_revision == self.work_revision
+                        && self
+                            .blockers
+                            .iter()
+                            .filter(|blocker| resolved.contains(&blocker.text))
+                            .all(|blocker| inspection.id > blocker.inspection_id)
+                });
+            if !self.has_current_verification() && !inspected {
+                return Err(
+                    "Run a current passing check before resolving reported blockers. \
+                     For a question or read-only analysis without required files/checks, \
+                     a new successful inspection after the blocker was reported also qualifies."
+                        .into(),
                 );
             }
         }
@@ -1116,6 +1375,17 @@ impl TaskRecord {
     /// Returns true when a previously fingerprinted file changed externally.
     /// Newly observed/missing files are not retroactive verification.
     pub fn refresh_files(&mut self, workspace: &Path) -> bool {
+        self.refresh_files_cached(workspace, &mut FileScanCache::default())
+    }
+
+    /// [`Self::refresh_files`] with fingerprints carried between scans. A
+    /// scan after every tool call must not re-read the whole evidence set
+    /// when only metadata moved.
+    pub(crate) fn refresh_files_cached(
+        &mut self,
+        workspace: &Path,
+        cache: &mut FileScanCache,
+    ) -> bool {
         let required: Vec<_> = self
             .contract
             .requirements
@@ -1130,7 +1400,7 @@ impl TaskRecord {
         }
         let mut changed = false;
         for file in &mut self.files {
-            let state = file_state(workspace, &file.path);
+            let state = file_state_cached(workspace, &file.path, cache);
             if !matches!(&file.state, FileState::Unknown(why) if why == "Not inspected yet")
                 && file.state != state
             {
@@ -1246,12 +1516,18 @@ impl TaskRecord {
     }
 
     pub fn assess(&mut self, reason: TurnEndReason, answered: bool) -> TaskAssessment {
+        let automatically_verified = self.is_automatically_verified();
         let requirements: Vec<_> = self
             .contract
             .requirements
             .iter()
             .map(|requirement| {
                 let (state, detail, evidence_id) = match &requirement.spec {
+                    RequirementSpec::Review(_) if automatically_verified => (
+                        EvidenceState::Passed,
+                        "A separate read-only review found no actionable issues at this revision. This is not user acceptance.".into(),
+                        None,
+                    ),
                     RequirementSpec::Review(_) => (
                         EvidenceState::NeedsReview,
                         "Content and scope need your review.".into(),
@@ -1379,10 +1655,7 @@ impl TaskRecord {
         for child in &self.children {
             // NeedsReview is a usable child report, not a failed dependency.
             // The parent still needs its own current verification and review.
-            if !matches!(
-                child.outcome,
-                TaskOutcome::Answered | TaskOutcome::NeedsReview | TaskOutcome::Accepted
-            ) {
+            if !child.outcome.is_usable_child_report() {
                 issues.push(format!(
                     "Child {}: {}",
                     child.session_id,
@@ -1393,12 +1666,29 @@ impl TaskRecord {
         if self.evidence_overflow {
             issues.push("The observation limit was reached; some evidence is unknown.".into());
         }
+        if let Some(review) = &self.automatic_review
+            && review.verdict != AutomaticReviewVerdict::Clean
+        {
+            issues.extend(
+                review
+                    .findings
+                    .iter()
+                    .map(|finding| format!("Automatic review: {finding}")),
+            );
+        }
         let outcome = if self.is_accepted() {
             TaskOutcome::Accepted
-        } else if !self.blockers.is_empty() {
+        } else if !self.blockers.is_empty()
+            || self
+                .automatic_review
+                .as_ref()
+                .is_some_and(|review| review.verdict == AutomaticReviewVerdict::Blocked)
+        {
             TaskOutcome::Blocked
         } else if !issues.is_empty() {
             TaskOutcome::Partial
+        } else if automatically_verified {
+            TaskOutcome::Verified
         } else if self.contract.mode == TaskMode::Conversation
             && answered
             && self.observed_edits == 0
@@ -1433,16 +1723,29 @@ impl TaskRecord {
              Keep the original goal and restrictions. Plans and report_task cannot remove \
              requirements or certify completion. Report real blockers and deliverable paths \
              with report_task before concluding substantial work. After fixing an agent-reported \
-             blocker and passing a current check, resolve its exact text with resolved_blockers. \
+             blocker and passing a current check (or a new relevant inspection for an \
+             informational task), resolve its exact text with resolved_blockers. \
              Omitting it does not resolve it; user-review blockers remain protected. \
              Never treat a normal stop, \
              a file's existence, or an unrelated passing command as accepted work.\n\
-             Observed work revision: {}. Check results: {}\nReported blockers: {}",
+             Observed work revision: {}. Check results: {}\nReported blockers: {}\n\
+             Last successful inspection: {}",
             serde_json::to_string(&self.contract).expect("task contract serializes"),
             self.work_revision,
             serde_json::to_string(&self.checks).expect("checks serialize"),
             serde_json::to_string(&self.blockers).expect("blockers serialize"),
+            serde_json::to_string(&self.last_inspection).expect("inspection serializes"),
         );
+        let context = if let Some(review) = &self.automatic_review {
+            format!(
+                "{context}\n[Independent automatic review feedback]\n{}\n\
+                 Fix these actionable findings within the protected task's scope. Only a new \
+                 independent review can clear this feedback; do not claim user acceptance.",
+                serde_json::to_string(review).expect("review serializes"),
+            )
+        } else {
+            context
+        };
         if self.contract.mode == TaskMode::ReadOnly {
             format!(
                 "{context}\n[Current review scope]\n{}\n\
@@ -1609,7 +1912,161 @@ pub(crate) fn read_only_call_allowed(name: &str, kind: ToolKind, args: &Value) -
     }
 }
 
-fn file_state(workspace: &Path, path: &str) -> FileState {
+pub(crate) fn validate_automatic_review(
+    review: &AutomaticReview,
+    task: &TaskRecord,
+) -> Result<(), String> {
+    if task.source != TaskSource::Native
+        || review.contract_revision == 0
+        || review.contract_revision > task.contract.revision
+        || review.work_revision > task.work_revision
+        || review.model.trim().is_empty()
+        || review.model.len() > 512
+        || review.summary.trim().is_empty()
+        || review.summary.chars().count() > MAX_REPORT_CHARS
+        || review.findings.len() > MAX_BLOCKERS
+        || review
+            .findings
+            .iter()
+            .any(|finding| finding.trim().is_empty() || finding.chars().count() > 1_000)
+        || review.inspected_files.len() > MAX_FILES
+        || review.inspected_files.iter().any(|file| {
+            file.path.trim().is_empty()
+                || !matches!(file.state, FileState::Present { bytes, .. } if bytes > 0)
+        })
+        || review.reviewed_requirements.len() > MAX_REQUIREMENTS
+        || (review.verdict == AutomaticReviewVerdict::Clean) != review.findings.is_empty()
+        || (review.verdict == AutomaticReviewVerdict::Clean && review.inspected_files.is_empty())
+    {
+        return Err("Independent review evidence is invalid or incomplete.".into());
+    }
+    if review.verdict == AutomaticReviewVerdict::Clean
+        && review.contract_revision == task.contract.revision
+        && !task
+            .contract
+            .requirements
+            .iter()
+            .all(|requirement| review.reviewed_requirements.contains(&requirement.id))
+    {
+        return Err("Independent review did not cover every protected requirement.".into());
+    }
+    let inspected_paths = review
+        .inspected_files
+        .iter()
+        .map(|file| file.path.as_str())
+        .collect::<std::collections::HashSet<_>>();
+    let reviewed_ids = review
+        .reviewed_requirements
+        .iter()
+        .copied()
+        .collect::<std::collections::HashSet<_>>();
+    if inspected_paths.len() != review.inspected_files.len()
+        || reviewed_ids.len() != review.reviewed_requirements.len()
+        || (review.contract_revision == task.contract.revision
+            && reviewed_ids.iter().any(|id| {
+                !task
+                    .contract
+                    .requirements
+                    .iter()
+                    .any(|requirement| requirement.id == *id)
+            }))
+    {
+        return Err("Independent review contains duplicate or unknown evidence.".into());
+    }
+    if review.verdict == AutomaticReviewVerdict::Clean
+        && review.contract_revision == task.contract.revision
+        && review.work_revision == task.work_revision
+        && task.files.iter().any(|file| {
+            matches!(file.state, FileState::Present { bytes, .. } if bytes > 0)
+                && !inspected_paths.contains(file.path.as_str())
+        })
+    {
+        return Err("Independent review must inspect every observed task file.".into());
+    }
+    Ok(())
+}
+
+pub(crate) fn file_state(workspace: &Path, path: &str) -> FileState {
+    file_state_cached(workspace, path, &mut FileScanCache::default())
+}
+
+/// Fingerprints already computed for files whose metadata has not moved since.
+///
+/// Deliberately not part of [`FileState`]: evidence stays the durable truth, so
+/// a reuse decision can never change what a saved session claims to have seen.
+#[derive(Debug, Default, Clone)]
+pub(crate) struct FileScanCache {
+    entries: std::collections::BTreeMap<std::path::PathBuf, Fingerprint>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Fingerprint {
+    bytes: u64,
+    fingerprint: u64,
+    modified: Option<std::time::SystemTime>,
+}
+
+/// A file modified this recently is hashed even when its metadata matches,
+/// because coarse filesystem timestamps can hide a same-size rewrite inside
+/// the same tick.
+const FINGERPRINT_MTIME_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// The cache holds short-lived metadata, so it is kept far below the evidence
+/// cap rather than sized by it.
+const FINGERPRINT_CACHE_MAX: usize = MAX_FILES * 4;
+
+impl FileScanCache {
+    fn reuse(&self, path: &Path, metadata: &std::fs::Metadata) -> Option<FileState> {
+        let cached = self.entries.get(path)?;
+        if cached.bytes != metadata.len() {
+            return None;
+        }
+        let modified = metadata.modified().ok()?;
+        if cached.modified != Some(modified) {
+            return None;
+        }
+        if modified
+            .elapsed()
+            .map_or(true, |settled| settled < FINGERPRINT_MTIME_GRACE)
+        {
+            return None;
+        }
+        Some(FileState::Present {
+            bytes: cached.bytes,
+            fingerprint: cached.fingerprint,
+        })
+    }
+
+    fn remember(
+        &mut self,
+        path: std::path::PathBuf,
+        bytes: u64,
+        fingerprint: u64,
+        modified: Option<std::time::SystemTime>,
+    ) {
+        if self.entries.len() >= FINGERPRINT_CACHE_MAX && !self.entries.contains_key(&path) {
+            self.entries.clear();
+        }
+        self.entries.insert(
+            path,
+            Fingerprint {
+                bytes,
+                fingerprint,
+                modified,
+            },
+        );
+    }
+
+    fn forget(&mut self, path: &Path) {
+        self.entries.remove(path);
+    }
+}
+
+pub(crate) fn file_state_cached(
+    workspace: &Path,
+    path: &str,
+    cache: &mut FileScanCache,
+) -> FileState {
     let path = match crate::tools::resolve(workspace, path) {
         Ok(path) => path,
         Err(_) => {
@@ -1620,7 +2077,10 @@ fn file_state(workspace: &Path, path: &str) -> FileState {
     };
     let mut file = match crate::file_io::open_regular_file(&path) {
         Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return FileState::Missing,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            cache.forget(&path);
+            return FileState::Missing;
+        }
         Err(_) => return FileState::Unknown("The file could not be read.".into()),
     };
     let metadata = match file.metadata() {
@@ -1628,8 +2088,33 @@ fn file_state(workspace: &Path, path: &str) -> FileState {
         _ => return FileState::Unknown("Not a readable regular file.".into()),
     };
     if metadata.len() > MAX_FILE_BYTES {
+        cache.forget(&path);
         return FileState::Unknown("File exceeds the 8 MB fingerprint limit.".into());
     }
+    if let Some(state) = cache.reuse(&path, &metadata) {
+        return state;
+    }
+    let modified = metadata.modified().ok();
+    let fingerprint = match fingerprint_file(&mut file) {
+        Ok(fingerprint) => fingerprint,
+        Err(state) => {
+            cache.forget(&path);
+            return state;
+        }
+    };
+    let (bytes, hash) = fingerprint;
+    if bytes != metadata.len() {
+        cache.forget(&path);
+        return FileState::Unknown("The file changed while it was being inspected.".into());
+    }
+    cache.remember(path, bytes, hash, modified);
+    FileState::Present {
+        bytes,
+        fingerprint: hash,
+    }
+}
+
+fn fingerprint_file(file: &mut std::fs::File) -> Result<(u64, u64), FileState> {
     // Versioned FNV-1a fingerprint for drift detection, not a security digest.
     let mut hash = 0xcbf29ce484222325_u64;
     let mut bytes = 0_u64;
@@ -1638,23 +2123,23 @@ fn file_state(workspace: &Path, path: &str) -> FileState {
         let count = match file.read(&mut buffer) {
             Ok(0) => break,
             Ok(count) => count,
-            Err(_) => return FileState::Unknown("The file changed or could not be read.".into()),
+            Err(_) => {
+                return Err(FileState::Unknown(
+                    "The file changed or could not be read.".into(),
+                ));
+            }
         };
         bytes += count as u64;
         if bytes > MAX_FILE_BYTES {
-            return FileState::Unknown("File exceeds the 8 MB fingerprint limit.".into());
+            return Err(FileState::Unknown(
+                "File exceeds the 8 MB fingerprint limit.".into(),
+            ));
         }
         for byte in &buffer[..count] {
             hash = (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3);
         }
     }
-    if bytes != metadata.len() {
-        return FileState::Unknown("The file changed while it was being inspected.".into());
-    }
-    FileState::Present {
-        bytes,
-        fingerprint: hash,
-    }
+    Ok((bytes, hash))
 }
 
 #[cfg(test)]

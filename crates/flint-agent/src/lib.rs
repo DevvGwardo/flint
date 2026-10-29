@@ -4,15 +4,19 @@
 //! No UI code lives here.
 
 mod approvals;
+mod automatic_review;
 #[cfg(test)]
 mod bench_tests;
 mod command_evidence;
 pub mod config;
 mod context;
 mod file_io;
+pub mod genui;
 pub mod harness;
+pub mod improvement;
 pub mod mcp;
 pub mod orchestration;
+mod pending_turn;
 mod persist;
 pub mod prompt;
 pub mod protocol;
@@ -183,12 +187,18 @@ pub fn spawn_session(config: AgentConfig) -> SessionHandle {
 #[derive(Debug, Clone, Copy)]
 pub struct ExecutionOptions {
     pub allow_subagents: bool,
+    /// Host advertises a bounded, data-only native interactive surface.
+    pub interactive_ui: bool,
+    /// Permit private, data-only learning of fixed verification reminders.
+    pub improvement_hints: bool,
 }
 
 impl Default for ExecutionOptions {
     fn default() -> Self {
         Self {
             allow_subagents: true,
+            interactive_ui: false,
+            improvement_hints: false,
         }
     }
 }

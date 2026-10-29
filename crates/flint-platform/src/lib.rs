@@ -59,7 +59,14 @@ pub fn search_path(home: Option<&Path>) -> OsString {
     }
     if let Some(home) = home {
         extra.extend(
-            [".local/bin", ".npm-global/bin", ".bun/bin", ".cargo/bin"].map(|p| home.join(p)),
+            [
+                ".local/bin",
+                ".npm-global/bin",
+                ".bun/bin",
+                ".cargo/bin",
+                ".opencode/bin",
+            ]
+            .map(|p| home.join(p)),
         );
     }
     for dir in extra {
@@ -244,6 +251,7 @@ mod tests {
         let dirs: Vec<_> = std::env::split_paths(&path).collect();
         assert!(dirs.contains(&home.path().join(".local/bin")));
         assert!(dirs.contains(&home.path().join(".cargo/bin")));
+        assert!(dirs.contains(&home.path().join(".opencode/bin")));
         assert_eq!(std::env::join_paths(dirs).unwrap(), path);
     }
 

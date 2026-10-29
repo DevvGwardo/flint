@@ -2,6 +2,62 @@ use super::*;
 use flint_app::settings::Settings;
 
 #[gpui_kit::test]
+fn jev_blocker_recovery_is_inspectable_guidance_not_task_acceptance(cx: &mut TestAppContext) {
+    let ui = open(cx);
+    let engine = running_turn(&ui, cx);
+    engine.send(
+        cx,
+        AgentEvent::JevVerdict {
+            question: flint_agent::JevQuestion::BlockerRecovery,
+            probability: 0.9,
+            confirmed: true,
+        },
+    );
+    engine.send(
+        cx,
+        AgentEvent::HarnessNudge {
+            reason: flint_agent::NudgeReason::BlockerRecovery,
+            message: "Inspect known activity sources using existing permissions.".into(),
+        },
+    );
+    let (judge, nudge) = ui.read(cx, |app, _| {
+        let view = &app.session().view;
+        assert!(view.running);
+        assert!(!view.task.as_ref().is_some_and(|task| task.is_accepted()));
+        (
+            view.items
+                .iter()
+                .position(|item| matches!(item, Item::Jev { .. }))
+                .unwrap(),
+            view.items
+                .iter()
+                .position(|item| matches!(item, Item::Nudge { .. }))
+                .unwrap(),
+        )
+    });
+    ui.with(cx, |window, cx| {
+        window.render_frame(cx);
+        assert_eq!(
+            window.find(("jev", judge)).label(),
+            Some("JEV · blocker check · 90% · investigate further"),
+        );
+        assert_eq!(
+            window.find(("nudge", nudge)).label(),
+            Some("Guard guidance · check the reported blocker"),
+        );
+    });
+    ui.click(cx, ("nudge", nudge));
+    assert!(ui.with(cx, |window, cx| {
+        window.render_frame(cx);
+        window.try_find(("nudge-evidence", nudge)).is_some()
+    }));
+    assert!(
+        engine.sent().is_empty(),
+        "guidance does not grant approval or dispatch work"
+    );
+}
+
+#[gpui_kit::test]
 fn jev_recovered_guard_guidance_collapses_and_keeps_evidence_inspectable(cx: &mut TestAppContext) {
     let ui = open(cx);
     let engine = running_turn(&ui, cx);

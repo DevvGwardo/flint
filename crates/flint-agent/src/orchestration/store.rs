@@ -242,7 +242,9 @@ pub(crate) fn validate_lineage(directory: &Directory, state: &State) -> Result<(
     let objects = directory
         .open_child("engine-objects")
         .map_err(|_| corrupt())?;
-    let mut matched = [false; 20];
+    // Sized by the entries actually indexed below, so this cannot silently
+    // overflow if the queued-command limit is ever raised.
+    let mut matched = vec![false; state.pending.len()];
     let mut next = state.receipt_head.clone();
     let mut ordinal = state.receipt_count;
     let mut before_sequence = state.next_sequence;
@@ -273,7 +275,7 @@ pub(crate) fn validate_lineage(directory: &Directory, state: &State) -> Result<(
         next = node.previous;
         ordinal -= 1;
     }
-    if ordinal != 0 || matched[..state.pending.len()].iter().any(|found| !found) {
+    if ordinal != 0 || matched.iter().any(|found| !found) {
         return Err(corrupt());
     }
     Ok(())

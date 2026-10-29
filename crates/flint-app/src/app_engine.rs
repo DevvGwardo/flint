@@ -59,12 +59,28 @@ impl FlintApp {
         // it up the sidebar; streaming deltas would reorder rows constantly.
         let mut notable = false;
         for event in events {
+            self.capture_genui_event(uid, &event);
+            if matches!(
+                event,
+                AgentEvent::Error(_) | AgentEvent::SessionStopped { .. }
+            ) {
+                self.sessions[ix]
+                    .auto_continue
+                    .pause("An engine error or shutdown stopped automatic continuation.");
+            }
             match &event {
                 AgentEvent::TurnStarted { .. } => self.sessions[ix].prompt_pending = false,
                 AgentEvent::TurnFinished { turn_id, reason }
                     if self.sessions[ix].view.running
                         && *turn_id == self.sessions[ix].view.turn_id =>
                 {
+                    if self.sessions[ix].view.pending_approvals > 0
+                        || self.sessions[ix].view.has_pending_approval()
+                    {
+                        self.sessions[ix]
+                            .auto_continue
+                            .pause("An unresolved approval stopped automatic continuation.");
+                    }
                     self.sessions[ix].prompt_pending = false;
                     finish_reason = Some(reason.clone());
                 }
@@ -525,6 +541,7 @@ impl FlintApp {
         if !self.storage_ready(ix, cx) {
             return false;
         }
+        self.sessions[ix].auto_continue = Default::default();
         if !self.record_prompt(ix, &prompt, PromptRecord::Immediate, cx) {
             return false;
         }
@@ -649,6 +666,14 @@ impl FlintApp {
             crate::session::RetryRequest::Continue { task_id, revision } => {
                 self.dispatch_task_continuation(ix, task_id, revision, cx);
             }
+            crate::session::RetryRequest::AutomaticReview {
+                task_id,
+                revision,
+                work_revision,
+            } => {
+                self.sessions[ix].auto_continue = Default::default();
+                self.dispatch_automatic_review(ix, task_id, revision, work_revision, cx);
+            }
         }
     }
 
@@ -659,11 +684,98 @@ impl FlintApp {
         revision: u64,
         cx: &mut Context<Self>,
     ) -> bool {
+        self.dispatch_task_continuation_inner(ix, task_id, revision, false, cx)
+    }
+
+    pub(crate) fn dispatch_automatic_review(
+        &mut self,
+        ix: usize,
+        task_id: u64,
+        revision: u64,
+        work_revision: u64,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if self.prompt_busy(ix)
+            || self.sessions[ix].stopping
+            || self.sessions[ix].history_save_failed
+            || self.sessions[ix].agent != flint_agent::AgentKind::Flint
+            || self.sessions[ix].view.task.as_ref().is_none_or(|task| {
+                task.contract.id != task_id
+                    || task.contract.revision != revision
+                    || task.work_revision != work_revision
+                    || !task.can_automatically_review()
+            })
+            || !self.storage_ready(ix, cx)
+        {
+            return false;
+        }
+        let request = crate::session::RetryRequest::AutomaticReview {
+            task_id,
+            revision,
+            work_revision,
+        };
+        self.sessions[ix].last_message = Some(request.clone());
+        if let Err(error) = self.ensure_engine(ix, cx) {
+            self.apply_event(ix, AgentEvent::Error(format!("{error:#}")), cx);
+            return false;
+        }
+        let prompt = crate::prompt_queue::Prompt::new(
+            "Independently review the current task".into(),
+            "Review the protected task without changing its scope or accepting it for the user."
+                .into(),
+            Vec::new(),
+        );
+        let recorded = self.record_prompt(ix, &prompt, PromptRecord::Immediate, cx);
+        self.sessions[ix].last_message = Some(request);
+        if !recorded {
+            return false;
+        }
+        let sent = self.sessions[ix].ops.as_ref().is_some_and(|ops| {
+            ops.try_send(Op::AutomaticallyReviewTask {
+                task_id,
+                expected_revision: revision,
+                expected_work_revision: work_revision,
+            })
+            .is_ok()
+        });
+        self.sessions[ix].prompt_pending = sent;
+        if !sent {
+            self.apply_event(
+                ix,
+                AgentEvent::Error("Couldn't request the independent review.".into()),
+                cx,
+            );
+        }
+        cx.notify();
+        sent
+    }
+
+    pub(crate) fn dispatch_automatic_task_continuation(
+        &mut self,
+        ix: usize,
+        task_id: u64,
+        revision: u64,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        self.dispatch_task_continuation_inner(ix, task_id, revision, true, cx)
+    }
+
+    fn dispatch_task_continuation_inner(
+        &mut self,
+        ix: usize,
+        task_id: u64,
+        revision: u64,
+        automatic: bool,
+        cx: &mut Context<Self>,
+    ) -> bool {
         if self.prompt_busy(ix)
             || self.sessions[ix].stopping
             || self.sessions[ix].history_save_failed
         {
             return false;
+        }
+        if !automatic {
+            self.sessions[ix].auto_continue = Default::default();
         }
         if self.sessions[ix].agent != flint_agent::AgentKind::Flint
             || self.sessions[ix].view.task.as_ref().is_none_or(|task| {
@@ -688,7 +800,15 @@ impl FlintApp {
             return false;
         }
         let prompt = crate::prompt_queue::Prompt::new(
-            "Continue the current task".into(),
+            if automatic {
+                format!(
+                    "Auto-continue fixes ({}/{})",
+                    self.sessions[ix].auto_continue.attempts,
+                    crate::auto_continue::MAX_AUTO_CONTINUATIONS,
+                )
+            } else {
+                "Continue the current task".into()
+            },
             "Continue the protected task.".into(),
             Vec::new(),
         );
@@ -764,7 +884,18 @@ impl FlintApp {
         self.sessions[ix].native_approval = Some(config.approval);
         self.sessions[ix].native_allow_all = false;
         self.sessions[ix].engine_shutdown_verified = false;
-        self.attach_engine(ix, flint_agent::spawn_session(config), cx);
+        self.attach_engine(
+            ix,
+            flint_agent::spawn_session_with_options(
+                config,
+                flint_agent::ExecutionOptions {
+                    allow_subagents: true,
+                    interactive_ui: crate::genui_ui::companion_executable().is_ok(),
+                    improvement_hints: true,
+                },
+            ),
+            cx,
+        );
         Ok(())
     }
 
@@ -884,10 +1015,13 @@ impl FlintApp {
 
     pub fn interrupt(&mut self, cx: &mut Context<Self>) {
         let ix = self.active;
+        self.sessions[ix]
+            .auto_continue
+            .pause("You stopped this task. Send a prompt or continue the task to start again.");
         self.sessions[ix].prompt_queue.paused = !self.sessions[ix].prompt_queue.items.is_empty();
         self.sessions[ix].prompt_queue.steer_after_turn = None;
         self.save_prompt_queue(ix, cx);
-        if !self.sessions[ix].view.running {
+        if !self.sessions[ix].view.running && !self.sessions[ix].prompt_pending {
             return;
         }
         if let Some(ops) = &self.sessions[ix].ops {
@@ -925,6 +1059,11 @@ impl FlintApp {
         self.approval_confirm = None;
         self.approval_preview = None;
         let session = &mut self.sessions[self.active];
+        if decision == ApprovalDecision::Deny {
+            session
+                .auto_continue
+                .pause("You denied a tool call. Review the task before continuing.");
+        }
         if decision == ApprovalDecision::ApproveAlways
             && session.agent == flint_agent::AgentKind::Flint
         {

@@ -1,9 +1,11 @@
 use super::*;
+#[path = "auto_continue.rs"]
+mod auto_continue;
 #[path = "task_review_boundaries.rs"]
 mod review_boundaries;
 use flint_agent::{
-    CommandEvidence, FileEvidence, FileState, ReviewDecision, TaskMode, TaskOutcome, TaskRecord,
-    TaskReview, TaskSource,
+    AutomaticReview, AutomaticReviewVerdict, CommandEvidence, FileEvidence, FileState,
+    ReviewDecision, TaskMode, TaskOutcome, TaskRecord, TaskReview, TaskSource,
 };
 
 pub(super) fn task_fixture(outcome: TaskOutcome) -> TaskRecord {
@@ -61,6 +63,23 @@ pub(super) fn task_fixture(outcome: TaskOutcome) -> TaskRecord {
     if outcome == TaskOutcome::Blocked {
         task.add_blocker("The input binary is unavailable.", "agent report");
     }
+    if outcome == TaskOutcome::Verified {
+        task.automatic_review = Some(AutomaticReview {
+            contract_revision: task.contract.revision,
+            work_revision: task.work_revision,
+            model: "fixture".into(),
+            verdict: AutomaticReviewVerdict::Clean,
+            summary: "Inspected the method bodies against all protected requirements.".into(),
+            findings: Vec::new(),
+            reviewed_requirements: task
+                .contract
+                .requirements
+                .iter()
+                .map(|requirement| requirement.id)
+                .collect(),
+            inspected_files: task.files.clone(),
+        });
+    }
     task.assess(TurnEndReason::Completed, true);
     if outcome == TaskOutcome::Accepted {
         task.review(&TaskReview {
@@ -83,6 +102,7 @@ fn completed_turn_labels_keep_execution_separate_from_task_acceptance(cx: &mut T
         TaskOutcome::Blocked,
         TaskOutcome::Unknown,
         TaskOutcome::NeedsReview,
+        TaskOutcome::Verified,
         TaskOutcome::Accepted,
     ] {
         let (ui, _) = finished_fixture(cx, outcome);
@@ -91,7 +111,7 @@ fn completed_turn_labels_keep_execution_separate_from_task_acceptance(cx: &mut T
             window.render_frame(cx);
             assert_eq!(
                 window.find(("turn-ended", end)).label(),
-                Some(if outcome == TaskOutcome::Accepted {
+                Some(if outcome.allows_queue() {
                     "Done"
                 } else {
                     "Turn ended"

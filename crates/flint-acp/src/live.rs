@@ -357,7 +357,12 @@ impl Live {
                 Next::Continue
             }
             Some(Op::SetReasoningEffort(_) | Op::SetJev(_)) => Next::Continue,
-            Some(Op::EditTask(_) | Op::ReviewTask(_) | Op::ContinueTask { .. }) => {
+            Some(
+                Op::EditTask(_)
+                | Op::ReviewTask(_)
+                | Op::ContinueTask { .. }
+                | Op::AutomaticallyReviewTask { .. },
+            ) => {
                 self.shared.emit_all(vec![AgentEvent::Error(
                     "Native task controls cannot govern this external agent's loop. Review its result in the app or send an explicit follow-up.".into(),
                 )]);
@@ -462,7 +467,7 @@ impl Live {
                         }
                     }
                     Ok(Op::SetReasoningEffort(_) | Op::SetJev(_)) => {}
-                    Ok(Op::EditTask(_) | Op::ReviewTask(_) | Op::ContinueTask { .. }) => self.shared.emit_all(vec![AgentEvent::Error(
+                    Ok(Op::EditTask(_) | Op::ReviewTask(_) | Op::ContinueTask { .. } | Op::AutomaticallyReviewTask { .. }) => self.shared.emit_all(vec![AgentEvent::Error(
                         "Native task controls cannot govern this external agent's loop.".into(),
                     )]),
                     Ok(Op::UndoLastTurn) => self.undo_unavailable(),

@@ -8,6 +8,23 @@ use super::key_with_typesafe_fallback;
 use flint_agent::ApprovalMode;
 
 #[test]
+fn auto_continue_fixes_is_opt_in_and_survives_save_load() {
+    assert!(!Settings::default().auto_continue_fixes);
+    let old: Settings = toml::from_str("model = \"existing-model\"").unwrap();
+    assert!(!old.auto_continue_fixes);
+    assert_eq!(old.model, "existing-model");
+    let dir = tempfile::tempdir().unwrap();
+    for enabled in [true, false] {
+        let settings = Settings {
+            auto_continue_fixes: enabled,
+            ..Settings::default()
+        };
+        settings.save(dir.path()).unwrap();
+        assert_eq!(Settings::load(dir.path(), &KeySources::none()), settings);
+    }
+}
+
+#[test]
 fn displayed_key_status_is_cached_but_agent_credentials_stay_fresh() {
     use std::time::{Duration, Instant};
     let temp = tempfile::tempdir().unwrap();
@@ -180,6 +197,28 @@ fn agent_model_provider_defaults_round_trip_without_changing_native_settings() {
         "droid-selected-model"
     );
     assert!(loaded.agent_options(AgentKind::ClaudeCode).is_empty());
+}
+
+#[test]
+fn opencode_defaults_and_models_round_trip_independently_of_other_agents() {
+    use flint_agent::AgentKind;
+    let dir = tempfile::tempdir().unwrap();
+    let mut settings = Settings {
+        default_agent: AgentKind::OpenCode,
+        ..Settings::default()
+    };
+    settings.agent_options.insert(
+        super::agent_key(AgentKind::OpenCode).into(),
+        [("model".into(), "provider/model".into())].into(),
+    );
+    settings.save(dir.path()).unwrap();
+    let loaded = Settings::load(dir.path(), &KeySources::none());
+    assert_eq!(loaded, settings);
+    assert_eq!(
+        loaded.agent_options(AgentKind::OpenCode)["model"],
+        "provider/model"
+    );
+    assert!(loaded.agent_options(AgentKind::Droid).is_empty());
 }
 
 #[test]

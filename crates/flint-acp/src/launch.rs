@@ -14,6 +14,8 @@ pub enum AcpAgent {
     Codex,
     /// Factory Droid speaks ACP directly; it does not need an adapter.
     Droid,
+    /// OpenCode speaks ACP directly via `opencode acp`.
+    OpenCode,
     /// Any other ACP agent: `command args…`.
     Custom {
         name: String,
@@ -29,6 +31,7 @@ impl AcpAgent {
             AcpAgent::ClaudeCode => "Claude Code",
             AcpAgent::Codex => "Codex",
             AcpAgent::Droid => "Droid",
+            AcpAgent::OpenCode => "OpenCode",
             AcpAgent::Custom { name, .. } => name,
         }
     }
@@ -39,6 +42,7 @@ impl AcpAgent {
             AcpAgent::ClaudeCode => "claude".to_string(),
             AcpAgent::Codex => "codex".to_string(),
             AcpAgent::Droid => "droid".to_string(),
+            AcpAgent::OpenCode => "opencode".to_string(),
             AcpAgent::Custom { name, .. } => name.to_lowercase(),
         }
     }
@@ -49,6 +53,7 @@ impl AcpAgent {
             AcpAgent::ClaudeCode => "claude_code".to_string(),
             AcpAgent::Codex => "codex".to_string(),
             AcpAgent::Droid => "droid".to_string(),
+            AcpAgent::OpenCode => "opencode".to_string(),
             AcpAgent::Custom { name, .. } => format!("custom:{name}"),
         }
     }
@@ -60,6 +65,7 @@ impl AcpAgent {
             AgentKind::ClaudeCode => Some(AcpAgent::ClaudeCode),
             AgentKind::Codex => Some(AcpAgent::Codex),
             AgentKind::Droid => Some(AcpAgent::Droid),
+            AgentKind::OpenCode => Some(AcpAgent::OpenCode),
         }
     }
 
@@ -70,12 +76,15 @@ impl AcpAgent {
                 Some(("claude-agent-acp", "@agentclientprotocol/claude-agent-acp"))
             }
             AcpAgent::Codex => Some(("codex-acp", "@agentclientprotocol/codex-acp")),
-            AcpAgent::Droid | AcpAgent::Custom { .. } => None,
+            AcpAgent::Droid | AcpAgent::OpenCode | AcpAgent::Custom { .. } => None,
         }
     }
 
     /// How to install the adapter.
     pub fn install_hint(&self) -> String {
+        if *self == AcpAgent::OpenCode {
+            return "Install OpenCode with `npm i -g opencode-ai`, ensure `opencode` is on PATH, then retry.".to_string();
+        }
         if *self == AcpAgent::Droid {
             if cfg!(windows) {
                 return "Install a Windows-compatible Factory Droid build, add it to PATH, then retry.".to_string();
@@ -96,18 +105,29 @@ impl AcpAgent {
             }
             AcpAgent::Codex => "Run `codex login` in a terminal, then retry.".to_string(),
             AcpAgent::Droid => "Run `droid` once in a terminal to log in, then retry.".to_string(),
+            AcpAgent::OpenCode => {
+                "Run `opencode auth login` in a terminal, then retry.".to_string()
+            }
             AcpAgent::Custom { name, .. } => format!("Log in to {name}, then retry."),
         }
     }
 
     /// The command to spawn: the adapter on PATH or in `~/.local/bin`, else
-    /// `npx -y <package>`. Droid runs its native ACP server directly.
+    /// `npx -y <package>`. Droid and OpenCode run their native ACP servers directly.
     pub fn command(
         &self,
         search_path: impl AsRef<OsStr>,
     ) -> Result<(PathBuf, Vec<String>), String> {
         let search_path = search_path.as_ref();
         match self {
+            AcpAgent::OpenCode => find("opencode", search_path)
+                .map(|program| (program, vec!["acp".to_string()]))
+                .ok_or_else(|| {
+                    format!(
+                        "OpenCode (`opencode`) isn't installed or isn't on PATH. {}",
+                        self.install_hint()
+                    )
+                }),
             AcpAgent::Droid => find("droid", search_path)
                 .map(|program| {
                     (
@@ -173,7 +193,9 @@ impl AcpAgent {
         let api_key = matches!(name, "ANTHROPIC_API_KEY" | "ANTHROPIC_AUTH_TOKEN");
         match self {
             AcpAgent::ClaudeCode => session_marker || (api_key && !keep_api_key),
-            AcpAgent::Codex | AcpAgent::Droid | AcpAgent::Custom { .. } => session_marker,
+            AcpAgent::Codex | AcpAgent::Droid | AcpAgent::OpenCode | AcpAgent::Custom { .. } => {
+                session_marker
+            }
         }
     }
 }
@@ -243,7 +265,12 @@ mod tests {
     fn windows_environment_filtering_is_case_insensitive() {
         assert!(AcpAgent::ClaudeCode.drops_env("anthropic_api_key", false));
         assert!(!AcpAgent::ClaudeCode.drops_env("anthropic_api_key", true));
-        for agent in [AcpAgent::ClaudeCode, AcpAgent::Codex, AcpAgent::Droid] {
+        for agent in [
+            AcpAgent::ClaudeCode,
+            AcpAgent::Codex,
+            AcpAgent::Droid,
+            AcpAgent::OpenCode,
+        ] {
             assert!(agent.drops_env("claudecode", false));
             assert!(agent.drops_env("claude_code_session_id", false));
         }
@@ -278,6 +305,43 @@ mod tests {
             missing.contains("npm i -g @agentclientprotocol/claude-agent-acp"),
             "{missing}"
         );
+    }
+
+    #[test]
+    fn opencode_uses_its_native_acp_server_without_an_adapter_or_npx() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = std::env::join_paths([dir.path()]).unwrap();
+        std::fs::write(dir.path().join("npx"), "").unwrap();
+        let missing = AcpAgent::OpenCode
+            .command(&path)
+            .expect_err("missing OpenCode");
+        assert!(missing.contains("npm i -g opencode-ai"), "{missing}");
+        assert!(missing.contains("isn't installed"), "{missing}");
+        std::fs::write(dir.path().join("opencode"), "").unwrap();
+        assert_eq!(
+            AcpAgent::OpenCode.command(&path),
+            Ok((dir.path().join("opencode"), vec!["acp".into()]))
+        );
+        assert_eq!(
+            AcpAgent::for_kind(AgentKind::OpenCode),
+            Some(AcpAgent::OpenCode)
+        );
+        assert_eq!(AcpAgent::OpenCode.name(), "OpenCode");
+        assert_eq!(AcpAgent::OpenCode.id(), "opencode");
+        assert_eq!(AcpAgent::OpenCode.label_prefix(), "opencode");
+        assert_eq!(
+            describe(
+                &AcpAgent::OpenCode,
+                "Authentication required",
+                Some(-32000),
+                ""
+            ),
+            "OpenCode isn't logged in (Authentication required). Run `opencode auth login` in a terminal, then retry."
+        );
+        assert!(AcpAgent::OpenCode.drops_env("CLAUDECODE", false));
+        for key in ["OPENCODE_API_KEY", "ANTHROPIC_API_KEY", "OPENAI_API_KEY"] {
+            assert!(!AcpAgent::OpenCode.drops_env(key, false));
+        }
     }
 
     #[test]
@@ -363,6 +427,11 @@ mod tests {
         assert_eq!(
             AcpAgent::Droid.command(&path).unwrap().0,
             bin.join("droid.exe")
+        );
+        std::fs::write(bin.join("opencode.cmd"), "").unwrap();
+        assert_eq!(
+            AcpAgent::OpenCode.command(&path).unwrap(),
+            (bin.join("opencode.cmd"), vec!["acp".into()])
         );
         assert_eq!(
             find(bin.join("droid.exe").to_str().unwrap(), &path),

@@ -84,6 +84,14 @@ pub fn general_system_prompt(workspace: &Path) -> String {
          # Environment\nPrivate working folder: {}. Relative file paths resolve here. \
          File writes stay inside this folder; existing sandbox and approval rules still apply. \
          This folder is not a Git repository and no project setup is required. \
+         It is an output scratch folder, not a complete inventory of the user's projects or \
+         activity. For recent-work questions, discover known project roots and relevant local \
+         activity/session records with bounded read-only inspections using existing permissions. \
+         If an activity MCP tool is configured, prefer its bounded metadata lookup to broad shell \
+         searches. Its results are partial source records, not proof of completed work. \
+         Do not infer that no work occurred from an empty scratch-folder search. Do not read \
+         unrelated private data or bypass access denials; ask for a specific location if needed. \
+         Distinguish repository creation from cloning, commit activity and file timestamps. \
          OS: {} ({}). Shell: {}. Be direct and concise.",
         workspace.display(),
         std::env::consts::OS,
@@ -181,6 +189,10 @@ mod tests {
         assert!(prompt.contains("general-purpose assistant"));
         assert!(prompt.contains("not attached to a coding project"));
         assert!(prompt.contains("sandbox and approval rules"));
+        assert!(prompt.contains("not a complete inventory"));
+        assert!(prompt.contains("activity/session records"));
+        assert!(prompt.contains("activity MCP tool"));
+        assert!(prompt.contains("Distinguish repository creation"));
         assert!(!prompt.contains("Only change Rust files."));
         assert!(!prompt.contains("coding agent working directly"));
     }

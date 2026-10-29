@@ -24,6 +24,74 @@ use pretty_assertions::assert_eq;
 use super::*;
 use crate::provider::RawToolCall;
 
+#[test]
+fn dropped_read_turn_keeps_bounded_source_pointers_not_old_contents() {
+    let mut history = vec![
+        Message::System("system".into()),
+        Message::User("Explain the router. ".repeat(400)),
+        Message::Assistant {
+            content: String::new(),
+            reasoning: String::new(),
+            tool_calls: vec![RawToolCall {
+                id: "read".into(),
+                name: "read_file".into(),
+                arguments: serde_json::json!({"path":"router.py","offset":17,"limit":9})
+                    .to_string(),
+            }],
+        },
+        Message::Tool {
+            call_id: "read".into(),
+            content: "OLD_PRIVATE_CONTENT".repeat(100),
+        },
+        Message::User("Next question".into()),
+        Message::User("Current question".into()),
+    ];
+    ContextTracker::new(1_000, 0)
+        .maybe_compact(&mut history)
+        .unwrap();
+    let summary = history
+        .iter()
+        .find_map(|message| match message {
+            Message::Summary(text) => Some(text),
+            _ => None,
+        })
+        .unwrap();
+    assert!(summary.contains("\"path\":\"router.py\""));
+    assert!(summary.contains("\"offset\":17"));
+    assert!(summary.contains("\"limit\":9"));
+    assert!(summary.contains("historical; re-read"));
+    assert!(!summary.contains("OLD_PRIVATE_CONTENT"));
+    assert!(summary.len() < 1_000);
+}
+
+#[test]
+fn source_pointer_budget_rejects_oversized_paths_and_ignores_unrelated_arguments() {
+    let calls = (0..100)
+        .map(|i| RawToolCall {
+            id: i.to_string(),
+            name: "read_file".into(),
+            arguments: serde_json::json!({
+                "path":format!("file-{i}.rs"), "offset":42, "content":"DO_NOT_RETAIN".repeat(100),
+            })
+            .to_string(),
+        })
+        .chain(std::iter::once(RawToolCall {
+            id: "huge".into(),
+            name: "read_file".into(),
+            arguments: serde_json::json!({"path":"OVERSIZED".repeat(500)}).to_string(),
+        }))
+        .collect();
+    let summary = summarize_turn(&[Message::Assistant {
+        content: String::new(),
+        reasoning: String::new(),
+        tool_calls: calls,
+    }]);
+    assert!(summary.contains("file-0.rs"));
+    assert!(!summary.contains("OVERSIZED"));
+    assert!(!summary.contains("DO_NOT_RETAIN"));
+    assert!(summary.len() < 400);
+}
+
 fn turn(i: usize, output_chars: usize) -> Vec<Message> {
     vec![
         Message::User(format!("task {i}")),

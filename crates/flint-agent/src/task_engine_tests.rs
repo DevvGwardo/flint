@@ -3,10 +3,20 @@
 use super::*;
 use crate::task::*;
 use pretty_assertions::assert_eq;
+#[path = "adaptive_session_tests.rs"]
+mod adaptive_session_tests;
 #[path = "analysis_flow_tests.rs"]
 mod analysis_flow_tests;
+#[path = "automatic_review_tests.rs"]
+mod automatic_review_tests;
+#[path = "blocker_recovery_tests.rs"]
+mod blocker_recovery_tests;
 #[path = "task_boundary_tests.rs"]
 mod boundary_tests;
+#[path = "genui_session_tests.rs"]
+mod genui_session_tests;
+#[path = "pending_start_tests.rs"]
+mod pending_start_tests;
 
 fn assessed(events: &[AgentEvent]) -> &TaskRecord {
     events
@@ -1192,4 +1202,49 @@ async fn beginning_a_turn_cannot_clear_a_queued_read_only_restriction_behind_und
     handle.ops.send(Op::Shutdown).await.unwrap();
     while let Ok(Ok(_)) = tokio::time::timeout(Duration::from_secs(5), handle.events.recv()).await {
     }
+}
+
+#[tokio::test]
+async fn a_write_and_its_check_in_one_step_keep_the_check_current() {
+    let (_root, ws) = temp_workspace();
+    // The file is already evidence before the step, so its change is drift the
+    // step must observe rather than a newly noticed artifact.
+    std::fs::write(ws.join("result.txt"), "before").unwrap();
+    let check = exists_check("result.txt");
+    let (url, _) = mock_server(vec![
+        // The replace needs a prior read of the existing file.
+        sse_tool_call("read", "read_file", json!({"path": "result.txt"})),
+        // One step: the write is followed by its own check.
+        sse_tool_calls(&[
+            (
+                "write",
+                "write_file",
+                json!({"path": "result.txt", "content": "result"}),
+            ),
+            ("check", "run_command", json!({"command": check})),
+        ]),
+        sse_text("Wrote and verified result.txt."),
+    ])
+    .await;
+    let events = run_one_turn(
+        url,
+        ws.clone(),
+        "Update result.txt and verify it exists.\nRequired file: result.txt",
+    )
+    .await;
+    assert!(ws.join("result.txt").is_file());
+    let task = assessed(&events);
+    let check = task
+        .checks
+        .iter()
+        .find(|check| check.command.contains("result.txt"))
+        .expect("the verification command is recorded");
+    // The write and the check share one step: the write's own drift scan runs
+    // before the check starts, and the deferred read scan must not arrive late
+    // and strand a passing check as stale.
+    assert_eq!(
+        check.state(task.contract.revision, task.work_revision),
+        EvidenceState::Passed,
+        "a check that ran after the write in the same step must stay current"
+    );
 }

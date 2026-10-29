@@ -1508,3 +1508,80 @@ async fn a_reply_cut_off_mid_stream_retries_the_step() {
     );
     assert_eq!(requests.lock().expect("lock").len(), 2);
 }
+
+#[test]
+fn only_calls_that_can_move_content_rescan_before_stamping() {
+    // Mutating tools and commands observe drift before their results are
+    // stamped with a work revision.
+    assert!(needs_rescan_before_stamping(tools::WRITE_FILE, true));
+    assert!(needs_rescan_before_stamping(tools::RUN_COMMAND, true));
+    // A subagent is not classified as mutating, but a child without its own
+    // checkout edits this workspace.
+    assert!(needs_rescan_before_stamping(tools::SPAWN_AGENT, false));
+    // Inspection and bookkeeping are covered by the once-per-step scan: a
+    // batch of reads must not re-read the whole evidence set per call.
+    for name in [
+        tools::READ_FILE,
+        tools::GREP,
+        tools::LIST_DIR,
+        tools::UPDATE_PLAN,
+        tools::REPORT_TASK,
+    ] {
+        assert!(
+            !needs_rescan_before_stamping(name, false),
+            "{name} cannot move content and must not force a per-call rescan"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_read_only_task_sends_the_same_inspection_specs_on_every_step() {
+    let (_guard, ws) = temp_workspace();
+    std::fs::write(ws.join("a.txt"), "alpha\n").expect("write");
+    let (url, requests) = mock_server(vec![
+        sse_tool_calls(&[("r1", "read_file", json!({"path": "a.txt"}))]),
+        sse_text("Inspected."),
+    ])
+    .await;
+    let events = run_one_turn(url, ws, "Inspect a.txt. Do not modify anything.").await;
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::TurnFinished { .. })),
+        "the turn must finish"
+    );
+    let requests = requests.lock().expect("lock").clone();
+    assert_eq!(requests.len(), 2);
+    let names = |index: usize| -> Vec<String> {
+        requests[index]["tools"]
+            .as_array()
+            .expect("tool specs")
+            .iter()
+            .map(|spec| {
+                spec["function"]["name"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string()
+            })
+            .collect()
+    };
+    let first = names(0);
+    assert!(first.contains(&tools::READ_FILE.to_string()));
+    assert!(!first.contains(&tools::WRITE_FILE.to_string()));
+    assert!(!first.contains(&tools::EDIT_FILE.to_string()));
+    // The read-only variant is derived once; later steps must send exactly
+    // the same specs rather than a rebuilt (and possibly drifting) copy.
+    assert_eq!(requests[0]["tools"], requests[1]["tools"]);
+    let run_command = requests[0]["tools"]
+        .as_array()
+        .expect("tools")
+        .iter()
+        .find(|spec| spec["function"]["name"] == tools::RUN_COMMAND)
+        .expect("run_command stays visible");
+    assert!(
+        run_command["function"]["description"]
+            .as_str()
+            .is_some_and(|description| description.starts_with("Inspect only")),
+        "read-only run_command must carry the inspection-only description"
+    );
+}

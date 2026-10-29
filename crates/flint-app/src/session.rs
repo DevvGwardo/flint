@@ -73,6 +73,8 @@ pub struct Session {
     pub queue_scroll: ScrollHandle,
     /// An accepted prompt is waiting for TurnStarted, or a steering ack.
     pub prompt_pending: bool,
+    /// Run-local only: saved preferences never restart unattended recovery.
+    pub auto_continue: crate::auto_continue::AutoContinueState,
     pub steering_pending: Option<u64>,
     /// Prevent a stopped engine or archive from racing a saved-task writer,
     /// even if the task sheet is dismissed while the write runs.
@@ -94,7 +96,15 @@ pub struct Session {
 #[derive(Clone)]
 pub enum RetryRequest {
     Prompt(crate::prompt_queue::Prompt),
-    Continue { task_id: u64, revision: u64 },
+    Continue {
+        task_id: u64,
+        revision: u64,
+    },
+    AutomaticReview {
+        task_id: u64,
+        revision: u64,
+        work_revision: u64,
+    },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -163,6 +173,27 @@ impl Bucket {
             Bucket::Inactive => "Inactive",
         }
     }
+
+    /// The stable name this bucket is saved under (settings, group keys).
+    pub fn key(self) -> &'static str {
+        match self {
+            Bucket::NeedsYou => "needs_you",
+            Bucket::Working => "working",
+            Bucket::Ready => "ready",
+            Bucket::Inactive => "inactive",
+        }
+    }
+
+    /// From [`Self::key`]; anything else is `None`.
+    pub fn from_key(key: &str) -> Option<Self> {
+        match key {
+            "needs_you" => Some(Bucket::NeedsYou),
+            "working" => Some(Bucket::Working),
+            "ready" => Some(Bucket::Ready),
+            "inactive" => Some(Bucket::Inactive),
+            _ => None,
+        }
+    }
 }
 
 impl Status {
@@ -223,6 +254,7 @@ impl Session {
             prompt_queue: Default::default(),
             queue_scroll: ScrollHandle::new(),
             prompt_pending: false,
+            auto_continue: Default::default(),
             steering_pending: None,
             task_update_pending: None,
             pending_records: VecDeque::new(),
@@ -528,13 +560,17 @@ impl Session {
                 self.event_writer = Some(store::EventWriter::new(dir.clone())?);
             }
             self.enqueue_pending()?;
-            self.event_writer.as_ref().unwrap().check_error()?;
+            if let Some(writer) = self.event_writer.as_ref() {
+                writer.check_error()?;
+            }
         }
         Ok(())
     }
 
     fn enqueue_pending(&mut self) -> std::io::Result<()> {
-        let writer = self.event_writer.as_ref().unwrap();
+        let Some(writer) = self.event_writer.as_ref() else {
+            return Err(std::io::Error::other("session writer missing"));
+        };
         while let Some(record) = self.pending_records.pop_front() {
             if let Err(record) = writer.enqueue(record) {
                 self.pending_records.push_front(*record);
@@ -555,7 +591,9 @@ impl Session {
     pub fn flush_records(&mut self) -> std::io::Result<()> {
         if self.event_writer.is_some() {
             self.enqueue_pending()?;
-            return self.event_writer.as_ref().unwrap().flush();
+            if let Some(writer) = self.event_writer.as_ref() {
+                return writer.flush();
+            }
         }
         if let Some(dir) = &self.dir {
             while let Some(record) = self.pending_records.front() {

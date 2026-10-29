@@ -123,7 +123,12 @@ pub fn open(cwd: &Path, home: &Path, reference: &str) -> Result<Worktree> {
         bail!("This branch is no longer available. Refresh the branch list.");
     };
     let (local_name, remote_ref) = if let Some(remote) = &selected.remote {
-        let name = selected.name.strip_prefix(&format!("{remote}/")).unwrap();
+        let Some(name) = selected.name.strip_prefix(&format!("{remote}/")) else {
+            bail!(
+                "Remote branch '{}' has an unexpected name. Refresh the branch list.",
+                selected.name
+            );
+        };
         if let Some(local) = repo
             .branches
             .iter()

@@ -193,7 +193,7 @@ fn bench_history_save_load() {
             std::hint::black_box(crate::persist::load(dir.path()).expect("load"));
         });
         eprintln!(
-            "BENCH history turns={turns} ({} KB): snapshot {snapshot_time:?} (on the session task), write {write_time:?} (background), load {load_time:?}",
+            "BENCH history turns={turns} ({} KB): snapshot {snapshot_time:?} (now formatted by the writer), write {write_time:?} (background), load {load_time:?}",
             bytes.len() / 1024
         );
     }
@@ -212,4 +212,84 @@ fn baseline_request_body(history: &[Message], tools: &[Value]) -> Vec<u8> {
     body["tools"] = Value::Array(tools.to_vec());
     body["tool_choice"] = json!("auto");
     serde_json::to_vec(&body).unwrap_or_default()
+}
+
+/// Evidence rescans after a tool call: re-read the whole evidence set versus
+/// reuse fingerprints for files whose metadata has not moved.
+#[test]
+fn bench_evidence_rescan() {
+    if !enabled() {
+        return;
+    }
+    use crate::task::TaskRecord;
+    let root = tempfile::tempdir().expect("tempdir");
+    let body = "x".repeat(64 * 1024);
+    let mut request = String::from("Touch the sources.\n");
+    // Steady state: evidence written before the turn, not moments ago. Files
+    // inside the timestamp grace window are hashed regardless.
+    let settled = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_600_000_000);
+    for file in 0..64 {
+        let name = format!("file_{file}.rs");
+        let path = root.path().join(&name);
+        std::fs::write(&path, &body).expect("write");
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .expect("open")
+            .set_modified(settled)
+            .expect("settle");
+        request.push_str(&format!("Required file: {name}\n"));
+    }
+    let mut task = TaskRecord::new(1, request, 0);
+    task.refresh_files(root.path());
+    let cached = median(20, || {
+        let mut cache = crate::task::FileScanCache::default();
+        task.refresh_files_cached(root.path(), &mut cache);
+        std::hint::black_box(&cache);
+    });
+    let mut warm = crate::task::FileScanCache::default();
+    task.refresh_files_cached(root.path(), &mut warm);
+    let reused = median(20, || {
+        let mut copy = warm.clone();
+        task.refresh_files_cached(root.path(), &mut copy);
+        std::hint::black_box(&copy);
+    });
+    eprintln!(
+        "BENCH evidence_rescan files=64 ({} MB total): cold {cached:?} -> warm {reused:?}",
+        64 * 64 / 1024
+    );
+    // A file just written shares its timestamp tick with the next scan, so it
+    // is re-hashed until it settles.
+    let recent = root.path().join("recent.rs");
+    std::fs::write(&recent, &body).expect("recent");
+    let mut fresh_cache = crate::task::FileScanCache::default();
+    std::fs::write(&recent, &body).expect("recent");
+    task.note_file("recent.rs", false);
+    let within_grace = median(20, || {
+        std::fs::write(&recent, &body).expect("rewrite");
+        task.refresh_files_cached(root.path(), &mut fresh_cache);
+    });
+    eprintln!("BENCH evidence_rescan with one file inside the grace window: {within_grace:?}");
+}
+
+/// What a save costs the session task: formatting the whole transcript (the
+/// old design) versus handing owned state to the background writer.
+#[test]
+fn bench_snapshot_handoff() {
+    if !enabled() {
+        return;
+    }
+    for turns in [20, 200] {
+        let history = synthetic_history(turns);
+        let formatted = median(20, || {
+            std::hint::black_box(crate::persist::snapshot(turns as u64, &history));
+        });
+        let handed_off = median(20, || {
+            std::hint::black_box(std::sync::Arc::new(history.clone()));
+        });
+        eprintln!(
+            "BENCH snapshot_handoff turns={turns}: format on session task {formatted:?} -> \
+             clone for the writer {handed_off:?}"
+        );
+    }
 }

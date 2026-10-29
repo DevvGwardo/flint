@@ -27,6 +27,7 @@ actions!(
         NewClaudeSession,
         NewCodexSession,
         NewDroidSession,
+        NewOpenCodeSession,
         TogglePalette,
         ToggleChanges,
         ToggleSidebar,
@@ -38,6 +39,7 @@ actions!(
         Interrupt,
         UndoLastTurn,
         FocusComposer,
+        FocusSearch,
         RevealWorkspace,
         OpenTerminal,
         ToggleTerminal,
@@ -149,6 +151,13 @@ pub enum SessionGrouping {
 }
 
 impl SessionGrouping {
+    /// Every order, in the order the footer menu lists them.
+    pub const ALL: [SessionGrouping; 3] = [
+        SessionGrouping::Project,
+        SessionGrouping::Status,
+        SessionGrouping::Agent,
+    ];
+
     pub fn next(self) -> Self {
         match self {
             Self::Project => Self::Status,
@@ -182,6 +191,13 @@ impl SessionGrouping {
             _ => Self::Project,
         }
     }
+}
+
+/// A popover opened from the sidebar's footer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SidebarMenu {
+    /// The grouping order picker.
+    Grouping,
 }
 
 /// Sessions and archived sessions the sidebar lists before "Show more", and
@@ -280,12 +296,25 @@ pub struct FlintApp {
     pub queue_popover: bool,
     pub queue_edit: Option<crate::queue_actions::QueueEdit>,
     pub task_panel: Option<crate::task_ui::TaskPanel>,
+    pub(crate) genui: Option<crate::genui_ui::InteractiveView>,
+    pub(crate) genui_error: Option<&'static str>,
+    pub(crate) genui_epoch: u64,
+    pub(crate) genui_content_revision: u64,
+    pub(crate) genui_generated: Option<crate::genui_ui::GeneratedSurface>,
+    pub(crate) genui_pending:
+        std::collections::HashMap<(u64, String), Option<flint_agent::genui::TaskMetadata>>,
     pub queue_resume_confirm: Option<crate::task_ui::QueueConfirmation>,
     /// Summary row whose answer was just copied, and when.
     pub copied: Option<(usize, Instant)>,
     pub copied_conversation: Option<crate::subagent_ui::Conversation>,
     /// Sidebar row with its context menu open.
     pub session_menu: Option<usize>,
+    /// Sidebar headings the user collapsed, remembered across launches.
+    pub collapsed_groups: std::collections::HashSet<crate::session_groups::GroupKey>,
+    /// The archived-sessions list is expanded, remembered across launches.
+    pub archived_open: bool,
+    /// A footer popover (the grouping menu) is open.
+    pub sidebar_menu: Option<SidebarMenu>,
     /// Session being renamed, with its title input.
     pub renaming: Option<(usize, Entity<InputState>)>,
     pub(crate) rename_subscription: Option<Subscription>,
@@ -349,7 +378,12 @@ impl FlintApp {
                 .submit_on_enter(true)
                 .placeholder("Ask anything, @ to mention, / for actions")
         });
-        let search = cx.new(|cx| InputState::new(window, cx).placeholder("Search sessions"));
+        let search = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(format!(
+                "Search sessions  {}",
+                crate::shortcuts::label("⌘F")
+            ))
+        });
         let subscriptions = vec![
             cx.subscribe_in(
                 &composer,
@@ -380,6 +414,12 @@ impl FlintApp {
             }),
         ];
         let grouping = SessionGrouping::from_setting(&settings.session_grouping);
+        let collapsed_groups = settings
+            .collapsed_groups
+            .iter()
+            .filter_map(|key| crate::session_groups::GroupKey::from_setting_key(key))
+            .collect();
+        let archived_open = settings.archived_open;
         let mut app = Self {
             sessions: Vec::new(),
             workspace: workspace.clone(),
@@ -448,10 +488,19 @@ impl FlintApp {
             queue_popover: false,
             queue_edit: None,
             task_panel: None,
+            genui: None,
+            genui_error: None,
+            genui_epoch: 0,
+            genui_content_revision: 0,
+            genui_generated: None,
+            genui_pending: Default::default(),
             queue_resume_confirm: None,
             copied: None,
             copied_conversation: None,
             session_menu: None,
+            collapsed_groups,
+            archived_open,
+            sidebar_menu: None,
             renaming: None,
             rename_subscription: None,
             rename_needs_scroll: std::cell::Cell::new(false),

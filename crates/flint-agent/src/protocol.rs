@@ -142,6 +142,8 @@ pub enum JevQuestion {
     Verified,
     /// Does the task still need file changes?
     Watchdog,
+    /// Can a claimed informational blocker be investigated within existing scope?
+    BlockerRecovery,
 }
 
 impl JevQuestion {
@@ -151,6 +153,7 @@ impl JevQuestion {
             JevQuestion::Stuck => "stuck",
             JevQuestion::Verified => "verified",
             JevQuestion::Watchdog => "watchdog",
+            JevQuestion::BlockerRecovery => "blocker_recovery",
         }
     }
 }
@@ -221,6 +224,12 @@ pub enum Op {
     ContinueTask {
         task_id: u64,
         expected_revision: u64,
+    },
+    /// Explicit opt-in independent review of current native evidence.
+    AutomaticallyReviewTask {
+        task_id: u64,
+        expected_revision: u64,
+        expected_work_revision: u64,
     },
     Shutdown,
 }
@@ -431,6 +440,7 @@ pub enum NudgeReason {
     Verify,
     Watchdog,
     LeakedCall,
+    BlockerRecovery,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -463,6 +473,7 @@ pub enum TurnEndReason {
 }
 
 pub const NATIVE_AGENT_NAME: &str = "Hooter";
+pub const IMPROVEMENT_OPTION_ID: &str = "native_improvement_hints";
 
 /// Which agent runs a session: flint's own engine or an ACP agent. Saved in
 /// the session's metadata so the UI can badge it and reopen it the same way.
@@ -474,6 +485,8 @@ pub enum AgentKind {
     ClaudeCode,
     Codex,
     Droid,
+    #[serde(rename = "opencode")]
+    OpenCode,
 }
 
 impl AgentKind {
@@ -484,6 +497,7 @@ impl AgentKind {
             AgentKind::ClaudeCode => "Claude Code",
             AgentKind::Codex => "Codex",
             AgentKind::Droid => "Droid",
+            AgentKind::OpenCode => "OpenCode",
         }
     }
 }
@@ -491,6 +505,19 @@ impl AgentKind {
 #[cfg(test)]
 mod branding_tests {
     use super::AgentKind;
+
+    #[test]
+    fn opencode_has_a_stable_saved_agent_key() {
+        assert_eq!(AgentKind::OpenCode.label(), "OpenCode");
+        assert_eq!(
+            serde_json::to_string(&AgentKind::OpenCode).unwrap(),
+            "\"opencode\""
+        );
+        assert_eq!(
+            serde_json::from_str::<AgentKind>("\"opencode\"").unwrap(),
+            AgentKind::OpenCode
+        );
+    }
 
     #[test]
     fn hooter_keeps_the_legacy_saved_agent_key() {

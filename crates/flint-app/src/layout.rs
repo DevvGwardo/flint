@@ -32,6 +32,7 @@ fn task_action_guard<A: Action>(
 impl Render for FlintApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let frame_started = std::time::Instant::now();
+        self.sync_genui(window, cx);
         self.chat_content.borrow_mut().begin_frame(cx);
         if let Some((old, new)) = self.session_workspace.pending_selection.take() {
             self.follow_session_selection(old, new, window, cx);
@@ -185,6 +186,11 @@ impl Render for FlintApp {
                     cx.stop_propagation();
                     return;
                 }
+                if key.key == "escape" && this.sidebar_menu.take().is_some() {
+                    cx.notify();
+                    cx.stop_propagation();
+                    return;
+                }
                 if this.renaming.is_some() {
                     if key.key == "escape" {
                         this.cancel_rename(window, cx);
@@ -202,6 +208,16 @@ impl Render for FlintApp {
                     if was_editing {
                         this.dispatch_next_prompt(this.session().uid, cx);
                     }
+                    cx.notify();
+                    cx.stop_propagation();
+                    return;
+                }
+                if key.key == "escape"
+                    && !this.search.read(cx).value().trim().is_empty()
+                    && this.search.read(cx).focus_handle(cx).is_focused(window)
+                {
+                    this.search
+                        .update(cx, |state, cx| state.set_value("", window, cx));
                     cx.notify();
                     cx.stop_propagation();
                     return;
@@ -236,6 +252,7 @@ impl Render for FlintApp {
             .capture_action(cx.listener(task_action_guard::<NewClaudeSession>))
             .capture_action(cx.listener(task_action_guard::<NewCodexSession>))
             .capture_action(cx.listener(task_action_guard::<NewDroidSession>))
+            .capture_action(cx.listener(task_action_guard::<NewOpenCodeSession>))
             .capture_action(cx.listener(task_action_guard::<ToggleTerminal>))
             .capture_action(cx.listener(task_action_guard::<TogglePalette>))
             .capture_action(cx.listener(task_action_guard::<ToggleChanges>))
@@ -255,6 +272,7 @@ impl Render for FlintApp {
             .capture_action(cx.listener(task_action_guard::<ArrangeSessionGrid>))
             .capture_action(cx.listener(task_action_guard::<ResetSessionPanes>))
             .capture_action(cx.listener(task_action_guard::<FocusComposer>))
+            .capture_action(cx.listener(task_action_guard::<FocusSearch>))
             .on_action(cx.listener(|this, _: &NewSession, window, cx| this.new_session(window, cx)))
             .on_action(
                 cx.listener(|this, _: &ToggleTerminal, window, cx| {
@@ -269,6 +287,9 @@ impl Render for FlintApp {
             }))
             .on_action(cx.listener(|this, _: &NewDroidSession, window, cx| {
                 this.new_agent_session(AgentKind::Droid, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &NewOpenCodeSession, window, cx| {
+                this.new_agent_session(AgentKind::OpenCode, window, cx)
             }))
             .on_action(cx.listener(|this, _: &TogglePalette, window, cx| {
                 if this.palette.is_some() {
@@ -339,6 +360,10 @@ impl Render for FlintApp {
             )
             .on_action(cx.listener(|this, _: &ResetSessionPanes, window, cx| {
                 this.reset_session_panes(window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &FocusSearch, window, cx| {
+                this.search.update(cx, |state, cx| state.focus(window, cx));
+                cx.notify();
             }))
             .on_action(cx.listener(|this, _: &FocusComposer, window, cx| {
                 let uid = this.session().uid;

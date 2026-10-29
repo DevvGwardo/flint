@@ -21,6 +21,39 @@ pub enum GroupKey {
     Agent(AgentKind),
 }
 
+impl GroupKey {
+    /// The stable string this heading is remembered as in
+    /// `Settings.collapsed_groups`.
+    pub fn setting_key(&self) -> String {
+        match self {
+            GroupKey::Project(root, subdir) => format!(
+                "project:{}|{}",
+                root.to_string_lossy(),
+                subdir.to_string_lossy()
+            ),
+            GroupKey::Status(bucket) => format!("status:{}", bucket.key()),
+            GroupKey::Agent(agent) => format!("agent:{}", crate::settings::agent_key(*agent)),
+        }
+    }
+
+    /// From [`Self::setting_key`]; an unknown key is dropped.
+    pub fn from_setting_key(key: &str) -> Option<Self> {
+        let (kind, rest) = key.split_once(':')?;
+        match kind {
+            "project" => {
+                let (root, subdir) = rest.split_once('|')?;
+                Some(GroupKey::Project(
+                    PathBuf::from(root),
+                    PathBuf::from(subdir),
+                ))
+            }
+            "status" => Bucket::from_key(rest).map(GroupKey::Status),
+            "agent" => crate::settings::agent_from_key(rest).map(GroupKey::Agent),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct SessionGroup {
     pub key: GroupKey,
@@ -74,6 +107,16 @@ impl FlintApp {
                 None,
             ),
         }
+    }
+
+    /// Every heading the current grouping produces, whether or not search,
+    /// the filter or a collapse is hiding its rows. Collapsed state is pruned
+    /// against this so a filtered-out group does not forget it.
+    pub fn listed_group_keys(&self) -> std::collections::HashSet<GroupKey> {
+        (0..self.sessions.len())
+            .filter(|&ix| self.is_listed(ix))
+            .map(|ix| self.group_of(ix).0)
+            .collect()
     }
 
     /// The visible sessions under their headings, at most `session_limit` of

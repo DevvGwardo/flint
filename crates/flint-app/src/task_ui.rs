@@ -613,7 +613,7 @@ pub fn parse_requirements(text: &str) -> Result<Vec<RequirementSpec>, String> {
 pub fn outcome_style(outcome: TaskOutcome) -> (IconName, Hsla) {
     let p = palette();
     match outcome {
-        TaskOutcome::Accepted => (IconName::Check, p.success),
+        TaskOutcome::Accepted | TaskOutcome::Verified => (IconName::Check, p.success),
         TaskOutcome::Answered => (IconName::MessageCircle, p.text_muted),
         TaskOutcome::Blocked => (IconName::CircleAlert, p.warning),
         TaskOutcome::Partial | TaskOutcome::NeedsReview | TaskOutcome::Unknown => {
@@ -679,6 +679,9 @@ pub fn render(
     let latest = app
         .conversation_view(&panel.target)
         .is_some_and(|view| view.turn_id == panel.turn_id);
+    let active_parent = panel.target.parent == app.session().uid
+        && panel.target.child.is_none()
+        && app.session().selected_subagent.is_none();
     let outcome = task
         .assessment
         .as_ref()
@@ -824,7 +827,17 @@ pub fn render(
                                 "{} (observed revision {})",
                                 check.detail, check.work_revision
                             ),
-                            check.state(task.contract.revision, task.work_revision),
+                            if !check.verification
+                                && !task.contract.requirements.iter().any(|requirement| {
+                                    matches!(&requirement.spec, RequirementSpec::Command(command) if command.trim() == check.command)
+                                })
+                                && check.state(task.contract.revision, task.work_revision) == EvidenceState::Stale
+                            {
+                                // Inspection is historical context, not a failed/stale required check.
+                                EvidenceState::Observed
+                            } else {
+                                check.state(task.contract.revision, task.work_revision)
+                            },
                         )
                     }))
                     .test_support(),
@@ -980,6 +993,23 @@ pub fn render(
                 ui::label(report.clone(), size::SM, p.text_muted),
             ));
         }
+        if let Some(review) = &task.automatic_review {
+            content = content.child(section(
+                "Independent automatic review",
+                ui::label(
+                    format!(
+                        "{}\nModel: {} · scope revision {} · work revision {}\n{}",
+                        review.summary,
+                        review.model,
+                        review.contract_revision,
+                        review.work_revision,
+                        review.findings.join("\n"),
+                    ),
+                    size::SM,
+                    p.text_muted,
+                ),
+            ));
+        }
         content = content.child(ui::label(
             if task.source == TaskSource::External {
                 "External agent: its own loop controls execution. Native scope, checks and read-only policy do not govern it. Acceptance here records your review only."
@@ -1021,6 +1051,19 @@ pub fn render(
             },size::XS,p.warning,
         )))
         .child(div().flex().flex_wrap().items_center().gap(px(7.))
+            .when(latest && active_parent && cfg!(target_os = "macos"), |row| row
+                .child(Button::new("task-genui").outline().label(app.genui_status())
+                    .disabled(panel.draft.is_some())
+                    .on_click(cx.listener(|app, _, _, cx| app.open_genui(cx)))))
+            .when(latest && active_parent && session.options.iter().any(|option| option.id == flint_agent::IMPROVEMENT_OPTION_ID), |row| row
+                .child(Button::new("task-adaptive-hints").outline().label("Adaptive hints")
+                    .disabled(panel.draft.is_some())
+                    .on_click(cx.listener(|app, _, window, cx| {
+                        if app.task_panel.as_ref().is_some_and(|panel| panel.draft.is_some()) { return; }
+                        app.close_task_details(window, cx);
+                        app.open_option_menu(
+                            crate::session_options::MenuTarget::Option(flint_agent::IMPROVEMENT_OPTION_ID.into()), cx);
+                    }))))
             .when(panel.draft.is_some(), |row| row
                 .child(Button::new("task-edit-cancel").label("Cancel").on_click(cx.listener(|app, _, window, cx| {
                     if let Some(panel) = &mut app.task_panel { panel.draft = None; panel.focus.focus(window, cx); }
@@ -1039,15 +1082,23 @@ pub fn render(
                 .when(latest && panel.target.child.is_none(), |row| row
                     .child(Button::new("task-continue").label("Continue task").disabled(!controls)
                         .on_click(cx.listener(|app, _, window, cx| app.continue_task(window, cx))))
+                    .when(app.settings.auto_continue_fixes && task.source == TaskSource::Native
+                        && task.contract.mode == TaskMode::Work && outcome != TaskOutcome::Verified
+                        && outcome != TaskOutcome::Accepted, |row| row
+                        .child(Button::new("task-auto-fix").label("Auto-fix and review").disabled(!controls)
+                            .on_click(cx.listener(|app, _, _, cx| app.resume_automatic_task(cx)))))
                     .when(task.source == TaskSource::Native, |row| row
                         .child(Button::new("task-edit").label("Revise scope").disabled(!controls)
                             .on_click(cx.listener(|app, _, window, cx| app.edit_task_scope(window, cx)))))
                     .when(outcome != TaskOutcome::Accepted, |row| row
-                        .child(Button::new("task-accept").primary().label("Review acceptance").disabled(!controls || task.assessment.is_none())
+                        .child(Button::new("task-accept").primary().label(if outcome == TaskOutcome::Verified { "Accept personally" } else { "Review acceptance" }).disabled(!controls || task.assessment.is_none())
                             .on_click(cx.listener(|app, _, _, cx| app.request_task_acceptance(cx))))))
                 .when(!latest || panel.target.child.is_some(), |row| row.child(ui::label(
                     "Read-only details. Continue or accept from the latest parent task.", size::XS, p.text_muted,
                 )))))
+        .when(app.genui_error.is_some(), |footer| footer.child(ui::label(
+            app.genui_error.unwrap_or(""), size::XS, p.warning,
+        )))
         .child(crate::automation::task_control_probe("footer")).test_support();
     let sheet = div()
         .id("task-sheet")

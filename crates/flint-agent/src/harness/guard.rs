@@ -40,6 +40,18 @@ pub const WATCHDOG_NUDGE: &str = "You inspected files and gathered context, but 
     any files or completed the requested changes yet. Implement the solution and verify it \
     before concluding.";
 
+pub const BLOCKER_RECOVERY_NUDGE: &str = "The reported obstacle has not been established by a \
+    failed inspection or access denial. Make one bounded read-only investigation using existing \
+    tools and permissions before concluding that this informational task is blocked. A private \
+    scratch folder is not the user's project inventory or activity history. For recent-work \
+    questions, look for known project roots and activity/session records, not just recent files \
+    under the scratch folder. Distinguish repository creation from cloning, commits and file \
+    timestamps; report uncertainty honestly. Do not scan unrelated private data, request a \
+    worktree, modify files, run executable tests, or bypass denied access. If a new relevant \
+    inspection resolves an agent-reported blocker, call report_task with its exact text in \
+    resolved_blockers and explain the evidence. Omitting a blocker does not clear it. If \
+    necessary input is genuinely unavailable, preserve the blocker and ask specifically for it.";
+
 /// The nudge when the last check after the edits failed.
 pub fn failed_check_nudge(command: &str, exit_code: Option<i32>) -> String {
     let code = exit_code.map_or_else(|| "failed".to_string(), |c| format!("exit {c}"));
@@ -135,6 +147,7 @@ pub struct TurnGuard {
     failed_check_nudged: bool,
     watchdog_nudged: bool,
     plan_nudged: bool,
+    failed_tool: bool,
     trace: Vec<TraceEntry>,
     edited_paths: Vec<String>,
     commands_after_last_edit: Vec<CommandEntry>,
@@ -165,6 +178,7 @@ impl TurnGuard {
             failed_check_nudged: false,
             watchdog_nudged: false,
             plan_nudged: false,
+            failed_tool: false,
             trace: Vec::new(),
             edited_paths: Vec::new(),
             commands_after_last_edit: Vec::new(),
@@ -361,6 +375,11 @@ impl TurnGuard {
         exit_code: Option<i32>,
         success: bool,
     ) {
+        if (!success || exit_code.is_some_and(|code| code != 0))
+            && !matches!(name, crate::tools::REPORT_TASK | crate::tools::UPDATE_PLAN)
+        {
+            self.failed_tool = true;
+        }
         if kind == ToolKind::Edit && success {
             self.record_edit(args.get("path").and_then(Value::as_str));
         }
@@ -512,14 +531,7 @@ impl TurnGuard {
                     .count(),
                 task.children
                     .iter()
-                    .filter(|child| {
-                        matches!(
-                            child.outcome,
-                            crate::task::TaskOutcome::Answered
-                                | crate::task::TaskOutcome::NeedsReview
-                                | crate::task::TaskOutcome::Accepted
-                        )
-                    })
+                    .filter(|child| child.outcome.is_usable_child_report())
                     .count(),
             )
         })
@@ -641,8 +653,54 @@ impl TurnGuard {
         state
     }
 
+    pub fn has_blockers(&self) -> bool {
+        self.task
+            .as_ref()
+            .is_some_and(|task| !task.blockers.is_empty())
+    }
+
+    /// A judge cannot overrule observed denials, protected requirements, or
+    /// user/child blockers. Only unsubstantiated informational claims qualify.
+    pub fn can_recover_blocker(&self) -> bool {
+        !self.failed_tool
+            && self.task.as_ref().is_some_and(|task| {
+                task.informational()
+                    && !task.blockers.is_empty()
+                    && task
+                        .blockers
+                        .iter()
+                        .all(|blocker| blocker.source == "agent report")
+                    && task.scope_denials.is_empty()
+                    && task.checks.iter().all(|check| check.success)
+                    && task.children.is_empty()
+                    && !task.evidence_overflow
+                    && task.automatic_review.is_none()
+            })
+    }
+
+    pub fn blocker_state(&self, final_message: &str) -> Value {
+        let mut state = self.watchdog_state(final_message);
+        if let Some(task) = &self.task {
+            state["reported_blockers"] = json!(
+                task.blockers
+                    .iter()
+                    .take(JEV_MAX_EDITED_FILES)
+                    .map(|blocker| json!({
+                        "text": truncate(&blocker.text, JEV_MAX_TASK_CHARS),
+                        "source": blocker.source,
+                    }))
+                    .collect::<Vec<_>>()
+            );
+            state["last_successful_inspection"] = json!(task.last_inspection);
+        }
+        state["permissions_unchanged"] = json!(true);
+        state
+    }
+
     fn changed_work(&self) -> bool {
-        self.edited_files || self.possible_changes
+        self.edited_files
+            || (self.possible_changes
+                && !self.task.as_ref().is_some_and(|task| task.informational()))
     }
 
     fn observed_work(&self) -> bool {

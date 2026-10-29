@@ -409,15 +409,9 @@ pub(super) async fn run_child(
         .and_then(|task| task.assessment.as_ref());
     // A successfully returned report is not accepted child work. NeedsReview
     // is a usable report, but blocked/partial work is not task success.
+    // Verified counts: task.rs already treats it as a satisfied dependency.
     let success = execution_success
-        && assessment.is_some_and(|assessment| {
-            matches!(
-                assessment.outcome,
-                crate::task::TaskOutcome::Answered
-                    | crate::task::TaskOutcome::NeedsReview
-                    | crate::task::TaskOutcome::Accepted
-            )
-        });
+        && assessment.is_some_and(|assessment| assessment.outcome.is_usable_child_report());
     let output = child
         .session
         .history

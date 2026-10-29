@@ -615,6 +615,7 @@ fn jev(ix: usize, question: JevQuestion, probability: f64, confirmed: bool) -> i
         JevQuestion::Stuck => "loop check",
         JevQuestion::Verified => "verification",
         JevQuestion::Watchdog => "edit check",
+        JevQuestion::BlockerRecovery => "blocker check",
     };
     let status = match (question, confirmed) {
         (JevQuestion::Stuck, true) => "stuck",
@@ -623,6 +624,8 @@ fn jev(ix: usize, question: JevQuestion, probability: f64, confirmed: bool) -> i
         (JevQuestion::Verified, false) => "verified",
         (JevQuestion::Watchdog, true) => "edits still needed",
         (JevQuestion::Watchdog, false) => "no edits needed",
+        (JevQuestion::BlockerRecovery, true) => "investigate further",
+        (JevQuestion::BlockerRecovery, false) => "no recovery advised",
     };
     let (icon, color) = guard_style(confirmed);
     let label = format!("JEV · {subject} · {:.0}% · {status}", probability * 100.0);
@@ -663,6 +666,7 @@ fn nudge(
         NudgeReason::Verify => "verify before done",
         NudgeReason::Watchdog => "no changes made yet",
         NudgeReason::LeakedCall => "tool call written as text",
+        NudgeReason::BlockerRecovery => "check the reported blocker",
     };
     let tip = message.to_string();
     div()

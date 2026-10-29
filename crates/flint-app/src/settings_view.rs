@@ -24,6 +24,10 @@ use crate::theme::size;
 use crate::ui;
 
 pub struct SettingsForm {
+    pub provider: settings::ProviderKind,
+    pub provider_name: Entity<InputState>,
+    pub provider_profiles: std::collections::BTreeMap<String, settings::ProviderProfile>,
+    pub omniroute_no_auth: bool,
     pub model: Entity<InputState>,
     pub subagent_model: Entity<InputState>,
     pub base_url: Entity<InputState>,
@@ -34,6 +38,7 @@ pub struct SettingsForm {
     pub transcript_width: settings::TranscriptWidth,
     pub jev_judge: bool,
     pub queue_after_verification: bool,
+    pub auto_continue_fixes: bool,
     pub error: Option<String>,
     pub subscriptions: Vec<Subscription>,
     pub focus: FocusHandle,
@@ -47,6 +52,9 @@ pub struct SettingsForm {
 impl SettingsForm {
     pub fn draft(&self, saved: &Settings, cx: &App) -> Settings {
         let mut draft = saved.clone();
+        draft.provider = self.provider;
+        draft.provider_profiles = self.provider_profiles.clone();
+        draft.omniroute_no_auth = self.omniroute_no_auth;
         draft.model = self.model.read(cx).value().trim().to_string();
         draft.subagent_model = self.subagent_model.read(cx).value().trim().to_string();
         draft.base_url = self.base_url.read(cx).value().trim().to_string();
@@ -55,7 +63,29 @@ impl SettingsForm {
         draft.transcript_width = self.transcript_width;
         draft.jev_judge = self.jev_judge;
         draft.queue_after_verification = self.queue_after_verification;
+        draft.auto_continue_fixes = self.auto_continue_fixes;
         draft
+    }
+
+    fn use_provider(
+        &mut self,
+        profile: &settings::ProviderProfile,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        self.provider = profile.provider;
+        self.omniroute_no_auth = profile.omniroute_no_auth;
+        for (input, value) in [
+            (&self.model, &profile.model),
+            (&self.subagent_model, &profile.subagent_model),
+            (&self.base_url, &profile.base_url),
+            (&self.api_key_env, &profile.api_key_env),
+            (&self.api_key_file, &profile.api_key_file),
+        ] {
+            input.update(cx, |input, cx| input.set_value(value.clone(), window, cx));
+        }
+        self.error = None;
+        self.invalidate_probe();
     }
 
     fn invalidate_probe(&mut self) {
@@ -67,13 +97,34 @@ impl SettingsForm {
 }
 
 impl FlintApp {
+    pub fn stage_provider_profile(&mut self, cx: &mut Context<Self>) {
+        let Some(form) = &mut self.settings_form else {
+            return;
+        };
+        let mut draft = form.draft(&self.settings, cx);
+        match draft.save_provider_profile(&form.provider_name.read(cx).value()) {
+            Ok(()) => {
+                form.provider_profiles = draft.provider_profiles;
+                form.error = None;
+                form.invalidate_probe();
+            }
+            Err(message) => form.error = Some(message.into()),
+        }
+        cx.notify();
+    }
+
     pub fn test_provider_connection(&mut self, cx: &mut Context<Self>) {
         let Some(form) = &mut self.settings_form else {
             return;
         };
         form.invalidate_probe();
         let draft = form.draft(&self.settings, cx);
-        if draft.model.is_empty() || !valid_env_name(&draft.api_key_env) {
+        if let Err(message) = draft.validate_provider() {
+            form.error = Some(message.into());
+            cx.notify();
+            return;
+        }
+        if draft.model.is_empty() || !settings::valid_key_env_name(&draft.api_key_env) {
             form.error =
                 Some("Enter a model and a valid credential environment variable name.".into());
             cx.notify();
@@ -81,7 +132,8 @@ impl FlintApp {
         }
         let key = draft
             .resolve_key(self.key_path.as_deref(), &self.key_sources)
-            .map(|key| key.key);
+            .map(|key| key.key)
+            .filter(|key| !key.is_empty());
         let probe =
             match crate::connection_test::Probe::start(&draft.base_url, draft.model.clone(), key) {
                 Ok(probe) => probe,
@@ -143,6 +195,19 @@ impl FlintApp {
                 .default_value(self.settings.subagent_model.clone())
         });
         let base_url = cx.new(|cx| InputState::new(window, cx).default_value(base_url));
+        let current = settings::ProviderProfile::from_settings(&self.settings);
+        let name = self
+            .settings
+            .provider_profiles
+            .iter()
+            .find(|(_, profile)| **profile == current)
+            .map(|(name, _)| name.clone())
+            .unwrap_or_default();
+        let provider_name = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("e.g. DeepSeek, work gateway, local server")
+                .default_value(name)
+        });
         let key_file = self.settings.api_key_file.clone();
         let api_key_file = cx.new(|cx| {
             InputState::new(window, cx)
@@ -151,7 +216,7 @@ impl FlintApp {
         });
         let api_key_env = cx.new(|cx| {
             InputState::new(window, cx)
-                .placeholder("FLINT_API_KEY, then OPENAI_API_KEY")
+                .placeholder("e.g. DEEPSEEK_API_KEY")
                 .default_value(self.settings.api_key_env.clone())
         });
         let mut subscriptions: Vec<_> = [
@@ -160,6 +225,7 @@ impl FlintApp {
             &base_url,
             &api_key_file,
             &api_key_env,
+            &provider_name,
         ]
         .into_iter()
         .map(|input| {
@@ -200,6 +266,10 @@ impl FlintApp {
             }),
         );
         self.settings_form = Some(SettingsForm {
+            provider: self.settings.provider,
+            provider_name,
+            provider_profiles: self.settings.provider_profiles.clone(),
+            omniroute_no_auth: self.settings.omniroute_no_auth,
             model,
             subagent_model,
             base_url,
@@ -210,6 +280,7 @@ impl FlintApp {
             transcript_width: self.settings.transcript_width,
             jev_judge: self.settings.jev_judge,
             queue_after_verification: self.settings.queue_after_verification,
+            auto_continue_fixes: self.settings.auto_continue_fixes,
             error: None,
             subscriptions,
             focus: cx.focus_handle(),
@@ -252,13 +323,26 @@ impl FlintApp {
             return;
         };
         let mut next = form.draft(&self.settings, cx);
+        if let Err(message) = next.validate_provider() {
+            form.error = Some(message.into());
+            cx.notify();
+            return;
+        }
         if next.model.is_empty() || crate::connection_test::models_url(&next.base_url).is_err() {
             form.error = Some("Enter a model name and an http(s) URL with a host.".into());
             cx.notify();
             return;
         }
-        if !valid_env_name(&next.api_key_env) {
+        if !settings::valid_key_env_name(&next.api_key_env) {
             form.error = Some("Enter an environment variable name, not a key value.".into());
+            cx.notify();
+            return;
+        }
+        let name = form.provider_name.read(cx).value();
+        if !name.trim().is_empty()
+            && let Err(message) = next.save_provider_profile(&name)
+        {
+            form.error = Some(message.into());
             cx.notify();
             return;
         }
@@ -277,7 +361,11 @@ impl FlintApp {
         let queue_policy_changed =
             self.settings.queue_after_verification != next.queue_after_verification;
         let jev_changed = self.settings.jev_judge != next.jev_judge;
+        let auto_continue_disabled = self.settings.auto_continue_fixes && !next.auto_continue_fixes;
         self.settings = next;
+        if auto_continue_disabled {
+            self.pause_auto_continuations();
+        }
         if jev_changed {
             self.broadcast_jev();
         }
@@ -330,17 +418,44 @@ impl FlintApp {
         }
     }
 
+    pub fn toggle_auto_continue_fixes(&mut self, cx: &mut Context<Self>) {
+        if self.session().agent != flint_agent::AgentKind::Flint || self.settings_form.is_some() {
+            return;
+        }
+        let mut next = self.settings.clone();
+        next.auto_continue_fixes = !next.auto_continue_fixes;
+        if let Err(error) = next.save(&self.home) {
+            self.store_error = Some(format!("Couldn't save auto-continue setting: {error}"));
+            cx.notify();
+            return;
+        }
+        self.settings = next;
+        if !self.settings.auto_continue_fixes {
+            self.pause_auto_continuations();
+        }
+        if self
+            .store_error
+            .as_deref()
+            .is_some_and(|error| error.starts_with("Couldn't save auto-continue setting:"))
+        {
+            self.store_error = None;
+        }
+        cx.notify();
+    }
+
+    fn pause_auto_continuations(&mut self) {
+        for session in &mut self.sessions {
+            session.auto_continue.pause(
+                "Auto-continue was turned off. Send a prompt or continue the task to start again.",
+            );
+        }
+    }
+
     pub fn dismiss_tip(&mut self, cx: &mut Context<Self>) {
         self.settings.tip_dismissed = true;
         self.settings.save(&self.home).ok();
         cx.notify();
     }
-}
-
-fn valid_env_name(name: &str) -> bool {
-    name.chars()
-        .enumerate()
-        .all(|(i, c)| c == '_' || c.is_ascii_alphabetic() || (i > 0 && c.is_ascii_digit()))
 }
 
 fn segment(id: impl Into<ElementId>, label: &str, selected: bool) -> Stateful<Div> {
@@ -406,6 +521,11 @@ pub fn render(
     let draft = form.draft(&app.settings, cx);
     let (key_icon, key_text, key_color) =
         match draft.key_status(app.key_path.as_deref(), &app.key_sources) {
+            KeyStatus::NotRequired => (
+                IconName::CircleCheck,
+                "No authentication: explicit local OmniRoute mode".into(),
+                p.text_subtle,
+            ),
             KeyStatus::Found(source) => (
                 IconName::CircleCheck,
                 format!("Found in {source}"),
@@ -502,17 +622,94 @@ pub fn render(
                 }),
             ),
         ))
-        .child(row(
-            "Provider",
-            Some("Presets fill the endpoint; confirm the model before saving"),
+        .when(!form.provider_profiles.is_empty(), |content| content.child(row(
+            "Saved providers",
+            Some("New Hooter sessions; Save keeps changes"),
             div()
                 .flex()
+                .flex_col()
                 .gap(px(8.))
+                .children(form.provider_profiles.iter().enumerate().map(|(n, (name, profile))| {
+                    let selected = settings::ProviderProfile::from_settings(&draft) == *profile;
+                    let select_name = name.clone();
+                    let profile = profile.clone();
+                    let remove_name = name.clone();
+                    div().flex().gap(px(6.))
+                        .child(
+                            Button::new(("settings-use-provider", n))
+                                .label(name.clone())
+                                .selected(selected)
+                                .on_click(cx.listener(move |app, _, window, cx| {
+                                    if let Some(form) = &mut app.settings_form {
+                                        form.use_provider(&profile, window, cx);
+                                        form.provider_name.update(cx, |input, cx| {
+                                            input.set_value(select_name.clone(), window, cx);
+                                        });
+                                    }
+                                    cx.notify();
+                                })),
+                        )
+                        .child(
+                            Button::new(("settings-remove-provider", n))
+                                .label(format!("Remove {name}"))
+                                .on_click(cx.listener(move |app, _, window, cx| {
+                                    if let Some(form) = &mut app.settings_form {
+                                        form.provider_profiles.remove(&remove_name);
+                                        if form.provider_name.read(cx).value().trim() == remove_name {
+                                            form.provider_name.update(cx, |input, cx| {
+                                                input.set_value("", window, cx);
+                                            });
+                                        }
+                                        form.error = None;
+                                        form.invalidate_probe();
+                                    }
+                                    cx.notify();
+                                })),
+                        )
+                })),
+        )))
+        .child(row(
+            "Provider",
+            Some("OpenAI-compatible Chat Completions APIs"),
+            div()
+                .flex()
+                .flex_wrap()
+                .gap(px(8.))
+                .child(
+                    Button::new("preset-custom")
+                        .label("Add custom")
+                        .selected(form.provider == settings::ProviderKind::Custom)
+                        .on_click(cx.listener(|app, _, window, cx| {
+                            if let Some(form) = &mut app.settings_form {
+                                form.use_provider(&settings::ProviderProfile {
+                                    provider: settings::ProviderKind::Custom,
+                                    omniroute_no_auth: false,
+                                    base_url: String::new(),
+                                    model: String::new(),
+                                    subagent_model: String::new(),
+                                    api_key_env: String::new(),
+                                    api_key_file: String::new(),
+                                }, window, cx);
+                                form.provider_name.update(cx, |input, cx| {
+                                    input.set_value("", window, cx);
+                                });
+                            }
+                            cx.notify();
+                        })),
+                )
                 .child(
                     Button::new("preset-openai")
                         .label("OpenAI")
                         .on_click(cx.listener(|this, _, window, cx| {
-                            if let Some(form) = &this.settings_form {
+                            if let Some(form) = &mut this.settings_form {
+                                if form.provider != settings::ProviderKind::OpenAiCompatible {
+                                    form.api_key_env.update(cx, |input, cx| input.set_value("", window, cx));
+                                    form.api_key_file.update(cx, |input, cx| input.set_value("", window, cx));
+                                }
+                                form.provider = settings::ProviderKind::OpenAiCompatible;
+                                form.provider_name.update(cx, |input, cx| input.set_value("", window, cx));
+                                form.omniroute_no_auth = false;
+                                form.invalidate_probe();
                                 form.base_url.update(cx, |input, cx| {
                                     input.set_value(
                                         flint_agent::config::DEFAULT_BASE_URL,
@@ -524,20 +721,78 @@ pub fn render(
                                     input.set_value(flint_agent::config::DEFAULT_MODEL, window, cx)
                                 });
                             }
+                            cx.notify();
                         })),
                 )
                 .child(
                     Button::new("preset-ollama")
                         .label("Local (Ollama)")
                         .on_click(cx.listener(|this, _, window, cx| {
-                            if let Some(form) = &this.settings_form {
+                            if let Some(form) = &mut this.settings_form {
+                                if form.provider != settings::ProviderKind::OpenAiCompatible {
+                                    form.api_key_env.update(cx, |input, cx| input.set_value("", window, cx));
+                                    form.api_key_file.update(cx, |input, cx| input.set_value("", window, cx));
+                                }
+                                form.provider = settings::ProviderKind::OpenAiCompatible;
+                                form.provider_name.update(cx, |input, cx| input.set_value("", window, cx));
+                                form.omniroute_no_auth = false;
+                                form.invalidate_probe();
                                 form.base_url.update(cx, |input, cx| {
                                     input.set_value("http://127.0.0.1:11434/v1", window, cx)
                                 });
                             }
+                            cx.notify();
+                        })),
+                )
+                .child(
+                    Button::new("preset-omniroute")
+                        .label("OmniRoute")
+                        .selected(form.provider == settings::ProviderKind::OmniRoute)
+                        .on_click(cx.listener(|app, _, window, cx| {
+                            if let Some(form) = &mut app.settings_form {
+                                form.provider = settings::ProviderKind::OmniRoute;
+                                form.provider_name.update(cx, |input, cx| input.set_value("", window, cx));
+                                form.omniroute_no_auth = false;
+                                form.invalidate_probe();
+                                form.base_url.update(cx, |input, cx| input.set_value(settings::OMNIROUTE_BASE_URL, window, cx));
+                                form.model.update(cx, |input, cx| input.set_value(settings::OMNIROUTE_MODEL, window, cx));
+                                form.subagent_model.update(cx, |input, cx| input.set_value("", window, cx));
+                                form.api_key_env.update(cx, |input, cx| input.set_value(settings::OMNIROUTE_KEY_ENV, window, cx));
+                                form.api_key_file.update(cx, |input, cx| input.set_value("", window, cx));
+                            }
+                            cx.notify();
                         })),
                 ),
         ))
+        .when(form.provider == settings::ProviderKind::OmniRoute, |content| {
+            content.child(row(
+                "OmniRoute",
+                Some("New native sessions; ACP agents keep their own providers"),
+                div().flex().flex_col().gap(px(8.))
+                    .child(ui::label(
+                        "Run OmniRoute separately. Use auto, an exact provider/model ID, or a combo name. Supply the router's API key, not an upstream provider key. Custom ports and remote URLs can be entered below.",
+                        size::XS, p.text_subtle,
+                    ))
+                    .child(
+                        Button::new("settings-omniroute-no-auth")
+                            .label("Local no-auth (loopback only)")
+                            .selected(form.omniroute_no_auth)
+                            .toggled(form.omniroute_no_auth)
+                            .on_click(cx.listener(|app, _, _, cx| {
+                                if let Some(form) = &mut app.settings_form {
+                                    form.omniroute_no_auth = !form.omniroute_no_auth;
+                                    form.error = None;
+                                    form.invalidate_probe();
+                                }
+                                cx.notify();
+                            })),
+                    )
+                    .child(ui::label(
+                        "Enable only when your local router does not require an API key. No credentials are sent; this does not disable authentication in OmniRoute.",
+                        size::XS, p.text_subtle,
+                    )),
+            ))
+        })
         .child(row(
             "Model",
             Some("New native engines; running sessions keep their model"),
@@ -561,7 +816,13 @@ pub fn render(
         ))
         .child(row(
             "API key env",
-            Some("Name only; FLINT_API_KEY then OPENAI_API_KEY if blank"),
+            Some(if form.provider == settings::ProviderKind::OmniRoute {
+                "Router key only; OMNIROUTE_API_KEY if blank"
+            } else if form.provider == settings::ProviderKind::Custom {
+                "This provider's variable name; no fallback to other providers' keys"
+            } else {
+                "Name only; FLINT_API_KEY then OPENAI_API_KEY if blank"
+            }),
             Input::new(&form.api_key_env)
                 .id("settings-key-env")
                 .aria_label("API key environment variable"),
@@ -586,6 +847,23 @@ pub fn render(
                     Input::new(&form.api_key_file)
                         .id("settings-key-file")
                         .aria_label("API key file"),
+                ),
+        ))
+        .child(row(
+            "Provider name",
+            Some("Keep stages a profile; Save keeps it, Cancel discards it"),
+            div().flex().flex_wrap().gap(px(8.))
+                .child(
+                    div().flex_1().min_w(px(150.)).child(
+                        Input::new(&form.provider_name)
+                            .id("settings-provider-name")
+                            .aria_label("Provider name"),
+                    ),
+                )
+                .child(
+                    Button::new("settings-store-provider")
+                        .label("Keep provider")
+                        .on_click(cx.listener(|app, _, _, cx| app.stage_provider_profile(cx))),
                 ),
         ))
         .child(row(
@@ -658,6 +936,32 @@ pub fn render(
                 )
                 .child(ui::label(
                     "Off: wait for your review. On: completed native tasks with current passing verification and no unresolved issues may continue the queue. This does not accept the result or change tool approvals or sandboxing. Manual and restored pauses stay paused.",
+                    size::XS,
+                    p.text_subtle,
+                )),
+        ))
+        .child(row(
+            "Automatic fixes",
+            Some("Opt-in; native work tasks only"),
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(8.))
+                .child(
+                    Button::new("settings-auto-continue")
+                        .label("Auto-continue fixes")
+                        .icon(if form.auto_continue_fixes { IconName::Check } else { IconName::Minus })
+                        .selected(form.auto_continue_fixes)
+                        .toggled(form.auto_continue_fixes)
+                        .on_click(cx.listener(|app, _, _, cx| {
+                            if let Some(form) = &mut app.settings_form {
+                                form.auto_continue_fixes = !form.auto_continue_fixes;
+                            }
+                            cx.notify();
+                        })),
+                )
+                .child(ui::label(
+                    "Fix unresolved work, then run an independent read-only review. When current checks pass and no actionable findings remain, finish as Verified automatically, not Accepted by you. Up to three repair follow-ups; stop without progress, on errors, Stop, or missing access. Scope, approvals and sandboxing stay unchanged. Stopped/restored work needs an explicit Auto-fix and review action.",
                     size::XS,
                     p.text_subtle,
                 )),

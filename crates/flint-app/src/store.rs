@@ -180,7 +180,11 @@ impl EventWriter {
                     };
                     let result = if failed && !retry {
                         Err(std::io::Error::other(
-                            worker_error.lock().unwrap().clone().unwrap_or_default(),
+                            worker_error
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                .clone()
+                                .unwrap_or_default(),
                         ))
                     } else {
                         append(&dir, &pending)
@@ -189,14 +193,19 @@ impl EventWriter {
                         Ok(()) => {
                             pending.clear();
                             failed = false;
-                            *worker_error.lock().unwrap() = None;
+                            *worker_error
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
                         }
                         Err(err) => {
                             if !failed {
                                 failure_tx.try_send(err.to_string()).ok();
                             }
                             failed = true;
-                            *worker_error.lock().unwrap() = Some(err.to_string());
+                            *worker_error
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                                Some(err.to_string());
                         }
                     }
                     if let Some(reply) = reply {
@@ -233,7 +242,12 @@ impl EventWriter {
     }
 
     pub(crate) fn check_error(&self) -> std::io::Result<()> {
-        if let Some(error) = self.error.lock().unwrap().as_ref() {
+        if let Some(error) = self
+            .error
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+        {
             return Err(std::io::Error::other(error.clone()));
         }
         Ok(())
@@ -244,7 +258,10 @@ impl EventWriter {
     }
 
     pub(crate) fn has_error(&self) -> bool {
-        self.error.lock().unwrap().is_some()
+        self.error
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_some()
     }
 
     /// A barrier: acknowledges all earlier records, or reports the retained
@@ -419,6 +436,22 @@ mod tests {
             messages(root.path()),
             (0..4_000).map(|n| n.to_string()).collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn poisoned_error_mutex_is_fail_closed_not_panic() {
+        let root = tempfile::tempdir().unwrap();
+        let writer = EventWriter::new(root.path().into()).unwrap();
+        // Poison the error mutex by panicking while holding the lock.
+        let error = writer.error.clone();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = error.lock().unwrap();
+            panic!("intentional poison for regression test");
+        }));
+        assert!(error.is_poisoned());
+        // These must not panic; they recover the poisoned inner value.
+        let _ = writer.has_error();
+        let _ = writer.check_error();
     }
 }
 

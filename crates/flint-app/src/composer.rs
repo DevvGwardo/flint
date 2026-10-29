@@ -470,6 +470,35 @@ pub fn render(app: &FlintApp, window: &Window, cx: &mut Context<FlintApp>) -> An
                     .test_support(),
             )
         })
+        .when(app.session().agent == AgentKind::Flint && !compact, |bar| {
+            let enabled = app.settings.auto_continue_fixes;
+            let paused = app.session().auto_continue.paused_reason;
+            let color = if enabled && paused.is_none() { p.accent } else { p.text_subtle };
+            let status = if !enabled {
+                "Off: unresolved work waits for you."
+            } else {
+                paused.unwrap_or("On: fix and independently review native work, with at most three repair follow-ups.")
+            };
+            bar.child(
+                chip("auto-continue-toggle")
+                    .role(Role::Switch)
+                    .aria_label(format!("Auto-continue fixes. {status}"))
+                    .aria_toggled(if enabled { Toggled::True } else { Toggled::False })
+                    .on_click(cx.listener(|app, _, _, cx| app.toggle_auto_continue_fixes(cx)))
+                    .tooltip(move |window, cx| {
+                        gpui_kit::component::tooltip::Tooltip::new(format!(
+                            "{status} Finish as Verified automatically after current checks and a clean independent review, never Accepted by you. Stops without progress, on errors or Stop. Scope, tool approvals and sandboxing stay unchanged. Use Auto-fix and review explicitly for an already ended task."
+                        )).build(window, cx)
+                    })
+                    .child(ui::icon(IconName::Repeat, 14., color))
+                    .child(ui::label(
+                        if !enabled { "Auto-fix: Off" } else if paused.is_some() { "Auto-fix: Paused" } else { "Auto-fix: On" },
+                        size::SM,
+                        color,
+                    ))
+                    .test_support(),
+            )
+        })
         // When the agent has its own modes, its mode chip replaces auto-run.
         .when(app.session().agent == AgentKind::Flint, |bar| {
             bar.child(

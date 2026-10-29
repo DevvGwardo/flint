@@ -124,7 +124,9 @@ fn hooter_sets_the_native_app_and_window_identity(cx: &mut TestAppContext) {
             .as_deref(),
         Some("Hooter")
     );
-    assert!(has(&ui, cx, "hooter-brand"));
+    // The panel names its job, not the product (docs/PLAN-SIDEBAR-SIMPLIFY.md
+    // P1); the product name lives in the titlebar and the welcome screen.
+    assert!(has(&ui, cx, "sidebar-heading"));
 }
 
 #[gpui_kit::test]

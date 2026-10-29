@@ -13,6 +13,62 @@ use flint_agent::config::DEFAULT_MODEL;
 use serde::Deserialize;
 use serde::Serialize;
 
+pub const OMNIROUTE_BASE_URL: &str = "http://127.0.0.1:20128/v1";
+pub const OMNIROUTE_MODEL: &str = "auto";
+pub const OMNIROUTE_KEY_ENV: &str = "OMNIROUTE_API_KEY";
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderKind {
+    #[default]
+    #[serde(rename = "openai_compatible")]
+    OpenAiCompatible,
+    #[serde(rename = "omniroute")]
+    OmniRoute,
+    /// An explicitly configured endpoint with its own credential source.
+    Custom,
+}
+
+/// A reusable native provider configuration. Stores credential locations, not keys.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderProfile {
+    pub provider: ProviderKind,
+    #[serde(default)]
+    pub omniroute_no_auth: bool,
+    pub base_url: String,
+    pub model: String,
+    #[serde(default)]
+    pub subagent_model: String,
+    #[serde(default)]
+    pub api_key_env: String,
+    #[serde(default)]
+    pub api_key_file: String,
+}
+
+impl ProviderProfile {
+    pub fn from_settings(settings: &Settings) -> Self {
+        Self {
+            provider: settings.provider,
+            omniroute_no_auth: settings.omniroute_no_auth,
+            base_url: settings.base_url.clone(),
+            model: settings.model.clone(),
+            subagent_model: settings.subagent_model.clone(),
+            api_key_env: settings.api_key_env.clone(),
+            api_key_file: settings.api_key_file.clone(),
+        }
+    }
+
+    pub fn apply_to(&self, settings: &mut Settings) {
+        settings.provider = self.provider;
+        settings.omniroute_no_auth = self.omniroute_no_auth;
+        settings.base_url = self.base_url.clone();
+        settings.model = self.model.clone();
+        settings.subagent_model = self.subagent_model.clone();
+        settings.api_key_env = self.api_key_env.clone();
+        settings.api_key_file = self.api_key_file.clone();
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum TranscriptWidth {
@@ -48,6 +104,11 @@ fn deserialize_width<'de, D: serde::Deserializer<'de>>(
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
+    pub provider: ProviderKind,
+    pub provider_profiles: std::collections::BTreeMap<String, ProviderProfile>,
+    /// Explicit opt-in for a loopback OmniRoute with API-key enforcement off.
+    /// Never applies to remote endpoints or other providers.
+    pub omniroute_no_auth: bool,
     /// Last agent explicitly selected, used for the fresh session on launch.
     pub default_agent: flint_agent::AgentKind,
     /// Confirmed model/provider selections, scoped to the ACP agent. Permission
@@ -58,8 +119,9 @@ pub struct Settings {
     /// Empty inherits the parent model. Uses the same endpoint and key.
     pub subagent_model: String,
     pub base_url: String,
-    /// Name of an environment variable holding the API key. Empty falls back
-    /// to `FLINT_API_KEY`, then `OPENAI_API_KEY`.
+    /// Name of an environment variable holding the API key. The default mode
+    /// falls back to `FLINT_API_KEY`, then `OPENAI_API_KEY`; custom providers
+    /// require their own source, and OmniRoute defaults to `OMNIROUTE_API_KEY`.
     pub api_key_env: String,
     /// File holding the API key (`~/` is expanded). Empty means none.
     pub api_key_file: String,
@@ -72,6 +134,9 @@ pub struct Settings {
     /// Continue queued native work after current passing verification, without
     /// accepting its result or changing approvals/sandboxing. Off by default.
     pub queue_after_verification: bool,
+    /// Retry unresolved native work within its protected scope. Off by default;
+    /// bounded and independent of queue advancement or user acceptance.
+    pub auto_continue_fixes: bool,
     /// Missing on existing installations. Only a genuinely fresh home sets true.
     pub permission_choice_pending: Option<bool>,
     /// `low`, `medium`, `high`, or empty for the provider default.
@@ -87,6 +152,10 @@ pub struct Settings {
     pub terminal_height: f32,
     /// How the sidebar groups sessions: `project`, `status` or `agent`.
     pub session_grouping: String,
+    /// Sidebar headings the user collapsed, as `GroupKey::setting_key` values.
+    pub collapsed_groups: Vec<String>,
+    /// The archived-sessions list is expanded in the sidebar.
+    pub archived_open: bool,
     /// Sandbox the agent's shell commands: they may only write inside the
     /// workspace, temp directories and build caches (macOS).
     pub sandbox: bool,
@@ -109,6 +178,9 @@ pub struct McpServer {
 impl Default for Settings {
     fn default() -> Self {
         Self {
+            provider: ProviderKind::OpenAiCompatible,
+            provider_profiles: Default::default(),
+            omniroute_no_auth: false,
             default_agent: flint_agent::AgentKind::Flint,
             agent_options: Default::default(),
             model: DEFAULT_MODEL.to_string(),
@@ -122,6 +194,7 @@ impl Default for Settings {
             // Existing installs keep the judge on when a credential is present.
             jev_judge: true,
             queue_after_verification: false,
+            auto_continue_fixes: false,
             permission_choice_pending: None,
             effort: "medium".to_string(),
             theme: "dark".to_string(),
@@ -130,6 +203,8 @@ impl Default for Settings {
             terminal_open: false,
             terminal_height: crate::term_panel::DEFAULT_HEIGHT,
             session_grouping: "project".to_string(),
+            collapsed_groups: Vec::new(),
+            archived_open: false,
             sandbox: true,
             mcp_servers: std::collections::BTreeMap::new(),
         }
@@ -263,7 +338,20 @@ pub(crate) fn agent_key(agent: flint_agent::AgentKind) -> &'static str {
         flint_agent::AgentKind::ClaudeCode => "claude_code",
         flint_agent::AgentKind::Codex => "codex",
         flint_agent::AgentKind::Droid => "droid",
+        flint_agent::AgentKind::OpenCode => "opencode",
     }
+}
+
+/// From [`agent_key`]; an unknown name is `None`.
+pub(crate) fn agent_from_key(key: &str) -> Option<flint_agent::AgentKind> {
+    Some(match key {
+        "flint" => flint_agent::AgentKind::Flint,
+        "claude_code" => flint_agent::AgentKind::ClaudeCode,
+        "codex" => flint_agent::AgentKind::Codex,
+        "droid" => flint_agent::AgentKind::Droid,
+        "opencode" => flint_agent::AgentKind::OpenCode,
+        _ => return None,
+    })
 }
 
 const LEGACY_BASE_URL: &str = "http://127.0.0.1:18433/v1";
@@ -314,6 +402,8 @@ pub enum KeyStatus {
     Found(String),
     /// Not found; the string says where flint looked first.
     Missing(String),
+    /// Explicit local-only unauthenticated routing, not a discovered credential.
+    NotRequired,
 }
 
 /// Cache only the display status, never a credential. Config changes invalidate
@@ -326,6 +416,8 @@ pub(crate) struct KeyStatusCache {
 struct KeyStatusEntry {
     read: std::time::Instant,
     base_url: String,
+    provider: ProviderKind,
+    omniroute_no_auth: bool,
     api_key_file: String,
     api_key_env: String,
     key_path: Option<PathBuf>,
@@ -344,6 +436,8 @@ impl KeyStatusCache {
         if let Some(entry) = &self.entry
             && now.saturating_duration_since(entry.read) < std::time::Duration::from_secs(2)
             && entry.base_url == settings.base_url
+            && entry.provider == settings.provider
+            && entry.omniroute_no_auth == settings.omniroute_no_auth
             && entry.api_key_file == settings.api_key_file
             && entry.api_key_env == settings.api_key_env
             && entry.key_path.as_deref() == key_path
@@ -356,6 +450,8 @@ impl KeyStatusCache {
         self.entry = Some(KeyStatusEntry {
             read: now,
             base_url: settings.base_url.clone(),
+            provider: settings.provider,
+            omniroute_no_auth: settings.omniroute_no_auth,
             api_key_file: settings.api_key_file.clone(),
             api_key_env: settings.api_key_env.clone(),
             key_path: key_path.map(Path::to_path_buf),
@@ -401,16 +497,55 @@ pub fn expand_home(path: &str) -> PathBuf {
 }
 
 impl Settings {
-    /// Finds the API key. Order: `key_file` (an explicit override), the
+    pub fn save_provider_profile(&mut self, name: &str) -> Result<(), &'static str> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err("Enter a name for this provider.");
+        }
+        self.validate_provider()?;
+        if self.model.trim().is_empty() {
+            return Err("Enter a model name.");
+        }
+        if !valid_key_env_name(self.api_key_env.trim()) {
+            return Err("Enter an environment variable name, not a key value.");
+        }
+        self.provider_profiles
+            .insert(name.to_string(), ProviderProfile::from_settings(self));
+        Ok(())
+    }
+
+    pub fn validate_provider(&self) -> Result<(), &'static str> {
+        if self.provider == ProviderKind::OmniRoute
+            && self.omniroute_no_auth
+            && !is_loopback_endpoint(&self.base_url)
+        {
+            return Err(
+                "OmniRoute no-auth mode requires a loopback URL. Use an API key for remote routers.",
+            );
+        }
+        crate::connection_test::models_url(&self.base_url)?;
+        Ok(())
+    }
+
+    /// Explicit loopback OmniRoute no-auth mode sends no credential. Otherwise,
+    /// finds the API key. Order: `key_file` (an explicit override), the
     /// `api_key_file` setting, the env var named by `api_key_env`,
-    /// `FLINT_API_KEY`, `OPENAI_API_KEY`. Keys from early installs
+    /// `FLINT_API_KEY`, `OPENAI_API_KEY` for the default compatible mode. Keys from early installs
     /// (`~/.fx/surplus.key`) are used only for the endpoint they were issued
-    /// for, so they are never sent to another provider.
+    /// for, so they are never sent to another provider. OmniRoute uses only its
+    /// chosen file/environment source and never the generic/legacy fallbacks;
+    /// custom providers likewise never borrow generic/legacy credentials.
     pub fn resolve_key(
         &self,
         key_file: Option<&Path>,
         sources: &KeySources,
     ) -> Option<ResolvedKey> {
+        if self.provider == ProviderKind::OmniRoute && self.omniroute_no_auth {
+            return is_loopback_endpoint(&self.base_url).then(|| ResolvedKey {
+                key: String::new(),
+                source: "local OmniRoute no-auth mode".into(),
+            });
+        }
         let from_file = |path: PathBuf| {
             read_key_file(&path).map(|key| ResolvedKey {
                 key,
@@ -425,7 +560,10 @@ impl Settings {
         {
             return Some(found);
         }
-        let named = self.api_key_env.trim();
+        let named = match self.api_key_env.trim() {
+            "" if self.provider == ProviderKind::OmniRoute => OMNIROUTE_KEY_ENV,
+            named => named,
+        };
         if !named.is_empty()
             && let Some(key) = (sources.env)(named)
         {
@@ -433,6 +571,10 @@ impl Settings {
                 key,
                 source: format!("${named}"),
             });
+        }
+        // Never borrow a different provider's ambient or legacy credential.
+        if self.provider != ProviderKind::OpenAiCompatible {
+            return None;
         }
         for name in ["FLINT_API_KEY", "OPENAI_API_KEY"] {
             if let Some(key) = (sources.env)(name) {
@@ -452,6 +594,12 @@ impl Settings {
 
     /// What Settings shows for the key: where it was found, or what to set.
     pub fn key_status(&self, key_file: Option<&Path>, sources: &KeySources) -> KeyStatus {
+        if self.provider == ProviderKind::OmniRoute
+            && self.omniroute_no_auth
+            && is_loopback_endpoint(&self.base_url)
+        {
+            return KeyStatus::NotRequired;
+        }
         match self.resolve_key(key_file, sources) {
             Some(found) => KeyStatus::Found(found.source),
             None if !self.api_key_file.is_empty() => {
@@ -460,9 +608,34 @@ impl Settings {
             None if !self.api_key_env.trim().is_empty() => {
                 KeyStatus::Missing(format!("${}", self.api_key_env.trim()))
             }
+            None if self.provider == ProviderKind::OmniRoute => {
+                KeyStatus::Missing(format!("${OMNIROUTE_KEY_ENV}"))
+            }
+            None if self.provider == ProviderKind::Custom => {
+                KeyStatus::Missing("a provider-specific API key env or file".into())
+            }
             None => KeyStatus::Missing("$FLINT_API_KEY".to_string()),
         }
     }
+}
+
+pub(crate) fn valid_key_env_name(name: &str) -> bool {
+    name.chars()
+        .enumerate()
+        .all(|(i, c)| c == '_' || c.is_ascii_alphabetic() || (i > 0 && c.is_ascii_digit()))
+}
+
+fn is_loopback_endpoint(base: &str) -> bool {
+    crate::connection_test::models_url(base)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_owned))
+        .is_some_and(|host| {
+            host == "localhost"
+                || host
+                    .trim_matches(['[', ']'])
+                    .parse::<std::net::IpAddr>()
+                    .is_ok_and(|address| address.is_loopback())
+        })
 }
 
 pub fn jev_key_set(sources: &KeySources) -> bool {
@@ -481,3 +654,11 @@ pub fn display_path(path: &Path) -> String {
 #[cfg(test)]
 #[path = "settings_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "omniroute_tests.rs"]
+mod omniroute_tests;
+
+#[cfg(test)]
+#[path = "provider_profile_tests.rs"]
+mod provider_profile_tests;

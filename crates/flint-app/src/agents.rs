@@ -1,5 +1,5 @@
 //! Choosing who runs a session: flint's own engine or an ACP agent (Claude
-//! Code, Codex, Droid). The choice applies to a session before its first message;
+//! Code, Codex, Droid, OpenCode). The choice applies to a session before its first message;
 //! after that the session keeps its agent and a new one is opened instead.
 
 use flint_acp::AcpAgent;
@@ -10,20 +10,22 @@ use gpui_kit::*;
 use crate::app::FlintApp;
 
 /// Agents offered by the picker, in order.
-pub const AGENTS: [AgentKind; 4] = [
+pub const AGENTS: [AgentKind; 5] = [
     AgentKind::Flint,
     AgentKind::ClaudeCode,
     AgentKind::Codex,
     AgentKind::Droid,
+    AgentKind::OpenCode,
 ];
 
-/// `/agent claude|codex|droid|hooter` typed into the composer.
+/// `/agent claude|codex|droid|opencode|hooter` typed into the composer.
 pub fn parse_command(text: &str) -> Option<AgentKind> {
     let name = text.trim().strip_prefix("/agent")?.trim().to_lowercase();
     match name.as_str() {
         "claude" | "claude-code" | "claude code" | "cc" => Some(AgentKind::ClaudeCode),
         "codex" => Some(AgentKind::Codex),
         "droid" | "factory" | "factory-droid" => Some(AgentKind::Droid),
+        "opencode" | "open-code" | "open code" => Some(AgentKind::OpenCode),
         "hooter" | "jevdex" | "flint" => Some(AgentKind::Flint),
         _ => None,
     }
@@ -36,6 +38,7 @@ pub fn about(kind: AgentKind) -> &'static str {
         AgentKind::ClaudeCode => "Anthropic's agent, on your Claude plan (ACP)",
         AgentKind::Codex => "OpenAI's agent, on your ChatGPT plan (ACP)",
         AgentKind::Droid => "Factory's agent, on your Factory account (ACP)",
+        AgentKind::OpenCode => "OpenCode, with your configured providers and models (ACP)",
     }
 }
 
@@ -98,7 +101,9 @@ impl FlintApp {
                     .as_deref()
                     .unwrap_or(&self.model)
             ),
-            AgentKind::ClaudeCode | AgentKind::Codex | AgentKind::Droid => kind.label().to_string(),
+            AgentKind::ClaudeCode | AgentKind::Codex | AgentKind::Droid | AgentKind::OpenCode => {
+                kind.label().to_string()
+            }
         }
     }
 
@@ -208,6 +213,14 @@ mod tests {
         assert_eq!(parse_command(" /agent Jevdex "), Some(AgentKind::Flint));
         assert_eq!(parse_command("/agent droid"), Some(AgentKind::Droid));
         assert_eq!(parse_command(" /agent Droid "), Some(AgentKind::Droid));
+        for command in [
+            "/agent opencode",
+            " /agent OpenCode ",
+            "/agent open-code",
+            "/agent open code",
+        ] {
+            assert_eq!(parse_command(command), Some(AgentKind::OpenCode));
+        }
         assert_eq!(
             parse_command("/agent factory-droid"),
             Some(AgentKind::Droid)

@@ -189,6 +189,33 @@ fn branch_operations_report_non_repository_missing_remote_and_fetch_errors() {
 }
 
 #[test]
+fn unknown_remote_refs_are_skipped_and_open_fails_closed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cwd = repository(tmp.path());
+    remote(&cwd, "origin", &cwd);
+    let id = String::from_utf8(run(&cwd, &["rev-parse", "HEAD"])).unwrap();
+    // A ref under an unconfigured remote must be skipped, never panic.
+    run(&cwd, &["update-ref", "refs/remotes/stale/fork", id.trim()]);
+    run(
+        &cwd,
+        &["update-ref", "refs/remotes/origin/valid", id.trim()],
+    );
+    let repo = list(&cwd).unwrap();
+    assert!(
+        repo.branches
+            .iter()
+            .all(|branch| branch.name != "stale/fork")
+    );
+    assert!(
+        repo.branches
+            .iter()
+            .any(|branch| branch.name == "origin/valid")
+    );
+    // Opening an unknown reference fails with an error, not a panic.
+    assert!(open(&cwd, &tmp.path().join("home"), "refs/remotes/stale/fork").is_err());
+}
+
+#[test]
 fn fetch_never_prunes_or_advances_local_branches_even_when_git_config_enables_pruning() {
     let tmp = tempfile::tempdir().unwrap();
     let cwd = repository(&tmp.path().join("local"));

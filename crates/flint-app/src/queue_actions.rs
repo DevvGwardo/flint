@@ -16,6 +16,21 @@ pub struct QueueEdit {
     _subscription: Subscription,
 }
 
+/// Fail-closed directory resolution for prompt-queue saves.
+/// Assigns a fresh session directory when none exists, then returns a clone.
+/// Returns `None` only if the directory is still missing (e.g. allocation
+/// bypassed in tests), letting callers pause instead of unwrapping.
+/// `pub` for integration-test coverage; not part of the UI surface.
+pub fn resolve_queue_dir(
+    home: &std::path::Path,
+    dir: &mut Option<std::path::PathBuf>,
+) -> Option<std::path::PathBuf> {
+    if dir.is_none() {
+        *dir = Some(store::sessions_dir(home).join(store::new_id()));
+    }
+    dir.clone()
+}
+
 impl FlintApp {
     pub fn prompt_busy(&self, ix: usize) -> bool {
         self.sessions[ix].view.running
@@ -35,12 +50,16 @@ impl FlintApp {
             cx.notify();
             return false;
         }
-        if session.dir.is_none() {
-            session.dir = Some(store::sessions_dir(&self.home).join(store::new_id()));
-        }
+        let Some(dir) = resolve_queue_dir(&self.home, &mut session.dir) else {
+            session.prompt_queue.save_failed = true;
+            session.prompt_queue.paused = true;
+            session.prompt_queue.error = Some("Couldn't save the prompt queue: missing session directory. Pending work is paused.".into());
+            cx.notify();
+            return false;
+        };
         let result = session
             .save_meta()
-            .and_then(|()| session.prompt_queue.save(session.dir.as_deref().unwrap()));
+            .and_then(|()| session.prompt_queue.save(&dir));
         if let Err(error) = result {
             session.prompt_queue.save_failed = true;
             session.prompt_queue.paused = true;
@@ -324,6 +343,8 @@ impl FlintApp {
         }
         if let Some(id) = self.sessions[ix].prompt_queue.steer_after_turn.take() {
             self.dispatch_queued_prompt(ix, id, cx);
+        } else if matches!(reason, TurnEndReason::Completed) && self.auto_continue_task(ix, cx) {
+            self.hold_queue_for_review(ix, cx);
         } else if matches!(reason, TurnEndReason::Completed) && self.queue_result_eligible(ix) {
             self.release_queue_review(ix, cx);
             self.dispatch_next_prompt(uid, cx);
@@ -414,7 +435,7 @@ impl FlintApp {
                         .is_some_and(|task| task.verified_for_queue())))
     }
 
-    fn hold_queue_for_review(&mut self, ix: usize, cx: &mut Context<Self>) {
+    pub(crate) fn hold_queue_for_review(&mut self, ix: usize, cx: &mut Context<Self>) {
         let outcome = self.sessions[ix].view.outcome();
         let queue = &mut self.sessions[ix].prompt_queue;
         let hold = Some(format!(

@@ -77,6 +77,14 @@ impl std::fmt::Debug for Provider {
 }
 
 impl Provider {
+    fn authenticate(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        if self.api_key.is_empty() {
+            request
+        } else {
+            request.bearer_auth(&self.api_key)
+        }
+    }
+
     pub fn new(base_url: &str, model: &str, api_key: &str) -> Self {
         let http = reqwest::Client::builder()
             .connect_timeout(CONNECT_TIMEOUT)
@@ -102,9 +110,7 @@ impl Provider {
     /// `None` when the listing is unavailable or doesn't say.
     pub async fn model_limits(&self) -> Option<ModelLimits> {
         let response = self
-            .http
-            .get(&self.models_url)
-            .bearer_auth(&self.api_key)
+            .authenticate(self.http.get(&self.models_url))
             .timeout(Duration::from_secs(10))
             .send()
             .await
@@ -119,9 +125,7 @@ impl Provider {
     /// Exact model ids advertised by the configured endpoint.
     pub async fn list_models(&self, cancel: &CancellationToken) -> Result<Vec<String>, String> {
         let request = self
-            .http
-            .get(&self.models_url)
-            .bearer_auth(&self.api_key)
+            .authenticate(self.http.get(&self.models_url))
             .timeout(Duration::from_secs(10))
             .send();
         let response = tokio::select! {
@@ -240,9 +244,7 @@ impl Provider {
     ) -> Result<Completion, Attempt> {
         let started = Instant::now();
         let request = self
-            .http
-            .post(&self.url)
-            .bearer_auth(&self.api_key)
+            .authenticate(self.http.post(&self.url))
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .body(body)
             .send();

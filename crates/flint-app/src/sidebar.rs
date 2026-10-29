@@ -19,6 +19,7 @@ use crate::app::OpenWorkspace;
 use crate::app::SESSION_PAGE;
 use crate::app::SessionFilter;
 use crate::app::SessionGrouping;
+use crate::app::SidebarMenu;
 use crate::app::ToggleSidebar;
 use crate::app::ToggleTerminal;
 use crate::project;
@@ -102,31 +103,79 @@ fn reveal_row(
     });
 }
 
-pub fn render(app: &FlintApp, window: &Window, cx: &mut Context<FlintApp>) -> impl IntoElement {
+pub fn render(app: &FlintApp, window: &mut Window, cx: &mut Context<FlintApp>) -> impl IntoElement {
     let p = palette();
-    let compact =
-        window.viewport_size().height < px(720.) || (app.session_drawer && !app.sidebar_visible);
+    // A stable handle for the footer's grouping control, so choosing an order
+    // from its menu can hand focus back instead of dropping it.
+    let grouping_focus = window
+        .use_keyed_state("sidebar-grouping-focus", cx, |_, cx| {
+            cx.focus_handle().tab_stop(true)
+        })
+        .read(cx)
+        .clone();
 
     // The dedicated grip moves the panel; the rest of the row moves the window.
+    // One title, one indicator, the close button: the mark and the product name
+    // belong to the titlebar and the welcome screen, not to this panel.
+    let waiting = app
+        .sessions
+        .iter()
+        .filter(|session| session.status().bucket() == Bucket::NeedsYou)
+        .count();
+    let working = app
+        .sessions
+        .iter()
+        .filter(|session| session.status().bucket() == Bucket::Working)
+        .count();
     let top = app.drag_region(
         div()
             .id("sidebar-top")
-            .h(px(if compact { 44. } else { 72. }))
+            .h(px(40.))
             .flex_shrink_0()
             .flex()
             .items_center()
-            .gap(px(10.))
-            .px(px(16.))
+            .gap(px(8.))
+            .px(px(12.))
             .child(crate::docking::handle(crate::docking::Panel::Sidebar, cx))
-            .child(crate::brand::mark(30.))
             .child(
-                ui::label(crate::brand::NAME, 21., p.text)
-                    .id("hooter-brand")
-                    .font_family(crate::theme::DISPLAY_FONT)
-                    .font_weight(FontWeight::SEMIBOLD)
+                ui::label("Sessions", size::SM, p.text_muted)
+                    .id("sidebar-heading")
+                    .font_weight(FontWeight::MEDIUM)
                     .test_support(),
             )
             .child(div().flex_1())
+            .when(waiting > 0, |header| {
+                header.child(
+                    div()
+                        .id("sidebar-waiting")
+                        .flex_shrink_0()
+                        .flex()
+                        .items_center()
+                        .gap(px(3.))
+                        .tooltip(move |window, cx| {
+                            Tooltip::new(format!("{waiting} need you")).build(window, cx)
+                        })
+                        .child(ui::icon(IconName::CircleAlert, 11., p.warning))
+                        .child(ui::label(waiting.to_string(), size::XS, p.warning))
+                        .test_support(),
+                )
+            })
+            .when(working > 0, |header| {
+                header.child(
+                    div()
+                        .id("sidebar-working")
+                        .flex_shrink_0()
+                        .flex()
+                        .items_center()
+                        .gap(px(3.))
+                        .tooltip(move |window, cx| {
+                            Tooltip::new(format!("{working} working")).build(window, cx)
+                        })
+                        .child(ui::spinner(app.now(), 11., p.accent))
+                        .child(ui::label(working.to_string(), size::XS, p.accent))
+                        .test_support(),
+                )
+            })
             .child(
                 div()
                     .id("hide-sidebar")
@@ -154,48 +203,75 @@ pub fn render(app: &FlintApp, window: &Window, cx: &mut Context<FlintApp>) -> im
         cx,
     );
 
-    let new_agent = nav_row(
-        "new-agent",
-        IconName::SquarePen,
-        "New agent",
-        Some(&crate::shortcuts::label("⌘N")),
-    )
-    .h(px(if compact { 38. } else { 44. }))
-    .mb(px(if compact { 2. } else { 6. }))
-    .bg(p.accent_soft)
-    .border_1()
-    .border_color(p.accent.opacity(0.18))
-    .on_click(cx.listener(|_, _, window, cx| {
-        window.dispatch_action(Box::new(NewSession), cx);
-    }));
-    let open_folder = nav_row(
-        "open-folder",
-        IconName::FolderPlus,
-        "Open folder",
-        Some(&crate::shortcuts::label("⌘O")),
-    )
-    .on_click(cx.listener(|_, _, window, cx| {
-        window.dispatch_action(Box::new(OpenWorkspace), cx);
-    }));
+    // The one primary action keeps the panel's only accent surface; opening a
+    // folder and the terminal are occasional and stay icon-only.
+    let new_agent = div()
+        .id("new-agent")
+        .role(gpui_kit::Role::Button)
+        .aria_label("New agent")
+        .tab_index(0)
+        .focus_visible(|style| style.border_1().border_color(p.accent))
+        .flex_1()
+        .min_w_0()
+        .h(px(36.))
+        .px(px(12.))
+        .rounded(px(9.))
+        .flex()
+        .items_center()
+        .gap(px(11.))
+        .cursor_pointer()
+        .bg(p.accent_soft)
+        .border_1()
+        .border_color(p.accent.opacity(0.18))
+        .hover(|style| style.bg(p.accent.opacity(0.18)))
+        .on_click(cx.listener(|_, _, window, cx| {
+            window.dispatch_action(Box::new(NewSession), cx);
+        }))
+        .child(ui::icon(IconName::SquarePen, 16., p.accent))
+        .child(div().flex_1().min_w_0().truncate().child(ui::label(
+            "New agent",
+            size::BASE,
+            p.text,
+        )))
+        .child(ui::label(
+            crate::shortcuts::label("⌘N"),
+            size::XS,
+            p.text_subtle,
+        ))
+        .test_support();
 
-    let terminal = nav_row("terminal", IconName::SquareTerminal, "Terminal", Some("⌃`"))
-        .when(app.terminal.open, |row| row.bg(white(0.075)))
+    let open_folder = icon_button("open-folder", IconName::FolderPlus, "Open folder", "⌘O")
+        .on_click(cx.listener(|_, _, window, cx| {
+            window.dispatch_action(Box::new(OpenWorkspace), cx);
+        }))
+        .test_support();
+
+    let terminal = icon_button("terminal", IconName::SquareTerminal, "Terminal", "⌃`")
+        .when(app.terminal.open, |button| button.bg(white(0.075)))
         .on_click(cx.listener(|_, _, window, cx| {
             window.dispatch_action(Box::new(ToggleTerminal), cx);
         }))
         .test_support();
 
-    let search = div()
+    let primary_actions = div()
         .flex_shrink_0()
-        .mx(px(10.))
-        .mt(px(if compact { 12. } else { 18. }))
-        .mb(px(if compact { 4. } else { 10. }))
-        .child(
-            Input::new(&app.search)
-                .id("session-search")
-                .prefix(ui::icon(IconName::Search, 14., p.text_subtle))
-                .cleanable(true),
-        );
+        .flex()
+        .items_center()
+        .gap(px(6.))
+        .mx(px(8.))
+        .mb(px(8.))
+        .h(px(36.))
+        .child(new_agent)
+        .child(open_folder)
+        .child(terminal);
+
+    let search = div().flex_shrink_0().mx(px(10.)).mb(px(8.)).child(
+        Input::new(&app.search)
+            .id("session-search")
+            .prefix(ui::icon(IconName::Search, 14., p.text_subtle))
+            .cleanable(true)
+            .small(),
+    );
 
     // Headings per the chosen grouping. A heading counts "n of N" when
     // search, the filter or paging hides some of its sessions.
@@ -231,6 +307,9 @@ pub fn render(app: &FlintApp, window: &Window, cx: &mut Context<FlintApp>) -> im
             .into_iter()
             .map(|ix| session_row(app, ix, cx))
             .collect();
+        // A collapsed heading keeps its counts and hides its rows.
+        let collapsed = app.collapsed_groups.contains(&group.key);
+        let key = group.key.clone();
         list.push(
             div()
                 .min_w_0()
@@ -239,12 +318,45 @@ pub fn render(app: &FlintApp, window: &Window, cx: &mut Context<FlintApp>) -> im
                 .gap(px(1.))
                 .child(
                     div()
-                        .px(px(20.))
-                        .pt(px(if g == 0 { 16. } else { 24. }))
-                        .pb(px(6.))
+                        .id(("group-header", g))
+                        .role(gpui_kit::Role::Button)
+                        .aria_label(format!(
+                            "{}, {}",
+                            group.label,
+                            if collapsed { "collapsed" } else { "expanded" }
+                        ))
+                        .tab_index(0)
+                        .focus_visible(|style| style.border_1().border_color(p.accent))
+                        .mx(px(8.))
+                        .px(px(12.))
+                        .h(px(24.))
+                        .mt(px(if g == 0 { 8. } else { 4. }))
+                        .rounded(px(6.))
                         .flex()
                         .items_center()
-                        .gap(px(7.))
+                        .gap(px(6.))
+                        .cursor_pointer()
+                        .hover(|style| style.bg(white(0.04)))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.toggle_group_collapsed(key.clone(), cx)
+                        }))
+                        .child(
+                            div()
+                                .id(("group-toggle", g))
+                                .flex_shrink_0()
+                                .flex()
+                                .items_center()
+                                .child(ui::icon(
+                                    if collapsed {
+                                        IconName::ChevronRight
+                                    } else {
+                                        IconName::ChevronDown
+                                    },
+                                    11.,
+                                    p.text_subtle,
+                                ))
+                                .test_support(),
+                        )
                         .child(icon)
                         .child(
                             div()
@@ -252,7 +364,7 @@ pub fn render(app: &FlintApp, window: &Window, cx: &mut Context<FlintApp>) -> im
                                 .flex_1()
                                 .min_w_0()
                                 .truncate()
-                                .text_size(px(size::SM))
+                                .text_size(px(size::XS))
                                 .font_weight(FontWeight::MEDIUM)
                                 .text_color(p.text_subtle)
                                 .when_some(tooltip, |label, tip| {
@@ -302,9 +414,10 @@ pub fn render(app: &FlintApp, window: &Window, cx: &mut Context<FlintApp>) -> im
                                 size::XS,
                                 p.text_subtle,
                             )))
-                        }),
+                        })
+                        .test_support(),
                 )
-                .children(rows)
+                .children(if collapsed { Vec::new() } else { rows })
                 .into_any_element(),
         );
     }
@@ -336,7 +449,7 @@ pub fn render(app: &FlintApp, window: &Window, cx: &mut Context<FlintApp>) -> im
         }
     };
 
-    // Equal-width columns and bounded count slots keep live updates from
+    // Equal-width chips in one row and fixed count slots keep live updates from
     // moving filter targets or changing the list's available height.
     let counts = app.bucket_counts(cx);
     let chips: Vec<_> = [
@@ -348,9 +461,14 @@ pub fn render(app: &FlintApp, window: &Window, cx: &mut Context<FlintApp>) -> im
     .into_iter()
     .enumerate()
     .map(|(ix, filter)| {
-        let label = match filter {
-            SessionFilter::All => "All",
-            SessionFilter::Only(bucket) => bucket.label(),
+        let (label, icon, tint) = match filter {
+            SessionFilter::All => ("All", None, p.text_subtle),
+            SessionFilter::Only(Bucket::NeedsYou) => {
+                ("Needs you", Some(IconName::ShieldAlert), p.warning)
+            }
+            SessionFilter::Only(Bucket::Working) => ("Working", Some(IconName::Loader), p.accent),
+            SessionFilter::Only(Bucket::Ready) => ("Ready", Some(IconName::Check), p.text_subtle),
+            SessionFilter::Only(_) => ("Sessions", None, p.text_subtle),
         };
         let count_color = match filter {
             SessionFilter::Only(Bucket::NeedsYou) if counts.of(filter) > 0 => p.warning,
@@ -360,6 +478,8 @@ pub fn render(app: &FlintApp, window: &Window, cx: &mut Context<FlintApp>) -> im
         filter_chip(
             ix,
             label,
+            icon,
+            tint,
             counts.of(filter),
             filter == app.filter,
             count_color,
@@ -373,14 +493,14 @@ pub fn render(app: &FlintApp, window: &Window, cx: &mut Context<FlintApp>) -> im
         .id("session-grouping")
         .role(gpui_kit::Role::Button)
         .aria_label(format!("Group by {}", grouping.label()))
+        .track_focus(&grouping_focus)
         .tab_index(0)
         .focus_visible(|style| style.border_1().border_color(p.accent))
         .tooltip(move |window, cx| {
             Tooltip::new(format!(
-                "Grouped by {}  {}\nClick to group by {}",
+                "Grouped by {}  {}\nChoose an order",
                 grouping.label(),
-                crate::shortcuts::label("⇧⌘G"),
-                grouping.next().label()
+                crate::shortcuts::label("⇧⌘G")
             ))
             .build(window, cx)
         })
@@ -393,33 +513,104 @@ pub fn render(app: &FlintApp, window: &Window, cx: &mut Context<FlintApp>) -> im
         .items_center()
         .gap(px(5.))
         .cursor_pointer()
+        .when(app.sidebar_menu == Some(SidebarMenu::Grouping), |button| {
+            button.bg(p.raised)
+        })
         .hover(|style| style.bg(white(0.06)))
-        .on_click(cx.listener(|this, _, _, cx| this.set_grouping(this.grouping.next(), cx)))
+        .on_click(cx.listener(|this, _, _, cx| {
+            this.sidebar_menu =
+                (this.sidebar_menu != Some(SidebarMenu::Grouping)).then_some(SidebarMenu::Grouping);
+            cx.notify();
+        }))
         .child(ui::icon(IconName::Layers, 13., p.text_subtle))
         .child(div().min_w_0().truncate().child(ui::label(
             grouping.label(),
             size::XS,
             p.text_subtle,
         )))
+        .child(ui::icon(IconName::ChevronDown, 11., p.text_subtle))
         .test_support();
-    let mut chips = chips.into_iter();
-    let first_filters = div().flex().gap(px(4.)).children(chips.by_ref().take(2));
-    let remaining_filters = div().flex().gap(px(4.)).children(chips);
     let filters = div()
         .id("session-filters")
         .flex_shrink_0()
         .mx(px(10.))
-        .mb(px(if compact { 2. } else { 8. }))
+        .mb(px(8.))
+        .h(px(28.))
         .flex()
-        .flex_col()
         .gap(px(4.))
-        .child(first_filters)
-        .child(remaining_filters);
+        .children(chips);
+    // The grouping picker opens above the footer row: the footer is the last
+    // child of a fixed-height panel, so a panel below it would be clipped.
+    let grouping_menu = (app.sidebar_menu == Some(SidebarMenu::Grouping)).then(|| {
+        div()
+            .id("grouping-menu")
+            .mx(px(8.))
+            .mb(px(4.))
+            .p(px(4.))
+            .rounded(px(10.))
+            .border_1()
+            .border_color(p.border_strong)
+            .bg(p.surface)
+            .shadow_lg()
+            .children(
+                SessionGrouping::ALL
+                    .into_iter()
+                    .enumerate()
+                    .map(|(ix, option)| {
+                        let selected = option == app.grouping;
+                        let grouping_focus = grouping_focus.clone();
+                        div()
+                            .id(("grouping-option", ix))
+                            .role(gpui_kit::Role::Button)
+                            .aria_label(option.label())
+                            .tab_index(0)
+                            .focus_visible(|style| style.border_2().border_color(p.accent))
+                            .h(px(30.))
+                            .px(px(8.))
+                            .rounded(px(7.))
+                            .flex()
+                            .items_center()
+                            .gap(px(8.))
+                            .cursor_pointer()
+                            .hover(|style| style.bg(white(0.06)))
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.sidebar_menu = None;
+                                this.set_grouping(option, cx);
+                                grouping_focus.focus(window, cx);
+                            }))
+                            .child(
+                                div()
+                                    .w(px(13.))
+                                    .flex_shrink_0()
+                                    .flex()
+                                    .items_center()
+                                    .child(if selected {
+                                        ui::icon(IconName::Check, 13., p.accent).into_any_element()
+                                    } else {
+                                        div().into_any_element()
+                                    }),
+                            )
+                            .child(div().flex_1().min_w_0().truncate().child(ui::label(
+                                option.label(),
+                                size::SM,
+                                if selected { p.text } else { p.text_muted },
+                            )))
+                            .test_support()
+                    }),
+            )
+            .child(div().px(px(8.)).pt(px(4.)).child(ui::label(
+                format!("{} cycles", crate::shortcuts::label("⇧⌘G")),
+                size::XS,
+                p.text_subtle,
+            )))
+            .test_support()
+    });
     let bottom = div()
         .flex_shrink_0()
         .py(px(8.))
         .border_t_1()
         .border_color(white(0.05))
+        .when_some(grouping_menu, |bottom, menu| bottom.child(menu))
         .child(
             div()
                 .flex()
@@ -432,6 +623,7 @@ pub fn render(app: &FlintApp, window: &Window, cx: &mut Context<FlintApp>) -> im
                         "Settings",
                         Some(&crate::shortcuts::label("⌘,")),
                     )
+                    .h(px(28.))
                     .flex_1()
                     .min_w_0()
                     .on_click(cx.listener(|this, _, window, cx| this.open_settings(window, cx)))
@@ -456,9 +648,7 @@ pub fn render(app: &FlintApp, window: &Window, cx: &mut Context<FlintApp>) -> im
         .border_color(p.border)
         .overflow_hidden()
         .child(top)
-        .child(new_agent)
-        .child(open_folder)
-        .child(terminal)
+        .child(primary_actions)
         .child(search)
         .child(filters)
         .child(
@@ -510,18 +700,43 @@ pub fn render(app: &FlintApp, window: &Window, cx: &mut Context<FlintApp>) -> im
                 .child(Scrollbar::vertical(&app.sidebar_scroll).mode(ScrollbarMode::Always)),
         )
         .when(!app.archives.is_empty(), |sidebar| {
-            sidebar.child(
-                div()
-                    .id("archived-sessions")
-                    .flex_shrink_0()
-                    .border_t_1()
-                    .border_color(white(0.05))
-                    .child(div().px(px(20.)).py(px(6.)).child(ui::label(
-                        format!("Archived · {}", app.archives.len()),
-                        size::SM,
-                        p.text_muted,
-                    )))
-                    .child(
+            sidebar
+                .child(
+                    div()
+                        .id("archived-sessions")
+                        .role(gpui_kit::Role::Button)
+                        .aria_label(format!("Archived, {} sessions", app.archives.len()))
+                        .tab_index(0)
+                        .focus_visible(|style| style.border_1().border_color(p.accent))
+                        .flex_shrink_0()
+                        .border_t_1()
+                        .border_color(white(0.05))
+                        .h(px(30.))
+                        .px(px(20.))
+                        .flex()
+                        .items_center()
+                        .gap(px(6.))
+                        .cursor_pointer()
+                        .hover(|style| style.bg(white(0.04)))
+                        .on_click(cx.listener(|this, _, _, cx| this.toggle_archived(cx)))
+                        .child(ui::icon(
+                            if app.archived_open {
+                                IconName::ChevronDown
+                            } else {
+                                IconName::ChevronRight
+                            },
+                            11.,
+                            p.text_subtle,
+                        ))
+                        .child(ui::label(
+                            format!("Archived · {}", app.archives.len()),
+                            size::SM,
+                            p.text_muted,
+                        ))
+                        .test_support(),
+                )
+                .when(app.archived_open, |sidebar| {
+                    sidebar.child(
                         div()
                             .relative()
                             .child(
@@ -616,8 +831,7 @@ pub fn render(app: &FlintApp, window: &Window, cx: &mut Context<FlintApp>) -> im
                                     .mode(ScrollbarMode::Always),
                             ),
                     )
-                    .test_support(),
-            )
+                })
         })
         .child(bottom)
         .test_support()
@@ -661,16 +875,22 @@ fn show_more(
         .test_support()
 }
 
-/// One choice in the filter strip, with how many sessions it would show.
+/// One choice in the filter strip, with how many sessions it would show. Four
+/// of these share one row, so each is an icon (or the word "All") plus its
+/// count; the full name lives in the accessible label and the tooltip.
 fn filter_chip(
     ix: usize,
     label: &'static str,
+    icon: Option<IconName>,
+    tint: Hsla,
     count: usize,
     selected: bool,
     count_color: Hsla,
 ) -> Stateful<Div> {
     let p = palette();
     let empty = count == 0 && !selected;
+    let label_color = if selected { p.text } else { p.text_subtle };
+    let has_icon = icon.is_some();
     div()
         .id(("session-filter", ix))
         .role(gpui_kit::Role::Button)
@@ -678,37 +898,61 @@ fn filter_chip(
         // Empty chips stay clickable but out of the tab order.
         .tab_index(if empty { -1 } else { 0 })
         .focus_visible(|style| style.border_1().border_color(p.accent))
+        .tooltip(move |window, cx| Tooltip::new(format!("{label} ({count})")).build(window, cx))
         .flex_1()
         .min_w_0()
         .h(px(28.))
-        .px(px(8.))
+        .px(px(6.))
         .rounded(px(6.))
         .flex()
         .items_center()
-        .gap(px(5.))
+        .justify_center()
+        .gap(px(4.))
         .cursor_pointer()
         .bg(if selected { p.raised } else { white(0.) })
         .hover(|style| style.bg(white(0.06)))
-        .child(div().flex_1().min_w_0().truncate().child(ui::label(
-            label,
+        .when_some(icon, |chip, icon| {
+            chip.child(ui::icon(icon, 12., tint).flex_shrink_0())
+        })
+        .when(!has_icon, |chip| {
+            chip.child(ui::label(label, size::XS, label_color))
+        })
+        // The count keeps its slot at zero so live updates cannot move targets.
+        .child(ui::label(
+            if count > 999 {
+                "999+".to_string()
+            } else {
+                count.to_string()
+            },
             size::XS,
-            if selected { p.text } else { p.text_subtle },
-        )))
-        .child(
-            div()
-                .w(px(30.))
-                .flex_shrink_0()
-                .text_right()
-                .child(ui::label(
-                    if count > 999 {
-                        "999+".to_string()
-                    } else {
-                        count.to_string()
-                    },
-                    size::XS,
-                    count_color,
-                )),
-        )
+            count_color,
+        ))
+}
+
+/// A 28 px icon-only button for the sidebar's secondary actions.
+fn icon_button(
+    id: &'static str,
+    icon: IconName,
+    label: &'static str,
+    hint: &'static str,
+) -> Stateful<Div> {
+    let p = palette();
+    div()
+        .id(id)
+        .role(gpui_kit::Role::Button)
+        .aria_label(label)
+        .tab_index(0)
+        .focus_visible(|style| style.border_1().border_color(p.accent))
+        .size(px(28.))
+        .flex_shrink_0()
+        .rounded(px(7.))
+        .flex()
+        .items_center()
+        .justify_center()
+        .cursor_pointer()
+        .hover(|style| style.bg(white(0.06)))
+        .tooltip(move |window, cx| Tooltip::new(format!("{label}  {hint}")).build(window, cx))
+        .child(ui::icon(icon, 16., p.text_muted))
 }
 
 fn nav_row(
@@ -733,22 +977,8 @@ fn nav_row(
         .items_center()
         .gap(px(11.))
         .cursor_pointer()
-        .hover(move |style| {
-            style.bg(if id == "new-agent" {
-                p.accent.opacity(0.18)
-            } else {
-                white(0.05)
-            })
-        })
-        .child(ui::icon(
-            icon,
-            16.,
-            if id == "new-agent" {
-                p.accent
-            } else {
-                p.text_muted
-            },
-        ))
+        .hover(|style| style.bg(white(0.05)))
+        .child(ui::icon(icon, 16., p.text_muted))
         .child(
             div()
                 .flex_1()
@@ -759,15 +989,6 @@ fn nav_row(
         .when_some(hint.map(str::to_string), |row, hint| {
             row.child(ui::label(hint, size::XS, p.text_subtle))
         })
-}
-
-/// A session's branch and token total, for the row's third line; `None` when
-/// it has neither.
-fn details_line(session: &crate::session::Session) -> Option<(Option<String>, Option<String>)> {
-    let branch = project::branch(&session.workspace);
-    let tokens = session.total_tokens();
-    let usage = (tokens > 0).then(|| format!("{} tokens", ui::tokens(tokens)));
-    (branch.is_some() || usage.is_some()).then_some((branch, usage))
 }
 
 fn session_row(app: &FlintApp, ix: usize, cx: &mut Context<FlintApp>) -> AnyElement {
@@ -853,6 +1074,21 @@ fn session_row(app: &FlintApp, ix: usize, cx: &mut Context<FlintApp>) -> AnyElem
     let is_renaming = renaming.is_some();
     let full_title = session.title();
     let full_subtitle = subtitle.clone();
+    // The branch keeps its own segment on the second line. The token total is a
+    // diagnostic rather than a navigation aid, so it moves into the tooltip.
+    let branch = project::branch(&session.workspace);
+    let tokens = session.total_tokens();
+    let title_tooltip = {
+        let mut tip = full_title.clone();
+        if let Some(branch) = &branch {
+            tip.push('\n');
+            tip.push_str(branch);
+        }
+        if tokens > 0 {
+            tip.push_str(&format!("\n{} tokens", ui::tokens(tokens)));
+        }
+        tip
+    };
     let title: AnyElement = match renaming {
         Some(input) => {
             let focus = input.focus_handle(cx);
@@ -883,20 +1119,24 @@ fn session_row(app: &FlintApp, ix: usize, cx: &mut Context<FlintApp>) -> AnyElem
                 matches!(status, Status::Unread | Status::Failed { seen: false }),
                 |t| t.font_weight(FontWeight::MEDIUM),
             )
-            .tooltip(move |window, cx| Tooltip::new(full_title.clone()).build(window, cx))
+            .tooltip(move |window, cx| Tooltip::new(title_tooltip.clone()).build(window, cx))
             .child(session.title())
             .test_support()
             .into_any_element(),
     };
+    // Two lines: title, then branch · status · time. The row's own hover group
+    // is what reveals the actions glyph, so bounds never move.
+    let row_group = format!("session-row-{ix}");
     let row = div()
         .id(("session", ix))
+        .group(row_group.clone())
         .role(gpui_kit::Role::Button)
         .aria_label(format!("Session: {}", session.title()))
         .tab_index(if is_renaming { -1 } else { 0 })
         .focus_visible(|style| style.border_2().border_color(p.accent))
         .mx(px(8.))
         .px(px(12.))
-        .py(px(12.))
+        .py(px(4.))
         .rounded(px(11.))
         .flex()
         .gap(px(11.))
@@ -950,6 +1190,26 @@ fn session_row(app: &FlintApp, ix: usize, cx: &mut Context<FlintApp>) -> AnyElem
                         .flex()
                         .items_center()
                         .gap(px(8.))
+                        .when_some(branch, |line, branch| {
+                            let tip = branch.clone();
+                            line.child(
+                                div()
+                                    .id(("sidebar-branch", ix))
+                                    .flex_shrink_1()
+                                    .min_w_0()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(3.))
+                                    .text_size(px(size::XS))
+                                    .text_color(p.text_subtle)
+                                    .tooltip(move |window, cx| {
+                                        Tooltip::new(tip.clone()).build(window, cx)
+                                    })
+                                    .child(ui::icon(IconName::GitBranch, 11., p.text_subtle))
+                                    .child(div().min_w_0().truncate().child(branch))
+                                    .test_support(),
+                            )
+                        })
                         .child(
                             div()
                                 .id(("sidebar-subtitle", ix))
@@ -971,42 +1231,7 @@ fn session_row(app: &FlintApp, ix: usize, cx: &mut Context<FlintApp>) -> AnyElem
                                 .child(ui::label(when, size::XS, when_color))
                                 .test_support(),
                         ),
-                )
-                .when_some(details_line(session), |col, (branch, usage)| {
-                    col.child(
-                        div()
-                            .id(("sidebar-details", ix))
-                            .min_w_0()
-                            .flex()
-                            .items_center()
-                            .gap(px(8.))
-                            .text_size(px(size::XS))
-                            .text_color(p.text_subtle)
-                            .when_some(branch, |line, branch| {
-                                line.child(
-                                    div()
-                                        .id(("sidebar-branch", ix))
-                                        .min_w_0()
-                                        .flex()
-                                        .items_center()
-                                        .gap(px(3.))
-                                        .child(ui::icon(IconName::GitBranch, 11., p.text_subtle))
-                                        .child(div().min_w_0().truncate().child(branch))
-                                        .test_support(),
-                                )
-                            })
-                            .when_some(usage, |line, usage| {
-                                line.child(
-                                    div()
-                                        .id(("sidebar-usage", ix))
-                                        .flex_shrink_0()
-                                        .child(usage)
-                                        .test_support(),
-                                )
-                            })
-                            .test_support(),
-                    )
-                }),
+                ),
         )
         .child(
             div()
@@ -1033,7 +1258,19 @@ fn session_row(app: &FlintApp, ix: usize, cx: &mut Context<FlintApp>) -> AnyElem
                     cx.stop_propagation();
                     cx.notify();
                 }))
-                .child(ui::icon(IconName::Ellipsis, 14., p.text_muted))
+                .child(
+                    // The glyph stays hidden until the row is hovered or active,
+                    // while the 24 px slot keeps its bounds. Only the inner
+                    // wrapper fades, so the button stays hit-testable.
+                    div()
+                        .opacity(if active || app.session_menu == Some(ix) {
+                            1.
+                        } else {
+                            0.
+                        })
+                        .group_hover(row_group, |style| style.opacity(1.))
+                        .child(ui::icon(IconName::Ellipsis, 14., p.text_muted)),
+                )
                 .test_support(),
         )
         .test_support();

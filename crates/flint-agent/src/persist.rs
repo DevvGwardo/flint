@@ -133,11 +133,57 @@ fn close_pending(out: &mut Vec<Message>, pending: &mut Vec<String>) {
     }
 }
 
+/// A snapshot waiting for the background writer.
+pub(crate) enum SaveData {
+    /// History already serialized by the caller.
+    Bytes(Vec<u8>),
+    /// Live state, serialized inside the writer's blocking task.
+    Session(Box<SessionSnapshot>),
+}
+
+/// The parts of a session that a saved history document carries.
+pub(crate) struct SessionSnapshot {
+    pub turn_id: u64,
+    pub messages: Arc<Vec<Message>>,
+    pub task: Option<TaskRecord>,
+}
+
+impl From<Vec<u8>> for SaveData {
+    fn from(bytes: Vec<u8>) -> Self {
+        Self::Bytes(bytes)
+    }
+}
+
+impl SaveData {
+    fn into_bytes(self) -> Vec<u8> {
+        match self {
+            Self::Bytes(bytes) => bytes,
+            // Serializing here keeps the one formatted copy of the transcript
+            // off the two async runtime workers that drive inference, events
+            // and subagent polling. A burst still formats once, not N times.
+            Self::Session(snapshot) => {
+                snapshot_with_task(snapshot.turn_id, &snapshot.messages, snapshot.task.as_ref())
+            }
+        }
+    }
+
+    /// The bytes this snapshot will write, without consuming it.
+    #[cfg(test)]
+    pub(crate) fn encoded(&self) -> Vec<u8> {
+        match self {
+            Self::Bytes(bytes) => bytes.clone(),
+            Self::Session(snapshot) => {
+                snapshot_with_task(snapshot.turn_id, &snapshot.messages, snapshot.task.as_ref())
+            }
+        }
+    }
+}
+
 /// Background writer for one session directory. Only the newest pending
 /// complete snapshot is retained, in addition to an in-flight write.
 pub struct Saver {
     tx: async_channel::Sender<SaveCommand>,
-    latest: Arc<Mutex<Option<Vec<u8>>>>,
+    latest: Arc<Mutex<Option<SaveData>>>,
     done: tokio::task::JoinHandle<std::io::Result<()>>,
 }
 
@@ -178,16 +224,20 @@ impl Saver {
     ) -> Self {
         // This channel carries wakeups, not snapshots or transcript events.
         let (tx, rx) = async_channel::bounded(1);
-        let latest = Arc::new(Mutex::new(None::<Vec<u8>>));
+        let latest = Arc::new(Mutex::new(None::<SaveData>));
         let pending = latest.clone();
         let done = tokio::spawn(async move {
             let mut result = Ok(());
             while let Ok(command) = rx.recv().await {
-                let latest = pending.lock().unwrap().take();
+                let latest = pending
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .take();
                 if let Some(latest) = latest {
                     let dir = dir.clone();
                     let completed = tokio::task::spawn_blocking(move || {
-                        let result = write(&dir, &latest);
+                        let bytes = latest.into_bytes();
+                        let result = write(&dir, &bytes);
                         (write, result)
                     })
                     .await;
@@ -231,8 +281,15 @@ impl Saver {
     }
 
     /// Replaces the pending complete snapshot without waiting for storage.
-    pub fn save(&self, snapshot: Vec<u8>) {
-        let previous = self.latest.lock().unwrap().replace(snapshot);
+    ///
+    /// `SaveData::Session` defers serialization to the writer; a caller that
+    /// already holds formatted bytes passes them straight through.
+    pub fn save(&self, snapshot: impl Into<SaveData>) {
+        let previous = self
+            .latest
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .replace(snapshot.into());
         drop(previous);
         // A full channel already has a wakeup for the shared latest snapshot.
         let _ = self.tx.try_send(SaveCommand::Wake);

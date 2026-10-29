@@ -32,7 +32,7 @@ fn finish_queue_fixture(
 fn enable_queue_policy(ui: &Ui, cx: &mut TestAppContext) {
     ui.press(cx, "secondary-,");
     ui.scroll_settings(cx);
-    ui.click(cx, "settings-queue-verification");
+    ui.click_settings(cx, "settings-queue-verification");
     ui.click(cx, "settings-save");
 }
 
@@ -49,12 +49,12 @@ fn queue_verification_cancel_and_failed_settings_save_cannot_release_review_hold
     );
     ui.press(cx, "secondary-,");
     ui.scroll_settings(cx);
-    ui.click(cx, "settings-queue-verification");
+    ui.click_settings(cx, "settings-queue-verification");
     ui.click(cx, "settings-cancel");
     assert!(engine.sent().is_empty());
     ui.press(cx, "secondary-,");
     ui.scroll_settings(cx);
-    ui.click(cx, "settings-queue-verification");
+    ui.click_settings(cx, "settings-queue-verification");
     let home = ui.read(cx, |app, _| app.home.clone());
     std::fs::create_dir(home.join("config.toml.tmp")).unwrap();
     ui.click(cx, "settings-save");

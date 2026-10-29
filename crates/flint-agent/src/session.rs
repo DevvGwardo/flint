@@ -34,6 +34,7 @@ use crate::protocol::AgentEvent;
 use crate::protocol::ApprovalDecision;
 use crate::protocol::ApprovalMode;
 use crate::protocol::FALLBACK_CONTEXT_WINDOW_TOKENS;
+use crate::protocol::IMPROVEMENT_OPTION_ID;
 use crate::protocol::ImageAttachment;
 use crate::protocol::JevConfig;
 use crate::protocol::NudgeReason;
@@ -86,7 +87,7 @@ pub(crate) async fn run(
             return;
         }
     };
-    let current = Arc::new(Mutex::new(CancellationToken::new()));
+    let current = Arc::new(crate::pending_turn::StartFence::default());
     // Interrupt cancels a turn, not the session's MCP inventory. Only
     // Shutdown/closed intake should abandon startup and its owned servers.
     let shutdown = CancellationToken::new();
@@ -111,11 +112,15 @@ pub(crate) async fn run(
             match op {
                 Op::UserMessage(text) => {
                     ops_work_clock.queue_restriction(&text);
-                    let _ = messages_tx.send(Input::Message(text, Vec::new())).await;
+                    let _ = messages_tx
+                        .send(scheduled(Input::Message(text, Vec::new()), &ops_current))
+                        .await;
                 }
                 Op::UserMessageWithImages { text, images } => {
                     ops_work_clock.queue_restriction(&text);
-                    let _ = messages_tx.send(Input::Message(text, images)).await;
+                    let _ = messages_tx
+                        .send(scheduled(Input::Message(text, images), &ops_current))
+                        .await;
                 }
                 Op::UserMessageWithContext {
                     request,
@@ -125,17 +130,22 @@ pub(crate) async fn run(
                 } => {
                     ops_work_clock.queue_restriction(&request);
                     let _ = messages_tx
-                        .send(Input::ContextMessage {
-                            request,
-                            text,
-                            images,
-                            steering_id,
-                        })
+                        .send(scheduled(
+                            Input::ContextMessage {
+                                request,
+                                text,
+                                images,
+                                steering_id,
+                            },
+                            &ops_current,
+                        ))
                         .await;
                 }
                 Op::SteerMessage { id, text, images } => {
                     ops_work_clock.queue_restriction(&text);
-                    let _ = messages_tx.send(Input::Steer { id, text, images }).await;
+                    let _ = messages_tx
+                        .send(scheduled(Input::Steer { id, text, images }, &ops_current))
+                        .await;
                 }
                 Op::UndoLastTurn => {
                     let _ = messages_tx.send(Input::Undo).await;
@@ -146,15 +156,34 @@ pub(crate) async fn run(
                 Op::ReviewTask(review) => {
                     let _ = messages_tx.send(Input::ReviewTask(review)).await;
                 }
+                Op::AutomaticallyReviewTask {
+                    task_id,
+                    expected_revision,
+                    expected_work_revision,
+                } => {
+                    let _ = messages_tx
+                        .send(scheduled(
+                            Input::AutomaticallyReviewTask {
+                                task_id,
+                                expected_revision,
+                                expected_work_revision,
+                            },
+                            &ops_current,
+                        ))
+                        .await;
+                }
                 Op::ContinueTask {
                     task_id,
                     expected_revision,
                 } => {
                     let _ = messages_tx
-                        .send(Input::ContinueTask {
-                            task_id,
-                            expected_revision,
-                        })
+                        .send(scheduled(
+                            Input::ContinueTask {
+                                task_id,
+                                expected_revision,
+                            },
+                            &ops_current,
+                        ))
                         .await;
                 }
                 Op::Interrupt => cancel_current(&ops_current),
@@ -169,8 +198,11 @@ pub(crate) async fn run(
                 Op::SetJev(config) => {
                     *ops_jev.lock().unwrap_or_else(|error| error.into_inner()) = config;
                 }
-                // flint's engine exposes no options beyond effort (its own op).
-                Op::SetSessionOption { .. } => {}
+                Op::SetSessionOption { id, value } => {
+                    if id == IMPROVEMENT_OPTION_ID {
+                        let _ = messages_tx.send(Input::ImprovementPolicy(value)).await;
+                    }
+                }
                 Op::Shutdown => break,
             }
         }
@@ -206,24 +238,30 @@ pub(crate) async fn run(
         Ok(saver),
     );
     session.jev_settings = jev_settings;
+    session.initialize_improvements(options.improvement_hints);
     if !options.allow_subagents {
         session.subagents = None;
-        session.tool_names.retain(|name| name != tools::SPAWN_AGENT);
+    }
+    if !options.allow_subagents || !options.interactive_ui {
+        session.tool_names.retain(|name| {
+            (options.allow_subagents || name != tools::SPAWN_AGENT)
+                && (options.interactive_ui || name != tools::RENDER_UI)
+        });
         let mut specs = tools::tool_specs();
-        specs.retain(|spec| spec["function"]["name"] != tools::SPAWN_AGENT);
+        specs.retain(|spec| {
+            (options.allow_subagents || spec["function"]["name"] != tools::SPAWN_AGENT)
+                && (options.interactive_ui || spec["function"]["name"] != tools::RENDER_UI)
+        });
         if let Some(hub) = &session.mcp {
             specs.extend(hub.specs());
         }
-        session.tools_json = serde_json::to_string(&specs).unwrap_or_default();
+        session.set_tools_json(serde_json::to_string(&specs).unwrap_or_default());
     }
     session.inbox = Some(messages_rx);
     if auto_budget {
         // Shutdown/closed prompt intake must interrupt bootstrap network
         // waits too, before a first turn owns its cancellation token.
-        let bootstrap = current
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .clone();
+        let bootstrap = current.bootstrap_token();
         let limits = tokio::select! {
             biased;
             () = bootstrap.cancelled() => None,
@@ -232,6 +270,13 @@ pub(crate) async fn run(
         session.context.set_budget(budget_for_window(limits));
     }
     while let Some(input) = session.next_input().await {
+        let (input, start) = unscoped(input);
+        if stopping.load(Ordering::SeqCst) {
+            break;
+        }
+        let token = start
+            .as_ref()
+            .map_or_else(CancellationToken::new, |start| start.enter());
         let (request, text, images, steering) = match input {
             Input::Message(text, images) => (text.clone(), text, images, None),
             Input::Steer { id, text, images } => (text.clone(), text, images, Some(id)),
@@ -253,6 +298,25 @@ pub(crate) async fn run(
                 session.review_task(review).await;
                 continue;
             }
+            Input::ImprovementPolicy(value) => {
+                session.set_improvement_policy(&value);
+                continue;
+            }
+            Input::AutomaticallyReviewTask {
+                task_id,
+                expected_revision,
+                expected_work_revision,
+            } => {
+                session
+                    .automatically_review_task(
+                        task_id,
+                        expected_revision,
+                        expected_work_revision,
+                        &token,
+                    )
+                    .await;
+                continue;
+            }
             Input::ContinueTask {
                 task_id,
                 expected_revision,
@@ -269,15 +333,9 @@ pub(crate) async fn run(
                 let text: String = "Continue the protected task. Address its outstanding requirements and blockers.".into();
                 (text.clone(), text, Vec::new(), None)
             }
+            Input::Scheduled { .. } => unreachable!("scheduled input was unwrapped"),
         };
         session.tools.work_clock.consume_restriction(&request);
-        let token = CancellationToken::new();
-        if let Ok(mut slot) = current.lock() {
-            *slot = token.clone();
-            if stopping.load(Ordering::SeqCst) {
-                break;
-            }
-        }
         if let Some(id) = steering {
             session.emit(AgentEvent::SteeringAccepted { id });
         }
@@ -323,6 +381,10 @@ pub(crate) fn budget_for_window(limits: Option<ModelLimits>) -> u64 {
 
 /// What the front end sends a session between (or during) turns.
 pub(super) enum Input {
+    Scheduled {
+        start: crate::pending_turn::QueuedStart,
+        input: Box<Input>,
+    },
     Message(String, Vec<ImageAttachment>),
     ContextMessage {
         request: String,
@@ -338,6 +400,12 @@ pub(super) enum Input {
     Undo,
     EditTask(TaskEdit),
     ReviewTask(TaskReview),
+    ImprovementPolicy(String),
+    AutomaticallyReviewTask {
+        task_id: u64,
+        expected_revision: u64,
+        expected_work_revision: u64,
+    },
     ContinueTask {
         task_id: u64,
         expected_revision: u64,
@@ -347,10 +415,45 @@ pub(super) enum Input {
 /// Retries of one step after the stream broke mid-reply.
 const MAX_STEP_RETRIES: u32 = 2;
 
-fn cancel_current(current: &Mutex<CancellationToken>) {
-    if let Ok(token) = current.lock() {
-        token.cancel();
+fn scheduled(input: Input, fence: &Arc<crate::pending_turn::StartFence>) -> Input {
+    Input::Scheduled {
+        start: fence.queue(),
+        input: Box::new(input),
     }
+}
+
+fn unscoped(input: Input) -> (Input, Option<crate::pending_turn::QueuedStart>) {
+    match input {
+        Input::Scheduled { start, input } => (*input, Some(start)),
+        other => (other, None),
+    }
+}
+
+fn rescope(input: Input, start: Option<crate::pending_turn::QueuedStart>) -> Input {
+    match start {
+        Some(start) => Input::Scheduled {
+            start,
+            input: Box::new(input),
+        },
+        None => input,
+    }
+}
+
+fn cancel_current(current: &crate::pending_turn::StartFence) {
+    current.interrupt();
+}
+
+/// Whether finishing a call must rescan file evidence before evidence is
+/// stamped with a work revision.
+///
+/// Reads, plans and reports cannot move content, so they are covered by the
+/// once-per-step scan in the turn loop; a batch of reads must not re-read the
+/// whole evidence set per call. Getting this wrong is never permissive: a
+/// deferred scan that finds drift can only advance the work clock, which makes
+/// anything stamped before it stale. A subagent is not classified as mutating,
+/// but a child without its own checkout edits this workspace.
+fn needs_rescan_before_stamping(name: &str, mutates: bool) -> bool {
+    mutates || name == tools::SPAWN_AGENT
 }
 
 pub(super) struct Session {
@@ -394,23 +497,147 @@ pub(super) struct Session {
     continuing_task: bool,
     last_task_projection: Option<(u64, TaskRecord)>,
     restore_error: Option<String>,
+    improvements: Option<crate::improvement::ImprovementStore>,
+    boundary_hints: Option<(u64, u64, Vec<crate::improvement::HintKind>)>,
+    /// Fingerprints reused between evidence scans; rebuilt when a scan fails.
+    file_scans: crate::task::FileScanCache,
+    /// Read-only tool specs, built on first use. The transform depends only on
+    /// the fixed host `tools_json`, so this never needs invalidating.
+    scoped_read_only_tools: std::sync::OnceLock<String>,
 }
+
+#[path = "adaptive_session.rs"]
+mod adaptive;
 
 async fn scan_task_files(
     mut task: TaskRecord,
     workspace: std::path::PathBuf,
-    scan: impl FnOnce(&mut TaskRecord, &std::path::Path) -> bool + Send + 'static,
-) -> Result<(TaskRecord, bool), tokio::task::JoinError> {
+    mut cache: crate::task::FileScanCache,
+    scan: impl FnOnce(&mut TaskRecord, &std::path::Path, &mut crate::task::FileScanCache) -> bool
+    + Send
+    + 'static,
+) -> Result<(TaskRecord, bool, crate::task::FileScanCache), tokio::task::JoinError> {
     // One awaited scanner per session, at most four active children. Keep
     // disk reads and bytewise hashing off the parent/child polling loop.
     tokio::task::spawn_blocking(move || {
-        let changed = scan(&mut task, &workspace);
-        (task, changed)
+        let changed = scan(&mut task, &workspace, &mut cache);
+        (task, changed, cache)
     })
     .await
 }
 
 impl Session {
+    async fn automatically_review_task(
+        &mut self,
+        task_id: u64,
+        expected_revision: u64,
+        expected_work_revision: u64,
+        cancel: &CancellationToken,
+    ) {
+        if self.task.as_ref().is_none_or(|task| {
+            task.contract.id != task_id
+                || task.contract.revision != expected_revision
+                || task.work_revision != expected_work_revision
+                || !task.can_automatically_review()
+        }) {
+            self.emit(AgentEvent::Error(
+                "The task is not ready for an independent automatic review.".into(),
+            ));
+            return;
+        }
+        self.turn_id = match self.turn_id.checked_add(1) {
+            Some(id) => id,
+            None => {
+                self.emit(AgentEvent::Error("The turn counter is exhausted.".into()));
+                return;
+            }
+        };
+        self.emit(AgentEvent::TurnStarted {
+            turn_id: self.turn_id,
+        });
+        self.emit_task(false);
+        self.refresh_task_files().await;
+        if let Some(task) = &mut self.task {
+            task.assess(TurnEndReason::Completed, true);
+        }
+        let mut reason = TurnEndReason::Completed;
+        let mut summary =
+            "Evidence changed before review. Current verification must be rerun.".to_string();
+        if let Some(task) = self
+            .task
+            .clone()
+            .filter(TaskRecord::can_automatically_review)
+        {
+            let events = self.events.clone();
+            let result = crate::automatic_review::run(
+                &self.config,
+                &task,
+                self.turn_id,
+                cancel,
+                &move |event| {
+                    events.try_send(event).ok();
+                },
+            )
+            .await;
+            self.refresh_task_files().await;
+            if let Some(task) = &mut self.task {
+                task.assess(TurnEndReason::Completed, true);
+            }
+            match result {
+                Ok(review) if !cancel.is_cancelled() => {
+                    summary = format!(
+                        "Independent automatic review: {}\n{}",
+                        match review.verdict {
+                            crate::task::AutomaticReviewVerdict::Clean =>
+                                "no actionable issues found.",
+                            crate::task::AutomaticReviewVerdict::NeedsFixes => "fixes required.",
+                            crate::task::AutomaticReviewVerdict::Blocked =>
+                                "blocked on missing evidence or access.",
+                        },
+                        review.summary
+                    );
+                    if let Some(task) = &mut self.task
+                        && let Err(error) = task.record_automatic_review(review)
+                    {
+                        // Drift is a repairable verification condition, not proof of completion.
+                        summary = error;
+                    }
+                }
+                Ok(_) | Err(ProviderError::Cancelled) => reason = TurnEndReason::Interrupted,
+                Err(ProviderError::Failed(error) | ProviderError::Dropped(error)) => {
+                    reason = TurnEndReason::Failed(error.clone());
+                    summary = format!("Independent automatic review stopped: {error}");
+                }
+            }
+        }
+        if cancel.is_cancelled() {
+            reason = TurnEndReason::Interrupted;
+        }
+        if let Some(task) = &mut self.task {
+            task.assess(reason.clone(), true);
+        }
+        self.emit(AgentEvent::TextDelta(summary.clone()));
+        self.history.push(Message::Assistant {
+            content: summary,
+            reasoning: String::new(),
+            tool_calls: Vec::new(),
+        });
+        self.update_task_context();
+        self.save();
+        if !self.checkpoint_task().await {
+            reason = TurnEndReason::Failed("Automatic review could not be saved.".into());
+            if let Some(task) = &mut self.task {
+                task.automatic_review = None;
+                task.assess(reason.clone(), true);
+            }
+        }
+        self.emit_task(true);
+        self.emit(AgentEvent::TurnFinished {
+            turn_id: self.turn_id,
+            reason,
+        });
+    }
+
     pub(super) fn stage_jev(&mut self, config: Option<JevConfig>) {
         *self
             .jev_settings
@@ -468,11 +695,14 @@ impl Session {
         };
         let mut specs = tools::tool_specs();
         if child {
-            specs.retain(|spec| spec["function"]["name"] != tools::SPAWN_AGENT);
+            specs.retain(|spec| {
+                spec["function"]["name"] != tools::SPAWN_AGENT
+                    && spec["function"]["name"] != tools::RENDER_UI
+            });
         }
         let mut tool_names: Vec<String> = tools::TOOL_NAMES
             .iter()
-            .filter(|name| !child || **name != tools::SPAWN_AGENT)
+            .filter(|name| !child || (**name != tools::SPAWN_AGENT && **name != tools::RENDER_UI))
             .map(|name| (*name).to_string())
             .collect();
         if let Some(hub) = &mcp {
@@ -553,6 +783,10 @@ impl Session {
             continuing_task: false,
             last_task_projection: None,
             restore_error,
+            improvements: None,
+            boundary_hints: None,
+            file_scans: crate::task::FileScanCache::default(),
+            scoped_read_only_tools: std::sync::OnceLock::new(),
         }
     }
 
@@ -575,6 +809,7 @@ impl Session {
             return messages;
         };
         while let Ok(input) = inbox.try_recv() {
+            let (input, start) = unscoped(input);
             match input {
                 Input::Message(text, images) if self.deferred.is_empty() => {
                     messages.push((text.clone(), text, images));
@@ -599,7 +834,7 @@ impl Session {
                     messages.push((request, text, images));
                 }
                 Input::EditTask(edit) if self.deferred.is_empty() => self.edit_task(edit).await,
-                other => self.deferred.push_back(other),
+                other => self.deferred.push_back(rescope(other, start)),
             }
         }
         for (request, _, _) in &messages {
@@ -658,11 +893,15 @@ impl Session {
     /// Queues a snapshot of the history for the background writer.
     fn save(&self) {
         if let Some(saver) = &self.saver {
-            saver.save(persist::snapshot_with_task(
-                self.turn_id,
-                &self.history,
-                self.task.as_ref(),
-            ));
+            // The writer serializes; only the (cheap, allocation-shallow)
+            // clone of live state happens here, never a full JSON format.
+            saver.save(persist::SaveData::Session(Box::new(
+                persist::SessionSnapshot {
+                    turn_id: self.turn_id,
+                    messages: std::sync::Arc::new(self.history.clone()),
+                    task: self.task.clone(),
+                },
+            )));
         }
     }
 
@@ -776,17 +1015,21 @@ impl Session {
             match scan_task_files(
                 task,
                 self.tools.workspace.clone(),
-                TaskRecord::refresh_files,
+                std::mem::take(&mut self.file_scans),
+                TaskRecord::refresh_files_cached,
             )
             .await
             {
-                Ok((task, changed)) => {
+                Ok((task, changed, scans)) => {
+                    self.file_scans = scans;
                     self.task = Some(task);
                     if changed {
                         self.tools.work_clock.advance();
                     }
                 }
                 Err(_) => {
+                    // The cache was consumed by the failed scan; an empty one
+                    // only costs hashing on the next pass.
                     if let Some(task) = &mut self.task {
                         task.evidence_overflow = true;
                     }
@@ -810,10 +1053,11 @@ impl Session {
                     ""
                 };
             let context = format!(
-                "{}{}\nParent restrictions: {:?}",
+                "{}{}\nParent restrictions: {:?}{}",
                 task.context(),
                 inherited,
-                self.inherited_restrictions
+                self.inherited_restrictions,
+                self.improvement_context(),
             );
             self.history
                 .insert(1.min(self.history.len()), Message::TaskContext(context));
@@ -829,30 +1073,44 @@ impl Session {
                 .is_some_and(|task| task.contract.mode == TaskMode::ReadOnly)
     }
 
+    /// Replaces the host tool specs and drops the read-only variant derived
+    /// from them. The pair must move together: the cached variant is only ever
+    /// a pure function of the specs.
+    fn set_tools_json(&mut self, json: String) {
+        self.tools_json = json;
+        self.scoped_read_only_tools.take();
+    }
+
     /// Tool visibility helps the model follow scope; the execution boundary
     /// still rejects stale/hallucinated calls and policy changes while waiting.
     fn scoped_tools_json(&self) -> std::borrow::Cow<'_, str> {
         if !self.read_only_scope() {
             return std::borrow::Cow::Borrowed(&self.tools_json);
         }
-        let mut specs: Vec<Value> =
-            serde_json::from_str(&self.tools_json).expect("host tool specs are valid JSON");
-        specs.retain(|spec| {
-            let name = spec["function"]["name"].as_str().unwrap_or_default();
-            !matches!(name, tools::WRITE_FILE | tools::EDIT_FILE)
-                && !name.starts_with(crate::mcp::PREFIX)
-        });
-        for spec in &mut specs {
-            if spec["function"]["name"] == tools::RUN_COMMAND {
-                spec["function"]["description"] = Value::String(
-                    "Inspect only: simple pwd, ls, cat, rg or read-only git commands. \
-                     No shell chains, redirection, interpreters, tests, builds or writes. \
-                     Prefer read_file, list_dir and grep. Return review findings in chat."
-                        .into(),
-                );
+        // The read-only variant is a fixed transform of the host specs, so it
+        // is built once per session instead of parsed and re-serialized on
+        // every step.
+        let scoped = self.scoped_read_only_tools.get_or_init(|| {
+            let mut specs: Vec<Value> =
+                serde_json::from_str(&self.tools_json).expect("host tool specs are valid JSON");
+            specs.retain(|spec| {
+                let name = spec["function"]["name"].as_str().unwrap_or_default();
+                !matches!(name, tools::WRITE_FILE | tools::EDIT_FILE)
+                    && !name.starts_with(crate::mcp::PREFIX)
+            });
+            for spec in &mut specs {
+                if spec["function"]["name"] == tools::RUN_COMMAND {
+                    spec["function"]["description"] = Value::String(
+                        "Inspect only: simple pwd, ls, cat, rg or read-only git commands. \
+                         No shell chains, redirection, interpreters, tests, builds or writes. \
+                         Prefer read_file, list_dir and grep. Return review findings in chat."
+                            .into(),
+                    );
+                }
             }
-        }
-        std::borrow::Cow::Owned(serde_json::to_string(&specs).expect("specs serialize"))
+            serde_json::to_string(&specs).expect("specs serialize")
+        });
+        std::borrow::Cow::Borrowed(scoped.as_str())
     }
 
     fn emit_task(&mut self, assessed: bool) {
@@ -956,6 +1214,7 @@ impl Session {
                     .is_some_and(|task| task.contract.mode == TaskMode::ReadOnly),
             );
         }
+        self.prepare_improvement_boundary(cancel);
         self.update_task_context();
         self.emit_task(false);
         let reason = self.turn_loop(text, images, turn_id, cancel).await;
@@ -982,6 +1241,7 @@ impl Session {
         }
         self.save();
         self.emit_task(true);
+        self.learn_completed_task(&reason);
         self.emit(AgentEvent::TurnFinished {
             turn_id,
             reason: reason.clone(),
@@ -1162,14 +1422,9 @@ impl Session {
                 // bounded finish recovery see that drift, not just the later
                 // final assessment after the opportunity to recheck is gone.
                 self.refresh_task_files().await;
-                if let Some(task) = &self.task {
-                    harness.set_task_record(task);
-                }
                 if let Some(task) = &mut self.task {
                     task.note_final(&completion.text);
-                    if !task.blockers.is_empty() {
-                        return TurnEndReason::Completed;
-                    }
+                    harness.set_task_record(task);
                 }
                 let names = self.tool_name_refs();
                 let decision = tokio::select! {
@@ -1221,6 +1476,10 @@ impl Session {
                     index += 1;
                 }
             }
+            // One drift scan per step: reads, plans and reports cannot change
+            // content themselves, but an out-of-band edit still matters. Cost
+            // is metadata-only while the evidence set is unchanged.
+            self.refresh_task_files().await;
             self.save();
             self.emit_task(false);
             if cancel.is_cancelled() {
@@ -1534,7 +1793,9 @@ impl Session {
         {
             task.note_file(&path, false);
         }
-        self.refresh_task_files().await;
+        if needs_rescan_before_stamping(&call.name, mutates) {
+            self.refresh_task_files().await;
+        }
         let revision = self.tools.work_clock.revision();
         if let Some(task) = &mut self.task {
             task.set_work_revision(revision);
@@ -1565,6 +1826,18 @@ impl Session {
             }
             if mutates && execution_attempted && kind != ToolKind::Edit {
                 task.unknown_effects = true;
+            }
+            if execution_attempted
+                && outcome.success
+                && outcome.exit_code.is_none_or(|code| code == 0)
+                && task
+                    .blockers
+                    .iter()
+                    .any(|blocker| blocker.source == "agent report")
+            {
+                // Recovery receipts matter only after a claim. Ordinary reads
+                // must not churn task projections or manufacture completion.
+                task.observe_inspection(&call.name, kind, &args_value);
             }
         }
         harness.record_tool_result(

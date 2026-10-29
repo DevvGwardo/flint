@@ -67,6 +67,82 @@ fn debug_output_does_not_expose_the_api_key() {
 }
 
 #[tokio::test]
+async fn omniroute_compatible_auth_modes_preserve_catalog_routing_and_streamed_tools() {
+    for key in ["", "router-fixture-key"] {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}/v1", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            for index in 0..3 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut reader = tokio::io::BufReader::new(&mut socket);
+                let mut headers = String::new();
+                let mut length = 0;
+                loop {
+                    let mut line = String::new();
+                    assert!(reader.read_line(&mut line).await.unwrap() > 0);
+                    if line == "\r\n" {
+                        break;
+                    }
+                    if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                        length = value.trim().parse::<usize>().unwrap();
+                    }
+                    headers.push_str(&line);
+                }
+                let headers = headers.to_ascii_lowercase();
+                if key.is_empty() {
+                    assert!(!headers.contains("authorization:"));
+                } else {
+                    assert!(headers.contains("authorization: bearer router-fixture-key"));
+                }
+                let mut body = vec![0; length];
+                reader.read_exact(&mut body).await.unwrap();
+                let (content_type, response) = if index < 2 {
+                    assert!(headers.starts_with("get /v1/models "));
+                    (
+                        "application/json",
+                        r#"{"data":[{"id":"auto","context_length":32768},{"id":"coding-combo"}]}"#,
+                    )
+                } else {
+                    assert!(headers.starts_with("post /v1/chat/completions "));
+                    let json: Value = serde_json::from_slice(&body).unwrap();
+                    assert_eq!(json["model"], "auto");
+                    assert_eq!(json["stream"], true);
+                    (
+                        "text/event-stream",
+                        concat!(
+                            "data: {\"choices\":[{\"delta\":{\"content\":\"Checking.\",\"tool_calls\":[",
+                            "{\"index\":0,\"id\":\"route-call\",\"type\":\"function\",\"function\":{\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\":\\\"README.md\\\"}\"}}",
+                            "]},\"finish_reason\":\"tool_calls\"}]}\n\n",
+                            "data: [DONE]\n\n",
+                        ),
+                    )
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{response}",
+                    response.len(),
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        let provider = Provider::new(&base, "auto", key);
+        assert_eq!(provider.model_limits().await.unwrap().context_window, 32768);
+        let cancel = CancellationToken::new();
+        assert_eq!(
+            provider.list_models(&cancel).await.unwrap(),
+            ["auto", "coding-combo"]
+        );
+        let completion = provider
+            .complete(&request(), &mut |_| {}, &cancel)
+            .await
+            .unwrap();
+        assert_eq!(completion.text, "Checking.");
+        assert_eq!(completion.tool_calls.len(), 1);
+        assert_eq!(completion.tool_calls[0].name, "read_file");
+        server.await.unwrap();
+    }
+}
+
+#[tokio::test]
 async fn eof_and_unsupported_terminal_outcomes_cannot_release_tools() {
     for reason in [
         None,

@@ -205,6 +205,9 @@ pub struct SessionView {
     /// Latest task and evidence. Missing in old streams until an unverified
     /// fallback is created; never inferred as accepted from Completed.
     pub task: Option<flint_agent::TaskRecord>,
+    /// Changes even when task/work counters stay fixed (e.g. new assessment
+    /// details). Renderer caches must not use task metadata alone.
+    pub(crate) task_projection_revision: u64,
     /// An error reported while no turn ran (e.g. the engine failed to
     /// start); cleared when a turn starts. Errors inside a turn that still
     /// completes are notices, not failures.
@@ -338,6 +341,7 @@ impl SessionView {
                 self.streamed_chars = 0;
                 self.idle_error = None;
                 self.task = None;
+                self.task_projection_revision = self.task_projection_revision.saturating_add(1);
                 self.begin_turn();
                 Change::default()
             }
@@ -717,6 +721,7 @@ impl SessionView {
         // Late events from an older turn cannot replace the active task.
         if turn_id == self.turn_id {
             self.task = Some(task.clone());
+            self.task_projection_revision = self.task_projection_revision.saturating_add(1);
         }
         turn.task = Some(task);
         turn.end.map(Change::updated).unwrap_or_default()

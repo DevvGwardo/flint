@@ -102,6 +102,42 @@ fn tool_names_are_sanitized_and_bounded() {
     assert_eq!(tool_name("s", &"x".repeat(100)).chars().count(), 64);
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn configured_activity_server_works_with_the_native_mcp_client() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("project/.git")).unwrap();
+    let config = McpServerConfig {
+        name: "activity".into(),
+        command: "python3".into(),
+        args: vec![
+            format!("{}/../../tools/activity_mcp.py", env!("CARGO_MANIFEST_DIR")),
+            "--project-root".into(),
+            dir.path().display().to_string(),
+        ],
+        env: vec![("PYTHONDONTWRITEBYTECODE".into(), "1".into())],
+    };
+    let (hub, errors) = McpHub::start(&[config], dir.path()).await;
+    assert!(errors.is_empty(), "{errors:?}");
+    let result = hub
+        .call(
+            "mcp__activity__project_activity",
+            &Map::new(),
+            &CancellationToken::new(),
+        )
+        .await;
+    assert!(result.success, "{}", result.output);
+    let data: Value = serde_json::from_str(&result.output).unwrap();
+    assert_eq!(data["projects"].as_array().unwrap().len(), 1);
+    assert!(
+        data["projects"][0]["source"]
+            .as_str()
+            .unwrap()
+            .ends_with("/project/.git")
+    );
+    assert!(data["sessions"].as_array().unwrap().is_empty());
+}
+
 #[tokio::test]
 async fn dropped_request_removes_pending_and_notifies_server() {
     let dir = tempfile::tempdir().expect("tempdir");

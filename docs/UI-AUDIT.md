@@ -2,6 +2,62 @@
 
 Date: 2026-10-03. Scope: current working tree, including pre-existing changes.
 
+## Sidebar density pass, 2026-10-17
+
+Plan: `docs/PLAN-SIDEBAR-SIMPLIFY.md`. Scope: `crates/flint-app/src/sidebar.rs`,
+with collapsed/archive state in `settings.rs` + `app.rs`/`app_actions.rs`, group
+keys in `session_groups.rs`, and the ⌘F binding in `lib.rs`/`layout.rs`.
+
+No screenshots were captured for this pass: image inspection was unavailable, so
+nothing here is claimed as visually approved. The table is the layout budget the
+code now renders; the fixtures below pin it.
+
+| Region | Before | After |
+| :--- | ---: | ---: |
+| Header | 72 (brand mark + "Hooter" at 21 px) | 40 ("Sessions", live counts, close) |
+| Primary actions | 44 + 38 + 38 (three nav rows) | 36 (New agent, Open folder, Terminal in one row) |
+| Search | ≈58 | 32 + 8 |
+| Filters | 68 (two rows of two) | 28 + 8 (one row of four) |
+| Session rows | ≈78–86 (three lines) | ≈57–59 (two lines) |
+| Archived | ≈142, always open | 30 px disclosure row, collapsed by default |
+| Footer | 55 | 44 |
+
+Measured by fixtures (all passing):
+
+- `sidebar_chrome_leaves_most_of_the_panel_to_sessions`: with 20 sessions at
+  1440×900 the fixed chrome above `session-list` is ≤ 202 px and the list takes
+  ≥ 60 % of the panel; at 1000×560 at least three rows are visible.
+- `sidebar_long_branch_preserves_readable_metadata`: no row exceeds 60 px, the
+  branch truncates before the clock, and `sidebar-details` / `sidebar-usage` are
+  gone — the token total moved into the title's tooltip.
+- `sidebar_filters_stay_in_one_row_at_minimum_width` and
+  `sidebar_primary_actions_fit_one_row`: both hold at the 264 px dock minimum.
+- `sidebar_filter_positions_survive_multi_digit_counts` and
+  `sidebar_filter_chips_stay_in_place_when_counts_change`: unchanged, still pass.
+
+Behaviour added: collapsible headings (remembered in
+`Settings.collapsed_groups`, pruned against headings that still exist), an
+archived disclosure (`Settings.archived_open`), a grouping menu with a checkmark
+(⌘⇧G still cycles), ⌘F to focus the search (Escape clears it while the search box
+has focus), and a row ellipsis painted only on hover, on the active row, or while
+its menu is open.
+
+Fixtures updated for the design change, each with a comment naming the plan:
+`sidebar_groups_by_project_status_or_agent_and_counts_hidden_sessions`,
+`sidebar_archive_scrollbar_keeps_restore_and_navigation_reachable`,
+`sidebar_long_branch_preserves_readable_metadata`,
+`sidebar_groups_every_worktree_of_a_repository_together`,
+`hooter_sets_the_native_app_and_window_identity`, and two tab-count fixtures
+(`sidebar_tab_navigation_scrolls_offscreen_sessions_into_view`,
+`subagent_sidebar_keyboard_reveals_offscreen_children`) that each gained one tab
+stop for the new group heading.
+
+Not done, from the plan: roving focus (P6.1) — rows remain one tab stop each, so
+the existing tab-navigation fixtures still hold — and auto-extending the page at
+the end of the scroll (P6.3), which needs a scroll callback the list does not
+expose. The ellipsis does not appear on keyboard focus alone; the slot shows its
+focus ring instead.
+
 ## Coastal home and portability checkpoint, 2026-10-06
 
 Evidence: `target/home-dashboard-validation-20261006/`. Earlier checkpoints

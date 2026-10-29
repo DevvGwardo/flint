@@ -14,10 +14,12 @@ use crate::app::CycleSessionGrouping;
 use crate::app::DeleteSession;
 use crate::app::FlintApp;
 use crate::app::FocusComposer;
+use crate::app::FocusSearch;
 use crate::app::Interrupt;
 use crate::app::NewClaudeSession;
 use crate::app::NewCodexSession;
 use crate::app::NewDroidSession;
+use crate::app::NewOpenCodeSession;
 use crate::app::NewSession;
 use crate::app::OpenSettings;
 use crate::app::OpenTerminal;
@@ -85,6 +87,11 @@ pub fn render(
                     Box::new(NewDroidSession),
                 ))
                 .item(item(
+                    "New OpenCode session",
+                    IconName::Bot,
+                    Box::new(NewOpenCodeSession),
+                ))
+                .item(item(
                     "Stop the running turn",
                     IconName::CircleStop,
                     Box::new(Interrupt),
@@ -108,6 +115,11 @@ pub fn render(
                     "Focus composer",
                     IconName::TextCursorInput,
                     Box::new(FocusComposer),
+                ))
+                .item(item(
+                    "Search sessions",
+                    IconName::Search,
+                    Box::new(FocusSearch),
                 )),
         )
         .group(

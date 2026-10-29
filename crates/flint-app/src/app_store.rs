@@ -20,6 +20,32 @@ fn from_secs(secs: i64) -> SystemTime {
     UNIX_EPOCH + Duration::from_secs(secs.max(0) as u64)
 }
 
+/// Fail-closed prompt-queue load for session restore.
+/// A missing directory can never panic: it yields a paused, unreadable queue.
+/// A missing queue file inside an existing directory loads as empty.
+/// `pub` for integration-test coverage; not part of the UI surface.
+pub fn load_queue_for_restore(dir: Option<&std::path::Path>) -> crate::prompt_queue::Queue {
+    match dir {
+        Some(dir) => match crate::prompt_queue::Queue::load(dir) {
+            Ok(queue) => queue,
+            Err(error) => {
+                let mut queue = crate::prompt_queue::Queue::default();
+                queue.paused = true;
+                queue.unreadable = true;
+                queue.error = Some(error);
+                queue
+            }
+        },
+        None => {
+            let mut queue = crate::prompt_queue::Queue::default();
+            queue.paused = true;
+            queue.unreadable = true;
+            queue.error = Some("Session directory is missing.".into());
+            queue
+        }
+    }
+}
+
 impl FlintApp {
     pub(crate) fn refresh_archives(&mut self) {
         self.archives = store::load_archived(&self.home);
@@ -126,14 +152,7 @@ impl FlintApp {
             session.view.title = meta.title;
         }
         session.touched = from_secs(meta.updated_at);
-        match crate::prompt_queue::Queue::load(session.dir.as_deref().unwrap()) {
-            Ok(queue) => session.prompt_queue = queue,
-            Err(error) => {
-                session.prompt_queue.paused = true;
-                session.prompt_queue.unreadable = true;
-                session.prompt_queue.error = Some(error);
-            }
-        }
+        session.prompt_queue = load_queue_for_restore(session.dir.as_deref());
         let native = session.agent == flint_agent::AgentKind::Flint;
         let uid = session.uid;
         if native {

@@ -36,6 +36,7 @@ pub(super) fn guard_recovered(turn: &TurnInfo) -> bool {
                             flint_agent::TaskOutcome::NeedsReview
                                 | flint_agent::TaskOutcome::Accepted
                                 | flint_agent::TaskOutcome::Answered
+                                | flint_agent::TaskOutcome::Verified
                         )
                 })
         })

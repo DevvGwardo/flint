@@ -1,0 +1,5 @@
+#include "../../Flutter/Flutter-Release.xcconfig"
+#include "Warnings.xcconfig"
+
+// A local release must not inherit Xcode's debugger attachment entitlement.
+CODE_SIGN_INJECT_BASE_ENTITLEMENTS = NO

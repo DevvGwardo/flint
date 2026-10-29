@@ -303,7 +303,14 @@ async fn saver_coalesces_snapshots_before_the_writer_is_polled() {
     }
     // A current-thread runtime cannot poll the writer until this test yields.
     let queued = saver.tx.len();
-    let retained_bytes = saver.latest.lock().unwrap().as_ref().unwrap().len();
+    let retained_bytes = saver
+        .latest
+        .lock()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .encoded()
+        .len();
     assert_eq!(retained_bytes, snapshot(128, &messages).len());
     eprintln!(
         "SNAPSHOT_PRESSURE submitted=128 bytes={submitted_bytes} queued={queued} retained_bytes={retained_bytes}"
@@ -384,8 +391,13 @@ async fn blocked_writer_retains_one_latest_snapshot_and_flush_waits_for_it() {
         saver.save(snapshot(turn, &messages));
     }
     assert_eq!(
-        saver.latest.lock().unwrap().as_deref(),
-        Some(snapshot(128, &messages).as_slice())
+        saver
+            .latest
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|pending| pending.encoded()),
+        Some(snapshot(128, &messages))
     );
     assert_eq!(saver.tx.len(), 1);
     let flush = tokio::spawn(saver.flush());
@@ -839,4 +851,79 @@ fn loading_repairs_invalid_results_without_changing_the_saved_file() {
     assert_eq!(wire["messages"][2]["tool_call_id"], "c2");
     assert_eq!(wire["messages"][3]["role"], "user");
     assert_eq!(wire["messages"].as_array().unwrap().len(), 4);
+}
+
+#[tokio::test]
+async fn writer_serialized_snapshots_match_preformatted_bytes() {
+    for (bytes_dir, session_dir) in [
+        (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap()),
+        // The same transcript, saved twice, must not depend on who formats it.
+        (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap()),
+    ] {
+        let mut task = TaskRecord::new(1, "Fix it.\nRequired file: result.c".into(), 0);
+        task.assess(crate::protocol::TurnEndReason::Completed, true);
+        let messages = sample();
+        let bytes_saver = Saver::new(bytes_dir.path().to_path_buf());
+        bytes_saver.save(snapshot_with_task(3, &messages, Some(&task)));
+        bytes_saver.flush().await.expect("bytes flush");
+
+        let session_saver = Saver::new(session_dir.path().to_path_buf());
+        session_saver.save(SaveData::Session(Box::new(SessionSnapshot {
+            turn_id: 3,
+            messages: Arc::new(messages.clone()),
+            task: Some(task.clone()),
+        })));
+        session_saver.flush().await.expect("session flush");
+
+        assert_eq!(
+            std::fs::read(bytes_dir.path().join(FILE_NAME)).unwrap(),
+            std::fs::read(session_dir.path().join(FILE_NAME)).unwrap()
+        );
+        let restored = load(session_dir.path()).unwrap().unwrap();
+        assert_eq!(restored.turn_id, 3);
+        assert_eq!(restored.task, Some(task));
+        assert_eq!(restored.messages, messages[1..]);
+    }
+}
+
+#[tokio::test]
+async fn deferred_serialization_still_keeps_and_checkpoints_the_newest_snapshot() {
+    let dir = tempfile::tempdir().unwrap();
+    let saver = Saver::new(dir.path().to_path_buf());
+    let messages = Arc::new(sample());
+    // A burst synthesizes one document, and the newest turn must be the one
+    // that survives coalescing: serialization is deferred, never dropped.
+    for turn in 1..=32 {
+        saver.save(SaveData::Session(Box::new(SessionSnapshot {
+            turn_id: turn,
+            messages: Arc::clone(&messages),
+            task: None,
+        })));
+    }
+    saver.checkpoint().await.expect("checkpoint");
+    let restored = load(dir.path()).unwrap().unwrap();
+    assert_eq!(restored.turn_id, 32);
+    saver.flush().await.expect("flush");
+    assert_eq!(
+        load(dir.path()).unwrap().unwrap().turn_id,
+        32,
+        "a later flush must not lose the checkpointed snapshot"
+    );
+}
+
+#[tokio::test]
+async fn poisoned_writer_mutex_stays_fail_closed_not_panic() {
+    let dir = tempfile::tempdir().unwrap();
+    let saver = Saver::new(dir.path().to_path_buf());
+    // Poison the pending-snapshot mutex by panicking while holding the lock.
+    let latest = saver.latest.clone();
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _guard = latest.lock().unwrap();
+        panic!("intentional poison for regression test");
+    }));
+    assert!(latest.is_poisoned());
+    // Neither the foreground save nor the background writer may panic.
+    saver.save(Vec::new());
+    saver.checkpoint().await.expect("checkpoint");
+    saver.flush().await.expect("flush");
 }

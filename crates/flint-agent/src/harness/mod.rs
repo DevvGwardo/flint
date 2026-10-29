@@ -33,6 +33,7 @@ pub const JEV_MAX_CALLS_PER_TURN: u32 = 6;
 const JEV_STUCK_NUDGE_THRESHOLD: f64 = 0.6;
 const JEV_VERIFY_NUDGE_THRESHOLD: f64 = 0.5;
 const JEV_WATCHDOG_NUDGE_THRESHOLD: f64 = 0.6;
+const JEV_BLOCKER_RECOVERY_THRESHOLD: f64 = 0.6;
 
 /// Harness state for one user turn.
 type FinishNudge = (NudgeReason, guard::FinishProgress);
@@ -41,11 +42,14 @@ pub struct Harness {
     guard: TurnGuard,
     jev: Option<JevClient>,
     jev_calls: u32,
+    /// An unavailable optional judge must not add repeated timeouts this turn.
+    jev_unavailable: bool,
     /// Verdicts the judge returned this turn, drained by the session to emit.
     jev_verdicts: Vec<JevVerdict>,
     continuations: u32,
     last_finish_nudge: Option<FinishNudge>,
     continuation_stop: Option<ContinuationStop>,
+    blocker_recovery_nudged: bool,
 }
 
 #[cfg(test)]
@@ -197,6 +201,154 @@ mod tests {
         assert_eq!(stop.cause, ContinuationStopCause::NoProgress);
         assert_eq!(stop.followups, 1);
     }
+
+    #[tokio::test]
+    async fn protected_blockers_never_reach_the_recovery_judge_or_nudge() {
+        for source in ["user review", "child dependency", "agent report"] {
+            let mut task = TaskRecord::new(1, "Analyze the source.".into(), 0);
+            task.add_blocker("Input is unavailable", source);
+            if source == "agent report" {
+                task.note_scope_denial("run_command", &serde_json::json!({"command":"cargo test"}));
+            }
+            let mut harness = Harness::new("Analyze the source.", None);
+            harness.set_task_record(&task);
+            assert_eq!(
+                harness.finish_decision("Cannot proceed.", &[]).await,
+                FinishDecision::Stop
+            );
+            assert!(!harness.blocker_recovery_nudged);
+            assert_eq!(harness.jev_calls, 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn blocker_recovery_obeys_the_existing_total_followup_budget() {
+        let mut task = TaskRecord::new(1, "What changed?".into(), 0);
+        task.add_blocker("No activity in scratch folder", "agent report");
+        let mut harness = Harness::new("What changed?", None);
+        harness.set_task_record(&task);
+        harness.continuations = MAX_CONTINUATIONS;
+        assert_eq!(
+            harness.finish_decision("Cannot tell.", &[]).await,
+            FinishDecision::BudgetExhausted
+        );
+        assert_eq!(
+            harness.continuation_stop().unwrap().followups,
+            MAX_CONTINUATIONS
+        );
+        assert_eq!(task.blockers.len(), 1);
+    }
+
+    async fn judge_fixture(
+        status: &str,
+    ) -> (JevClient, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let config = crate::JevConfig {
+            api_key: "offline-fixture".into(),
+            base_url: format!("http://{}", listener.local_addr().unwrap()),
+            model: "fixture".into(),
+        };
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = calls.clone();
+        let status = status.to_string();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let mut request = [0; 4096];
+                if socket.read(&mut request).await.unwrap_or(0) == 0 {
+                    continue;
+                }
+                seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let body = r#"{"answers":{"verified":{"noul":0.1},"blocker_recovery":{"noul":0.9},"stuck":{"noul":0.9}}}"#;
+                let reply = format!(
+                    "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket.write_all(reply.as_bytes()).await.unwrap();
+            }
+        });
+        (JevClient::new(config), calls)
+    }
+
+    #[tokio::test]
+    async fn a_failed_judge_is_attempted_once_per_turn_and_retried_next_turn() {
+        let (client, calls) = judge_fixture("503 Unavailable").await;
+        let mut harness = Harness::new("Fix the code", Some(client.clone()));
+        for _ in 0..JEV_MAX_CALLS_PER_TURN {
+            assert!(
+                harness
+                    .judge(serde_json::json!({}), JevQuestion::Verified, 0.5, false)
+                    .await
+                    .is_none()
+            );
+        }
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(harness.jev_calls, 1);
+        assert!(harness.take_jev_verdicts().is_empty());
+        let mut task = TaskRecord::new(1, "Fix the code".into(), 0);
+        task.observed_edits = 1;
+        harness.set_task_record(&task);
+        assert!(matches!(
+            harness.finish_decision("Done.", &[]).await,
+            FinishDecision::Continue {
+                reason: NudgeReason::Verify,
+                ..
+            }
+        ));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let mut next_turn = Harness::new("Fix the code", Some(client));
+        assert!(
+            next_turn
+                .judge(serde_json::json!({}), JevQuestion::Verified, 0.5, false)
+                .await
+                .is_none()
+        );
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn exhausted_finish_budget_skips_judge_but_keeps_the_unresolved_condition() {
+        for informational in [false, true] {
+            let (client, calls) = judge_fixture("200 OK").await;
+            let goal = if informational {
+                "What changed?"
+            } else {
+                "Fix the code"
+            };
+            let mut task = TaskRecord::new(1, goal.into(), 0);
+            if informational {
+                task.add_blocker("No activity in scratch folder", "agent report");
+            } else {
+                task.observed_edits = 1;
+            }
+            let mut harness = Harness::new(goal, Some(client));
+            harness.set_task_record(&task);
+            harness.continuations = MAX_CONTINUATIONS;
+            assert_eq!(
+                harness.finish_decision("Done.", &[]).await,
+                FinishDecision::BudgetExhausted
+            );
+            assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+            assert_eq!(harness.jev_calls, 0);
+            assert!(harness.take_jev_verdicts().is_empty());
+            assert!(!harness.continuation_stop().unwrap().condition.is_empty());
+            assert!(!task.has_current_verification() && !task.is_accepted());
+        }
+    }
+
+    #[tokio::test]
+    async fn exhausted_finish_budget_does_not_disable_midturn_loop_judgments() {
+        let (client, calls) = judge_fixture("200 OK").await;
+        let mut harness = Harness::new("Fix the code", Some(client));
+        harness.continuations = MAX_CONTINUATIONS;
+        assert_eq!(
+            harness
+                .judge(serde_json::json!({}), JevQuestion::Stuck, 0.6, true)
+                .await,
+            Some((0.9, true))
+        );
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
 }
 
 /// Bounded execution control. `Stop` is not a judgment of task acceptance.
@@ -217,10 +369,12 @@ impl Harness {
             guard: TurnGuard::new(user_message),
             jev,
             jev_calls: 0,
+            jev_unavailable: false,
             jev_verdicts: Vec::new(),
             continuations: 0,
             last_finish_nudge: None,
             continuation_stop: None,
+            blocker_recovery_nudged: false,
         }
     }
 
@@ -277,14 +431,20 @@ impl Harness {
         threshold: f64,
         nudge_on_high: bool,
     ) -> Option<(f64, bool)> {
-        if self.jev_calls >= JEV_MAX_CALLS_PER_TURN {
+        if self.jev_unavailable
+            || self.jev_calls >= JEV_MAX_CALLS_PER_TURN
+            || (question != JevQuestion::Stuck && self.continuations >= MAX_CONTINUATIONS)
+        {
             return None;
         }
         let jev = self.jev.as_ref()?;
         self.jev_calls += 1;
-        let probability = jev
-            .ask_noul(&state, question.name(), question.noul())
-            .await?;
+        let Some(probability) = jev.ask_noul(&state, question.name(), question.noul()).await else {
+            // Keep deterministic guards active. A new turn gets a fresh chance
+            // to use JEV; a transient service failure never changes permissions.
+            self.jev_unavailable = true;
+            return None;
+        };
         let confirmed = if nudge_on_high {
             probability >= threshold
         } else {
@@ -339,7 +499,36 @@ impl Harness {
         tool_names: &[&str],
     ) -> FinishDecision {
         self.continuation_stop = None;
-        let nudge = if let Some(message) = self.guard.analysis_scope_nudge(final_text) {
+        let nudge = if self.guard.has_blockers() {
+            if !self.blocker_recovery_nudged && self.guard.can_recover_blocker() {
+                self.blocker_recovery_nudged = true;
+                let mut state = self.guard.blocker_state(final_text);
+                state["available_tools"] = serde_json::json!(
+                    tool_names
+                        .iter()
+                        .take(40)
+                        .map(|name| name.chars().take(160).collect::<String>())
+                        .collect::<Vec<_>>()
+                );
+                let recover = self
+                    .judge(
+                        state,
+                        JevQuestion::BlockerRecovery,
+                        JEV_BLOCKER_RECOVERY_THRESHOLD,
+                        true,
+                    )
+                    .await
+                    .is_none_or(|(_, confirmed)| confirmed);
+                recover.then(|| {
+                    (
+                        NudgeReason::BlockerRecovery,
+                        guard::BLOCKER_RECOVERY_NUDGE.into(),
+                    )
+                })
+            } else {
+                None
+            }
+        } else if let Some(message) = self.guard.analysis_scope_nudge(final_text) {
             Some((NudgeReason::Watchdog, message))
         } else {
             match leaked::detect_leaked_tool_call(final_text, tool_names) {

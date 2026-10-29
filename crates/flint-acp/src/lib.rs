@@ -12,6 +12,8 @@ mod files;
 mod launch;
 mod live;
 mod mapper;
+#[cfg(test)]
+mod opencode_tests;
 mod options;
 mod output;
 mod process;
