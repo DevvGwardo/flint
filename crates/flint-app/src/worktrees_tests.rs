@@ -120,7 +120,7 @@ fn worktree_creation_leaves_source_edits_and_uses_resolved_base() {
     assert_eq!(trees[1], tree);
     assert_eq!(
         crate::project::identity(&tree.path).root,
-        cwd.canonicalize().unwrap()
+        flint_platform::without_verbatim(&cwd.canonicalize().unwrap())
     );
 }
 
