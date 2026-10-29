@@ -124,11 +124,19 @@ fn relative_paths_use_forward_slashes_on_every_platform() {
         relative(workspace, &workspace.join("new").join("b.txt")),
         "new/b.txt"
     );
-    // A backslash is an ordinary filename character outside Windows.
-    assert_eq!(
-        relative(workspace, &workspace.join("weird\\name.txt")),
-        "weird\\name.txt"
-    );
+    // A backslash is an ordinary filename character outside Windows, where
+    // it separates path components and is rendered as `/` like the rest.
+    if cfg!(windows) {
+        assert_eq!(
+            relative(workspace, &workspace.join("weird\\name.txt")),
+            "weird/name.txt"
+        );
+    } else {
+        assert_eq!(
+            relative(workspace, &workspace.join("weird\\name.txt")),
+            "weird\\name.txt"
+        );
+    }
     // Outside the workspace, the display form is kept as-is.
     assert_eq!(
         relative(workspace, Path::new("/elsewhere/a.txt")),
